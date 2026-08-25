@@ -45,7 +45,7 @@ Carried forward from ADR-0, the drivers most load-bearing for this specific deci
 Adopt **option 2**, structured as two distinct roles:
 
 - **Orchestrator** (runs outside any agent sandbox, is not itself an agent): decides which repo/task/branch a unit of work targets, mints a short-lived credential scoped to that one repo and bounded to the container's max lifetime, starts the container with the task prompt and credential injected via environment/secret manager (never baked into the container image), enforces a timeout, tears the container down, and emits the audit record for the invocation (start, credential issuance, stop, outcome). The orchestrator, not the agent, is the source of truth for "this happened" — the agent's own output is not trusted as an audit record, consistent with treating agent behavior as potentially prompt-injected.
-- **Agent container** (single-use): runs headless opencode, given the task prompt at start. Clones the target repo (or creates it, if it doesn't exist yet) using the injected credential, does the work, opens or updates a pull request, and exits. The container is destroyed on exit or on timeout — this destruction *is* the kill switch, and it requires no cooperation from the agent process.
+- **Agent container** (single-use): runs a headless coding-agent CLI, given the task prompt at start. Clones the target repo (or creates it, if it doesn't exist yet) using the injected credential, does the work, opens or updates a pull request, and exits. The container is destroyed on exit or on timeout — this destruction *is* the kill switch, and it requires no cooperation from the agent process.
 
 **Invocation granularity is one-shot per round, not per task.** A brand-new task and every subsequent round of work on that same task (e.g., addressing a human's PR review comment) each get their own complete container lifecycle: a fresh credential, a fresh clone of the current PR branch at its current HEAD, and the round's instruction as the prompt. Nothing is preserved via in-process/session state between rounds; any continuity the agent needs from a prior round is passed forward explicitly as prompt context (e.g., a short summary, or the PR's existing comment thread), not relied on implicitly.
 
@@ -71,8 +71,9 @@ Build the orchestrator as bespoke infrastructure rather than reusing whatever CI
 - Sandbox isolation mechanism (plain Docker vs. gVisor vs. Firecracker microVM) — deferred to ADR-4; likely needs to vary by the risk tier of the task (per ADR-0's action-category table), not be a single fixed choice.
 - Network egress allowlist mechanics for the container (the git hosting platform + required package registries only) — deferred to ADR-4.
 - Maximum per-invocation timeout — TBD, likely needs real usage data.
-- Image build/maintenance process for the headless opencode container — implementation detail, out of scope for this ADR.
+- Image build/maintenance process for the headless agent container — implementation detail, out of scope for this ADR.
 - Which concrete git hosting platform to run — deferred to ADR-6, once the requirements this ADR and ADR-2 assume are joined by whatever ADR-3/ADR-4/ADR-5 add.
+- Which concrete coding-agent CLI/framework runs inside the container (opencode, OpenHands, or another) — deferred to ADR-7. That decision is entangled with this one (some frameworks bundle their own session/workspace model), so ADR-7 must be evaluated against the one-shot execution model fixed here, not the other way around.
 
 ## References
 

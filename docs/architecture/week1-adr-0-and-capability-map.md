@@ -7,7 +7,7 @@
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec, Compliance/Legal, FinOps, Developer Experience, [1–2 affected product teams as pilot candidates] |
 | **Informed** | Engineering leadership, platform team, affected product team leads |
-| **Supersedes / Related** | — (this is the root ADR; ADR-1 through ADR-6 build on it) |
+| **Supersedes / Related** | — (this is the root ADR; ADR-1 through ADR-7 build on it) |
 
 ## Context
 
@@ -17,7 +17,7 @@ This is a general industry gap, not unique to us: as of mid-2026, industry surve
 
 Agents are, in effect, a category of **non-human identity (NHI)**. The identity model this initiative builds (ADR-2) should follow NHI lifecycle patterns — short-lived/session-scoped credentials, explicit delegation chains ("acting on behalf of"), rotation and revocation — rather than reusing human-SSO patterns as-is.
 
-The goal of this ADR is **not** to design the full harness — that's ADR-1 through ADR-6. It's to fix scope, so those later decisions are made against a shared, agreed problem statement rather than each being litigated from scratch.
+The goal of this ADR is **not** to design the full harness — that's ADR-1 through ADR-7. It's to fix scope, so those later decisions are made against a shared, agreed problem statement rather than each being litigated from scratch.
 
 ## Decision Drivers
 
@@ -39,6 +39,7 @@ The goal of this ADR is **not** to design the full harness — that's ADR-1 thro
 5. Observability & audit trail (ADR-5)
 6. MCP / tool server governance (vetting, allowlisting, treating tool descriptions and output as untrusted input) — folds into ADR-3 (policy) and ADR-4 (sandboxing).
 7. Git hosting platform selection (ADR-6) — binds the git-forge capability requirements assumed by ADR-1 (execution model) and ADR-2 (identity/permission model) — repo hosting, PR/MR API, scoped/expiring tokens, bot accounts, webhooks — to one concrete, evaluated, free/self-hostable platform, informed by every ADR that touches the git host.
+8. Coding-agent runtime selection (ADR-7) — binds the "headless coding-agent CLI" ADR-1 assumes runs inside each container (e.g. opencode vs. OpenHands vs. another) to a concrete choice, evaluated against the one-shot execution model ADR-1 already fixed rather than the other way around.
 
 ### Explicitly out of scope for this phase
 - Model selection / evaluation of which LLM to use

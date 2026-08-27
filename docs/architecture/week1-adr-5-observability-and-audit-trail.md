@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Date** | 2026-08-25 |
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec, Compliance/Legal |
@@ -35,10 +35,11 @@ ADR-0 also left two things as literal placeholders this ADR needs to fill: "any 
 
 ### Audit record store: append-only, hash-chained PostgreSQL table
 
-- Every invocation produces exactly one consolidated audit record, keyed by `invocation_id`: ADR-2's delegation record, ADR-3's PDP decision, and ADR-1's execution outcome (container start/stop timestamps, exit status, PR URL created or updated), merged into a single row. Written once, by the orchestrator — never by the agent, consistent with ADR-1/ADR-2's "orchestrator is the source of truth."
+- Every invocation produces exactly one consolidated audit record, keyed by `invocation_id` and tagged with `task_id`: ADR-2's delegation record, ADR-3's PDP decision, and ADR-1's execution outcome (container start/stop timestamps, exit status, PR URL created or updated), merged into a single row. Written once, by the orchestrator — never by the agent, consistent with ADR-1/ADR-2's "orchestrator is the source of truth."
 - The table is append-only by database permission, not just convention: the orchestrator's DB role has `INSERT` only — no `UPDATE`, no `DELETE`.
 - **Tamper-evidence via hash chaining**: each row includes a SHA-256 hash of the previous row's content. A retroactive edit, even through privileged database access, breaks the chain and is detectable. This resolves ADR-2's open question about a signing/schema mechanism without standing up full asymmetric-signature infrastructure — proportionate to the actual threat model here (detecting insider tampering or a compromised writer), not third-party cryptographic verifiability.
 - **Query target** (filling ADR-0's placeholder): any invocation's full chain — principal → orchestrator instance → credential/scopes → policy decision → git action outcome — answerable within **5 minutes** of query, for any incident within the retention window. First-pass target, pending Compliance/Legal input on actual retention requirements (ADR-0 notes no compliance mandate currently applies, so this may remain self-imposed).
+- **Task-level rollup** (per ADR-7): since one `task_id` can span a coding round plus however many review/security-triage rounds it triggers, the same 5-minute query target applies to "every invocation under this task_id" as a unit — not just single-invocation lookups — so cost, round count, and full history are answerable per task, not only per round.
 - If audit volume or a future regulatory requirement demands genuine WORM/immutable object storage or full-text search beyond indexed Postgres queries, that's a documented future upgrade — added alongside, not instead of, the relational audit table. Worth naming now which object-storage option that upgrade should *not* be: MinIO's open-source edition was effectively discontinued in 2026 — GitHub repo archived, console/admin functionality stripped out and pushed toward a commercial product (MinIO AIStor, priced around $96k/year at entry) — the same open-core pattern already avoided elsewhere in this design (Gitea's commercial stewardship, Vault's BSL relicense, OPA's commercial layer winding down). Garage or SeaweedFS remain genuinely free, self-hostable S3-compatible alternatives if that need materializes.
 
 ### Operational metrics & alerting: Prometheus + Grafana + Alertmanager

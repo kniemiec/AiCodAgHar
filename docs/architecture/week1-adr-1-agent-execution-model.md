@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Date** | 2026-08-24 |
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec, Developer Experience |
@@ -73,7 +73,7 @@ Build the orchestrator as bespoke infrastructure rather than reusing whatever CI
 - Maximum per-invocation timeout — TBD, likely needs real usage data.
 - Image build/maintenance process for the headless agent container — implementation detail, out of scope for this ADR.
 - Which concrete git hosting platform to run — deferred to ADR-6, once the requirements this ADR and ADR-2 assume are joined by whatever ADR-3/ADR-4/ADR-5 add.
-- Which concrete coding-agent CLI/framework runs inside the container (opencode, OpenHands, or another) — deferred to ADR-7. That decision is entangled with this one (some frameworks bundle their own session/workspace model), so ADR-7 must be evaluated against the one-shot execution model fixed here, not the other way around.
+- Which concrete coding-agent CLI/framework runs inside the container (opencode, OpenHands, or another) — deferred to ADR-8. That decision is entangled with this one (some frameworks bundle their own session/workspace model), so ADR-8 must be evaluated against the one-shot execution model fixed here, not the other way around.
 
 ## References
 

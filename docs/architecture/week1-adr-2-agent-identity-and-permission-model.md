@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Date** | 2026-08-24 |
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec |
@@ -55,17 +55,20 @@ injected into the container at launch, never baked into the image.
 ```
 {
   invocation_id,
+  task_id,                 // groups every invocation belonging to one logical unit of work
   triggering_principal,
   orchestrator_instance_id,
   bot_account,
   target_repo,            // or org + create_new: true
-  task_type,               // new-task | pr-review-round
+  task_type,               // new-task | pr-review-round | review | security-triage (per ADR-7)
   risk_tier,               // from ADR-0's action-category table
   granted_scopes,
   issued_at,
   expires_at
 }
 ```
+
+**`task_id`** exists because a unit of work is no longer always a single invocation: ADR-7's multi-agent review workflow means one PR can span a coding round plus however many review/security-triage rounds it triggers, each its own invocation with its own credential. `task_id` is what ties all of them back together as one traceable, auditable, cost-attributable unit — the PR/branch identity is the natural value for it, since every round already operates against "the current PR branch at its current HEAD" per ADR-1. `invocation_id` still uniquely identifies one round; `task_id` is the grouping key across rounds.
 
 These claims inform ADR-3's authorization decision; they are not self-authorizing on their own — ADR-3 still decides whether to grant/allow based on claims plus its own rules. The agent container also writes `invocation_id` into a trailer on every commit and into the PR description it creates or updates, so a PR sitting in the platform's UI — where the visible author is just the shared bot account — can always be traced back to the exact orchestrator record, principal, and risk tier that produced it.
 

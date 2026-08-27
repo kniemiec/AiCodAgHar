@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Date** | 2026-08-24 |
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec, Compliance/Legal, FinOps |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Accepted |
 | **Date** | 2026-08-27 |
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec, Developer Experience |

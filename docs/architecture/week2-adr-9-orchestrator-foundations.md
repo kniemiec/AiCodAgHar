@@ -7,7 +7,7 @@
 | **Deciders** | Me |
 | **Consulted** | Security/InfoSec, Developer Experience |
 | **Informed** | Engineering leadership, platform team |
-| **Supersedes / Related** | Builds on [ADR-0](week1-adr-0-and-capability-map.md) (risk tiers), [ADR-1](week1-adr-1-agent-execution-model.md) (bespoke orchestrator), [ADR-2](week1-adr-2-agent-identity-and-permission-model.md) (bot-account/repo-permission pattern, delegation record), [ADR-3](week1-adr-3-policy-enforcement-layer.md) (resolves its open questions on policy-data storage/ownership and the human-approval-event mechanism), [ADR-5](week1-adr-5-observability-and-audit-trail.md) (approval events extend the audit record), [ADR-6](week1-adr-6-git-hosting-platform-selection.md) (reuses Forgejo's repo permissions, labels, webhooks — no new platform introduced), and [ADR-7](week1-adr-7-multi-agent-review-workflow.md) (resolves its open question on where the stage-list config lives); microVM launch/lifecycle mechanics (Firecracker operational details) are explicitly deferred to a later ADR-10, not covered here
+| **Supersedes / Related** | Builds on [ADR-0](week1-adr-0-and-capability-map.md) (risk tiers), [ADR-1](week1-adr-1-agent-execution-model.md) (bespoke orchestrator), [ADR-2](week1-adr-2-agent-identity-and-permission-model.md) (bot-account/repo-permission pattern, delegation record), [ADR-3](week1-adr-3-policy-enforcement-layer.md) (resolves its open questions on policy-data storage/ownership and the human-approval-event mechanism), [ADR-5](week1-adr-5-observability-and-audit-trail.md) (approval events extend the audit record), [ADR-6](week1-adr-6-git-hosting-platform-selection.md) (reuses Forgejo's repo permissions, labels, webhooks — no new platform introduced), and [ADR-7](week1-adr-7-multi-agent-review-workflow.md) (resolves its open question on where the stage-list config lives); microVM launch/lifecycle mechanics (Firecracker operational details) are explicitly deferred to [ADR-10](week2-adr-10-microvm-launch-and-lifecycle-mechanics.md), not covered here
 
 ## Context
 
@@ -104,7 +104,7 @@ This is explicitly **not** the multi-backend abstraction ADR-6 declined to build
 - Exact approver-set definition mechanics — a specific Forgejo team vs. a minimum collaborator-role threshold — needs to be pinned down before implementation, not left ambiguous.
 - Schema/validation for `.harness/policy.yaml` and `.harness/stages.yaml` (e.g. JSON Schema validated at bundle-build time before a malformed file can break the merge) — implementation detail, not decided here.
 - Whether a rejected "widening" override attempt should also trigger a real-time alert (per ADR-5's pattern for egress-proxy denials) rather than only being logged — leaning yes, not fixed here.
-- MicroVM launch/lifecycle mechanics for `ContainerLauncher`'s production implementation — explicitly out of scope for this ADR, deferred to ADR-10.
+- ~~MicroVM launch/lifecycle mechanics for `ContainerLauncher`'s production implementation~~ — **Resolved 2026-09-04.** [ADR-10: MicroVM Launch & Lifecycle Mechanics](week2-adr-10-microvm-launch-and-lifecycle-mechanics.md) covers jailer/cgroup-v2 launch, MMDS credential injection, vsock log extraction, the tap-device egress design, and kill-switch/teardown semantics, all validated against a real Firecracker host. One implementation gap it identifies as still needed, not yet built: `ContainerLauncher`'s production implementation must give each invocation a fresh copy-on-write rootfs layer, which the validating PoC did not itself do.
 
 ## References
 

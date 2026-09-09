@@ -1,0 +1,24 @@
+[
+  {
+    "id": "review-round",
+    "type": "agent-stage",
+    "bot_account": "review-bot",
+    "task_type": "pr-review-round",
+    "blocking": true,
+    "conditions": {
+      "risk_tier": ["low", "medium"],
+      "files_touched_patterns": ["**/*.go"]
+    }
+  },
+  {
+    "id": "run-unit-tests",
+    "type": "deterministic-step",
+    "bot_account": "ci-bot",
+    "task_type": "pr-review-round",
+    "blocking": true,
+    "command": "go test ./...",
+    "working_dir": ".",
+    "timeout_seconds": 120,
+    "expected_exit_codes": [0]
+  }
+]

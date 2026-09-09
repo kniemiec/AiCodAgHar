@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package launcher.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1;launcherv1";
+
+// ContainerLauncher is ADR-11's unified execution primitive: every StepExecutor
+// (agent-stage and deterministic-step alike) dispatches exclusively through
+// this service, whether it is backed by launcher-mock or the real jailer/
+// Firecracker launcher (ADR-10).
+service ContainerLauncherService {
+  rpc Launch(LaunchRequest) returns (LaunchResponse);
+  rpc Kill(KillRequest) returns (KillResponse);
+  // ExtractLogs is independently callable, decoupled from Launch — mirrors the
+  // Firecracker PoC's finding that vsock log extraction is independent of the
+  // invocation's network path.
+  rpc ExtractLogs(ExtractLogsRequest) returns (ExtractLogsResponse);
+}
+
+message LaunchRequest {
+  string invocation_id = 1;
+  string task_id = 2;
+  string step_type = 3;         // "agent-stage" | "deterministic-step"
+  string step_id = 4;
+  string payload_ref = 5;       // mock: fixture key; real: image+command ref
+  map<string, string> env = 6;  // injected credential, target_repo, branch, prompt/command
+  int32 timeout_seconds = 7;
+  repeated string granted_scopes = 8;
+}
+
+message LaunchResponse {
+  string invocation_id = 1;
+  int32 exit_code = 2;
+  string status = 3; // completed | timed_out | killed | error
+  google.protobuf.Timestamp started_at = 4;
+  google.protobuf.Timestamp finished_at = 5;
+}
+
+message KillRequest {
+  string invocation_id = 1;
+}
+
+message KillResponse {
+  bool killed = 1;
+}
+
+message ExtractLogsRequest {
+  string invocation_id = 1;
+}
+
+message ExtractLogsResponse {
+  bytes stdout = 1;
+  bytes stderr = 2;
+  bytes structured_result_json = 3;
+}

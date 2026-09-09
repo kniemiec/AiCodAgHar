@@ -1,0 +1,6 @@
+{
+  "grant_extra_scopes": ["write:admin"],
+  "quota_rules": [
+    { "scope": "write:repository", "max_per_window": 10, "window_seconds": 3600 }
+  ]
+}

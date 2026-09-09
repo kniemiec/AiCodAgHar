@@ -1,0 +1,14 @@
+{
+  "risk_tier_overrides": [
+    {
+      "match": { "files_touched_patterns": ["**/security/**"] },
+      "risk_tier": "high"
+    }
+  ],
+  "require_human_approval": [
+    { "step_id": "security-triage", "risk_tier": ["high"] }
+  ],
+  "quota_rules": [
+    { "scope": "write:repository", "max_per_window": 10, "window_seconds": 3600 }
+  ]
+}

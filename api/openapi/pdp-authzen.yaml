@@ -1,0 +1,133 @@
+openapi: 3.0.3
+info:
+  title: PDP Authorization API (AuthZEN + resolved_steps extension)
+  version: 1.0.0
+  description: >
+    Base AuthZEN Authorization API evaluation endpoint, extended with a
+    documented local extension field `resolved_steps`. That field is
+    ADR-11's addition — the PDP resolves per-task step applicability on the
+    same call the orchestrator already makes for its allow/deny/require-
+    approval decision — and is NOT part of the base AuthZEN spec.
+servers:
+  - url: http://pdp-mock:8080
+paths:
+  /access/v1/evaluation:
+    post:
+      operationId: evaluate
+      summary: Evaluate a single access-control decision, with resolved_steps.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluationRequest'
+      responses:
+        '200':
+          description: Decision computed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationResponse'
+components:
+  schemas:
+    Subject:
+      type: object
+      required: [type, id]
+      properties:
+        type:
+          type: string
+          example: bot_account
+        id:
+          type: string
+          description: TriggeringPrincipal / BotAccount identity.
+    Resource:
+      type: object
+      required: [type, id]
+      properties:
+        type:
+          type: string
+          example: repository
+        id:
+          type: string
+          description: TargetRepo.
+    Action:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: TaskType (new-task | pr-review-round | review | security-triage).
+          example: pr-review-round
+    Context:
+      type: object
+      description: >
+        Orchestrator-supplied facts the base AuthZEN spec leaves open-ended:
+        invocation/task identity, risk tier, requested scopes, and arbitrary
+        round/file-touch facts.
+      required: [invocation_id, task_id, orchestrator_instance_id, risk_tier]
+      properties:
+        invocation_id:
+          type: string
+        task_id:
+          type: string
+        orchestrator_instance_id:
+          type: string
+        risk_tier:
+          type: string
+        requested_scopes:
+          type: array
+          items:
+            type: string
+        facts:
+          type: object
+          additionalProperties: true
+          description: Round number, files touched, etc.
+    EvaluationRequest:
+      type: object
+      required: [subject, resource, action, context]
+      properties:
+        subject:
+          $ref: '#/components/schemas/Subject'
+        resource:
+          $ref: '#/components/schemas/Resource'
+        action:
+          $ref: '#/components/schemas/Action'
+        context:
+          $ref: '#/components/schemas/Context'
+    ResolvedStep:
+      type: object
+      description: >
+        ADR-11 local extension — not part of base AuthZEN. bot_account was
+        added during Phase 4 implementation: the executor needs to know
+        which bot account to mint each step's credential as.
+      required: [step_id, type, blocking, bot_account]
+      properties:
+        step_id:
+          type: string
+        type:
+          type: string
+          enum: [agent-stage, deterministic-step]
+        blocking:
+          type: boolean
+        bot_account:
+          type: string
+    EvaluationResponse:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [allow, deny, require_human_approval]
+        granted_scopes:
+          type: array
+          items:
+            type: string
+        reason:
+          type: string
+        policy_bundle_version:
+          type: string
+        resolved_steps:
+          type: array
+          description: ADR-11 local extension field — see EvaluationResponse description.
+          items:
+            $ref: '#/components/schemas/ResolvedStep'

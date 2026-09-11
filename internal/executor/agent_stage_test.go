@@ -17,7 +17,8 @@ func TestAgentStageExecutor_ParsesBlockingFindingFromStructuredResult(t *testing
 			return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": true}`)}, nil
 		},
 	}
-	e := &executor.AgentStageExecutor{Launcher: launcher, Secrets: &fakes.FakeSecretsClient{}, ForgejoURL: "http://forgejo:3000"}
+	auditWriter := &fakes.FakeAuditWriter{}
+	e := &executor.AgentStageExecutor{Launcher: launcher, Secrets: &fakes.FakeSecretsClient{}, Audit: auditWriter, ForgejoURL: "http://forgejo:3000"}
 
 	run, err := e.Execute(context.Background(), executor.StepContext{
 		Task:  domain.Task{ID: "task-1", TargetRepo: "owner/repo", Branch: "feature", PRNumber: 7},
@@ -48,10 +49,21 @@ func TestAgentStageExecutor_ParsesBlockingFindingFromStructuredResult(t *testing
 	if env["FORGEJO_TOKEN"] == "" {
 		t.Fatal("expected a minted credential token in the launch env")
 	}
+
+	chain, err := auditWriter.GetTaskChain(context.Background(), "task-1")
+	if err != nil {
+		t.Fatalf("GetTaskChain: %v", err)
+	}
+	if len(chain) != 1 {
+		t.Fatalf("expected one audited invocation, got %d", len(chain))
+	}
+	if chain[0].StepID != "review" || chain[0].StepType != executor.StepTypeAgentStage || chain[0].Status != "completed" {
+		t.Fatalf("unexpected audit record: %+v", chain[0])
+	}
 }
 
 func TestAgentStageExecutor_NoFindingWhenStructuredResultAbsent(t *testing.T) {
-	e := &executor.AgentStageExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: &fakes.FakeSecretsClient{}}
+	e := &executor.AgentStageExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: &fakes.FakeSecretsClient{}, Audit: &fakes.FakeAuditWriter{}}
 
 	run, err := e.Execute(context.Background(), executor.StepContext{
 		Task:  domain.Task{ID: "task-1", TargetRepo: "owner/repo"},
@@ -68,7 +80,7 @@ func TestAgentStageExecutor_NoFindingWhenStructuredResultAbsent(t *testing.T) {
 
 func TestAgentStageExecutor_RevokesCredentialAfterLaunch(t *testing.T) {
 	secrets := &fakes.FakeSecretsClient{}
-	e := &executor.AgentStageExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: secrets}
+	e := &executor.AgentStageExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: secrets, Audit: &fakes.FakeAuditWriter{}}
 
 	run, err := e.Execute(context.Background(), executor.StepContext{
 		Task:  domain.Task{ID: "task-1", TargetRepo: "owner/repo"},

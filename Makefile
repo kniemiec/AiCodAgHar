@@ -1,4 +1,4 @@
-.PHONY: build test test-spike test-integration compose-up compose-down compose-logs bootstrap-admin gen-certs install-buf proto-lint proto-gen tidy
+.PHONY: build test test-spike test-integration test-e2e compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
 
 BUF := $(shell go env GOPATH)/bin/buf
 
@@ -33,6 +33,21 @@ compose-logs:
 
 bootstrap-admin:
 	./deploy/bootstrap-admin.sh
+
+migrate:
+	./deploy/migrate.sh
+
+seed:
+	set -a; . deploy/.env; set +a; \
+	go run ./cmd/seed
+	docker compose -f deploy/docker-compose.yml up -d secrets-mock pdp-mock control-plane
+
+test-e2e:
+	set -a; . deploy/.env; set +a; \
+	TLS_CA_CERT=$(CURDIR)/deploy/certs/ca.crt \
+	TLS_CLIENT_CERT=$(CURDIR)/deploy/certs/client.crt \
+	TLS_CLIENT_KEY=$(CURDIR)/deploy/certs/client.key \
+	go test -tags e2e ./internal/e2e/... -v
 
 tidy:
 	go mod tidy

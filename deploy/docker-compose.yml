@@ -82,6 +82,9 @@ services:
       # until then; `make bootstrap-admin` recreates it once the token exists.
       FORGEJO_TOKEN: ${FORGEJO_ADMIN_TOKEN}
       PDP_MOCK_REF: "main"
+      # Phase 6: platform-owned global-baseline policy repo `make seed`
+      # creates. Optional — pdp-mock works target-repo-only if unset.
+      GLOBAL_BASELINE_REPO: ${FORGEJO_ADMIN_USERNAME:-}/platform-baseline-policy
     ports:
       - "8081:8080"
     networks: [orchestrator-net]
@@ -108,6 +111,8 @@ services:
       dockerfile: deploy/docker/control-plane.Dockerfile
     restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
       forgejo:
         condition: service_started
       pdp-mock:
@@ -128,6 +133,9 @@ services:
       TLS_CA_CERT: /certs/ca.crt
       TLS_CLIENT_CERT: /certs/client.crt
       TLS_CLIENT_KEY: /certs/client.key
+      # Phase 5: requires deploy/migrations to have been applied (`make
+      # migrate`) — the orchestrator_audit_writer role/schema must exist.
+      AUDIT_DB_DSN: ${AUDIT_DB_INTERNAL_DSN:?set in deploy/.env}
     volumes:
       - ./certs:/certs:ro
     ports:

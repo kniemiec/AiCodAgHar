@@ -17,7 +17,7 @@ func TestDeterministicStepExecutor_NonZeroExitIsAFinding(t *testing.T) {
 			return launcherclient.RunResult{InvocationID: req.InvocationID, ExitCode: 1, Status: "completed"}, nil
 		},
 	}
-	e := &executor.DeterministicStepExecutor{Launcher: launcher, Secrets: &fakes.FakeSecretsClient{}}
+	e := &executor.DeterministicStepExecutor{Launcher: launcher, Secrets: &fakes.FakeSecretsClient{}, Audit: &fakes.FakeAuditWriter{}}
 
 	run, err := e.Execute(context.Background(), executor.StepContext{
 		Task:  domain.Task{ID: "task-1", TargetRepo: "owner/repo"},
@@ -36,7 +36,7 @@ func TestDeterministicStepExecutor_NonZeroExitIsAFinding(t *testing.T) {
 }
 
 func TestDeterministicStepExecutor_ZeroExitIsNotAFinding(t *testing.T) {
-	e := &executor.DeterministicStepExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: &fakes.FakeSecretsClient{}}
+	e := &executor.DeterministicStepExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: &fakes.FakeSecretsClient{}, Audit: &fakes.FakeAuditWriter{}}
 
 	run, err := e.Execute(context.Background(), executor.StepContext{
 		Task:  domain.Task{ID: "task-1", TargetRepo: "owner/repo"},

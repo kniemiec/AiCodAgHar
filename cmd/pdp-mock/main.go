@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 )
@@ -30,8 +31,17 @@ func main() {
 		log.Fatalf("pdp-mock: git client: %v", err)
 	}
 
-	d := &decider{git: git, ref: ref}
-	log.Printf("pdp-mock listening on %s (forgejo=%s ref=%s)", addr, forgejoURL, ref)
+	var baselineRepo *gitclient.RepoRef
+	if v := os.Getenv("GLOBAL_BASELINE_REPO"); v != "" {
+		owner, name, ok := strings.Cut(v, "/")
+		if !ok {
+			log.Fatalf("pdp-mock: GLOBAL_BASELINE_REPO must be \"owner/name\", got %q", v)
+		}
+		baselineRepo = &gitclient.RepoRef{Owner: owner, Name: name}
+	}
+
+	d := &decider{git: git, ref: ref, baselineRepo: baselineRepo}
+	log.Printf("pdp-mock listening on %s (forgejo=%s ref=%s baseline=%v)", addr, forgejoURL, ref, baselineRepo)
 	if err := http.ListenAndServe(addr, logRequests(newServeMux(d))); err != nil {
 		log.Fatalf("pdp-mock: %v", err)
 	}

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kniemiec/AiCodAgHar/internal/audit"
+	"github.com/kniemiec/AiCodAgHar/internal/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/secretsclient"
 )
 
@@ -45,4 +47,20 @@ func launchEnv(forgejoURL string, sc StepContext, cred secretsclient.Credential)
 		env["PR_NUMBER"] = strconv.Itoa(sc.Task.PRNumber)
 	}
 	return env
+}
+
+// auditStepRun writes this invocation's audit row — the "launch start/stop"
+// decision point. Called on both the success and failure launch paths.
+func auditStepRun(ctx context.Context, w audit.AuditWriter, sc StepContext, invocationID string, result launcherclient.RunResult) error {
+	return w.WriteInvocationRecord(ctx, audit.InvocationAuditRecord{
+		InvocationID: invocationID,
+		TaskID:       sc.Task.ID,
+		Round:        sc.Round,
+		StepID:       sc.Step.StepID,
+		StepType:     sc.Step.Type,
+		BotAccount:   sc.Step.BotAccount,
+		TargetRepo:   sc.Task.TargetRepo,
+		ExitCode:     result.ExitCode,
+		Status:       result.Status,
+	})
 }

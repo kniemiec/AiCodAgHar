@@ -6,10 +6,12 @@ package coreloop
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
 	"github.com/kniemiec/AiCodAgHar/internal/approval"
+	"github.com/kniemiec/AiCodAgHar/internal/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
 	"github.com/kniemiec/AiCodAgHar/internal/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/executor"
@@ -29,10 +31,11 @@ const (
 // Dependencies are the test-seam interfaces Run needs, plus the
 // orchestrator process identity PolicyRequest carries. SecretsClient is
 // wired into internal/executor directly (credential issuance happens per
-// step, not per round); AuditWriter is wired starting Phase 5.
+// step, not per round).
 type Dependencies struct {
 	Policy                 policyclient.PolicyClient
 	Approval               approval.ApprovalVerifier
+	Audit                  audit.AuditWriter
 	Executors              *executor.Registry
 	OrchestratorInstanceID string
 }
@@ -47,22 +50,34 @@ type Result struct {
 }
 
 // Run executes the core loop for one task until it reaches a terminal
-// outcome or exhausts MaxRounds.
+// outcome or exhausts MaxRounds. Every PDP decision and the task's terminal
+// outcome are audited (internal/executor's step executors audit their own
+// invocations) — an audit write failure fails the task, matching this
+// project's fail-closed posture elsewhere (ADR-3/ADR-9).
 func Run(ctx context.Context, deps Dependencies, task domain.Task) (Result, error) {
 	var allRuns []domain.StepRun
 
 	for round := 1; round <= MaxRounds; round++ {
-		decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round))
+		pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval", task.ID, round)
+		decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round, pdpInvocationID))
 		if err != nil {
 			return Result{}, fmt.Errorf("round %d: policy evaluate: %w", round, err)
 		}
 
+		if err := auditPDPDecision(ctx, deps.Audit, task, round, pdpInvocationID, decision); err != nil {
+			return Result{}, fmt.Errorf("round %d: audit PDP decision: %w", round, err)
+		}
+
 		switch decision.Decision {
 		case "deny":
-			return Result{
+			result := Result{
 				TaskID: task.ID, Outcome: OutcomeStopEscalate, RoundsRun: round,
 				Reason: "policy denied: " + decision.Reason, StepRuns: allRuns,
-			}, nil
+			}
+			if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
+				return Result{}, fmt.Errorf("round %d: audit task outcome: %w", round, err)
+			}
+			return result, nil
 
 		case "require_human_approval":
 			res, err := deps.Approval.VerifyApproval(ctx, approval.ApprovalCheckRequest{TargetRepo: task.TargetRepo})
@@ -70,10 +85,14 @@ func Run(ctx context.Context, deps Dependencies, task domain.Task) (Result, erro
 				return Result{}, fmt.Errorf("round %d: verify approval: %w", round, err)
 			}
 			if !res.Approved {
-				return Result{
+				result := Result{
 					TaskID: task.ID, Outcome: OutcomeStopEscalate, RoundsRun: round,
 					Reason: "human approval required and not granted", StepRuns: allRuns,
-				}, nil
+				}
+				if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
+					return Result{}, fmt.Errorf("round %d: audit task outcome: %w", round, err)
+				}
+				return result, nil
 			}
 
 		case "allow":
@@ -83,26 +102,34 @@ func Run(ctx context.Context, deps Dependencies, task domain.Task) (Result, erro
 			return Result{}, fmt.Errorf("round %d: unknown policy decision %q", round, decision.Decision)
 		}
 
-		runs, err := fanOut(ctx, deps.Executors, task, round, decision.ResolvedSteps, decision.GrantedScopes)
+		runs, err := fanOut(ctx, deps, task, round, decision.ResolvedSteps, decision.GrantedScopes)
 		if err != nil {
 			return Result{}, fmt.Errorf("round %d: fan out: %w", round, err)
 		}
 		allRuns = append(allRuns, runs...)
 
 		if !aggregate(runs) {
-			return Result{TaskID: task.ID, Outcome: OutcomeStopSuccess, RoundsRun: round, StepRuns: allRuns}, nil
+			result := Result{TaskID: task.ID, Outcome: OutcomeStopSuccess, RoundsRun: round, StepRuns: allRuns}
+			if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
+				return Result{}, fmt.Errorf("round %d: audit task outcome: %w", round, err)
+			}
+			return result, nil
 		}
 	}
 
-	return Result{
+	result := Result{
 		TaskID: task.ID, Outcome: OutcomeStopEscalate, RoundsRun: MaxRounds,
 		Reason: "round cap reached with blocking findings outstanding", StepRuns: allRuns,
-	}, nil
+	}
+	if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
+		return Result{}, fmt.Errorf("audit task outcome: %w", err)
+	}
+	return result, nil
 }
 
-func policyRequest(deps Dependencies, task domain.Task, round int) policyclient.PolicyRequest {
+func policyRequest(deps Dependencies, task domain.Task, round int, invocationID string) policyclient.PolicyRequest {
 	return policyclient.PolicyRequest{
-		InvocationID:           fmt.Sprintf("%s:round-%d:pdp-eval", task.ID, round),
+		InvocationID:           invocationID,
 		TaskID:                 task.ID,
 		TriggeringPrincipal:    task.TriggeringPrincipal,
 		OrchestratorInstanceID: deps.OrchestratorInstanceID,
@@ -114,9 +141,48 @@ func policyRequest(deps Dependencies, task domain.Task, round int) policyclient.
 	}
 }
 
+// auditPDPDecision writes one "pdp-decision" audit row per round, whether
+// or not it results in any launches — this is the only place a deny or an
+// unapproved require_human_approval round leaves an audit trail at all.
+func auditPDPDecision(ctx context.Context, w audit.AuditWriter, task domain.Task, round int, invocationID string, decision policyclient.PolicyDecision) error {
+	resolvedStepsJSON, err := json.Marshal(decision.ResolvedSteps)
+	if err != nil {
+		return fmt.Errorf("marshal resolved_steps: %w", err)
+	}
+	return w.WriteInvocationRecord(ctx, audit.InvocationAuditRecord{
+		InvocationID:        invocationID,
+		TaskID:              task.ID,
+		Round:               round,
+		StepType:            "pdp-decision",
+		BotAccount:          task.BotAccount,
+		TargetRepo:          task.TargetRepo,
+		PolicyDecision:      decision.Decision,
+		GrantedScopes:       decision.GrantedScopes,
+		PolicyBundleVersion: decision.PolicyBundleVersion,
+		ResolvedStepsJSON:   resolvedStepsJSON,
+	})
+}
+
+// auditTaskOutcome writes one "task-outcome" row per task — the terminal
+// stop-success/stop-escalate decision point ADR-1's execution-outcome
+// merge otherwise has nowhere to land, since it isn't scoped to any single
+// invocation.
+func auditTaskOutcome(ctx context.Context, w audit.AuditWriter, task domain.Task, result Result) error {
+	return w.WriteInvocationRecord(ctx, audit.InvocationAuditRecord{
+		InvocationID: fmt.Sprintf("%s:outcome", task.ID),
+		TaskID:       task.ID,
+		Round:        result.RoundsRun,
+		StepType:     "task-outcome",
+		BotAccount:   task.BotAccount,
+		TargetRepo:   task.TargetRepo,
+		Status:       string(result.Outcome),
+		Evidence:     result.Reason,
+	})
+}
+
 // fanOut dispatches every PDP-resolved step concurrently through the
 // registry and waits for all of them to finish.
-func fanOut(ctx context.Context, reg *executor.Registry, task domain.Task, round int, steps []policyclient.ResolvedStep, grantedScopes []string) ([]domain.StepRun, error) {
+func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int, steps []policyclient.ResolvedStep, grantedScopes []string) ([]domain.StepRun, error) {
 	runs := make([]domain.StepRun, len(steps))
 	errs := make([]error, len(steps))
 
@@ -125,7 +191,7 @@ func fanOut(ctx context.Context, reg *executor.Registry, task domain.Task, round
 		wg.Add(1)
 		go func(i int, step policyclient.ResolvedStep) {
 			defer wg.Done()
-			exec, ok := reg.Lookup(step.Type)
+			exec, ok := deps.Executors.Lookup(step.Type)
 			if !ok {
 				errs[i] = fmt.Errorf("no executor registered for step type %q", step.Type)
 				return

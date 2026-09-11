@@ -26,13 +26,14 @@ type createTaskRequest struct {
 }
 
 type stepRunWire struct {
-	Round        int    `json:"round"`
-	StepID       string `json:"step_id"`
-	StepType     string `json:"step_type"`
-	InvocationID string `json:"invocation_id"`
-	Blocking     bool   `json:"blocking"`
-	ExitCode     int32  `json:"exit_code"`
-	HasFinding   bool   `json:"has_finding"`
+	Round            int             `json:"round"`
+	StepID           string          `json:"step_id"`
+	StepType         string          `json:"step_type"`
+	InvocationID     string          `json:"invocation_id"`
+	Blocking         bool            `json:"blocking"`
+	ExitCode         int32           `json:"exit_code"`
+	HasFinding       bool            `json:"has_finding"`
+	StructuredResult json.RawMessage `json:"structured_result,omitempty"`
 }
 
 type createTaskResponse struct {
@@ -116,6 +117,7 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		stepRuns[i] = stepRunWire{
 			Round: sr.Round, StepID: sr.StepID, StepType: sr.StepType, InvocationID: sr.InvocationID,
 			Blocking: sr.Blocking, ExitCode: sr.ExitCode, HasFinding: sr.HasFinding,
+			StructuredResult: json.RawMessage(sr.StructuredResult),
 		}
 	}
 

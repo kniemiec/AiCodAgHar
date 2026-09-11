@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/kniemiec/AiCodAgHar/internal/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/domain"
@@ -30,6 +31,7 @@ type agentStageResult struct {
 type AgentStageExecutor struct {
 	Launcher   launcherclient.ContainerLauncher
 	Secrets    secretsclient.SecretsClient
+	Audit      audit.AuditWriter
 	ForgejoURL string
 }
 
@@ -53,6 +55,7 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 		TimeoutSeconds: 0,
 	})
 	if err != nil {
+		_ = auditStepRun(context.Background(), e.Audit, sc, invocationID, launcherclient.RunResult{InvocationID: invocationID, Status: "error"})
 		return domain.StepRun{}, fmt.Errorf("launch agent-stage step %s: %w", sc.Step.StepID, err)
 	}
 
@@ -68,13 +71,18 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 		}
 	}
 
+	if err := auditStepRun(ctx, e.Audit, sc, invocationID, result); err != nil {
+		return domain.StepRun{}, fmt.Errorf("audit agent-stage step %s: %w", sc.Step.StepID, err)
+	}
+
 	return domain.StepRun{
-		Round:        sc.Round,
-		StepID:       sc.Step.StepID,
-		StepType:     StepTypeAgentStage,
-		InvocationID: result.InvocationID,
-		Blocking:     sc.Step.Blocking,
-		ExitCode:     result.ExitCode,
-		HasFinding:   parsed.HasBlockingFinding,
+		Round:            sc.Round,
+		StepID:           sc.Step.StepID,
+		StepType:         StepTypeAgentStage,
+		InvocationID:     result.InvocationID,
+		Blocking:         sc.Step.Blocking,
+		ExitCode:         result.ExitCode,
+		HasFinding:       parsed.HasBlockingFinding,
+		StructuredResult: logs.StructuredResultJSON,
 	}, nil
 }

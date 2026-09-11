@@ -27,11 +27,16 @@ type PolicyRequest struct {
 // and the base AuthZEN response has nowhere else to carry it. See
 // docs/plans/active/orchestrator-control-plane-mvp.md's Architect
 // Perspective note on contract mismatches surfacing during implementation.
+//
+// json tags matter here: this type is also what internal/coreloop marshals
+// verbatim into the audit trail's resolved_steps column (Phase 5), so its
+// wire shape should match api/openapi/pdp-authzen.yaml's snake_case
+// ResolvedStep schema, not Go's default capitalized field names.
 type ResolvedStep struct {
-	StepID     string
-	Type       string // agent-stage | deterministic-step
-	Blocking   bool
-	BotAccount string
+	StepID     string `json:"step_id"`
+	Type       string `json:"type"` // agent-stage | deterministic-step
+	Blocking   bool   `json:"blocking"`
+	BotAccount string `json:"bot_account"`
 }
 
 // PolicyDecision mirrors api/openapi/pdp-authzen.yaml's EvaluationResponse.

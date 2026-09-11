@@ -1,9 +1,9 @@
 // control-plane is the real, unprivileged production binary (see
-// docs/plans/active/orchestrator-control-plane-mvp.md). Phase 4 wires all
-// the real client implementations built so far — GitHostClient,
-// PolicyClient, SecretsClient, ContainerLauncher, ApprovalVerifier — into
-// internal/coreloop and exposes a REST endpoint to create a task.
-// AuditWriter's production Postgres implementation lands in Phase 5.
+// docs/plans/active/orchestrator-control-plane-mvp.md). Wires all the real
+// client implementations — GitHostClient, PolicyClient, SecretsClient,
+// ContainerLauncher, ApprovalVerifier, and (Phase 5) the Postgres
+// AuditWriter — into internal/coreloop and exposes a REST endpoint to
+// create a task.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"os"
 
 	"github.com/kniemiec/AiCodAgHar/internal/approval"
+	"github.com/kniemiec/AiCodAgHar/internal/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
@@ -53,9 +54,15 @@ func main() {
 	}
 	defer launcher.Close()
 
+	auditWriter, err := audit.NewPostgresWriter(requireEnv("AUDIT_DB_DSN"))
+	if err != nil {
+		log.Fatalf("control-plane: audit writer: %v", err)
+	}
+	defer auditWriter.Close()
+
 	registry := executor.NewRegistry(
-		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, ForgejoURL: forgejoURL},
-		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, ForgejoURL: forgejoURL},
+		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
+		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
 	)
 
 	srv := &server{
@@ -63,6 +70,7 @@ func main() {
 		loop: coreloop.Dependencies{
 			Policy:                 policy,
 			Approval:               approval.NoopApprovalVerifier{},
+			Audit:                  auditWriter,
 			Executors:              registry,
 			OrchestratorInstanceID: orchestratorInstanceID,
 		},

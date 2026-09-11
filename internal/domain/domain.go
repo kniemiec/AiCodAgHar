@@ -32,14 +32,21 @@ type Round struct {
 // StepExecutor registry (internal/executor) for one Round. HasFinding is a
 // Phase 2 stub signal — the aggregate/evaluate transition in internal/coreloop
 // treats a StepRun as blocking iff Blocking && HasFinding.
+//
+// StructuredResult is a Phase 6 addition: the raw
+// ExtractLogsResponse.StructuredResultJSON both executor types now surface
+// on their StepRun, not just parse internally for HasFinding — the e2e
+// smoke test asserts the deterministic-step executor's structured result is
+// present on its step_run.
 type StepRun struct {
-	Round        int
-	StepID       string
-	StepType     string // agent-stage | deterministic-step
-	InvocationID string
-	Blocking     bool
-	ExitCode     int32
-	HasFinding   bool
+	Round            int
+	StepID           string
+	StepType         string // agent-stage | deterministic-step
+	InvocationID     string
+	Blocking         bool
+	ExitCode         int32
+	HasFinding       bool
+	StructuredResult []byte
 }
 
 // Invocation is one ContainerLauncher.Launch call, identified the same way

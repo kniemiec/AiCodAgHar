@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/kniemiec/AiCodAgHar/internal/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/domain"
@@ -21,6 +22,7 @@ import (
 type DeterministicStepExecutor struct {
 	Launcher   launcherclient.ContainerLauncher
 	Secrets    secretsclient.SecretsClient
+	Audit      audit.AuditWriter
 	ForgejoURL string
 }
 
@@ -44,16 +46,27 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 		TimeoutSeconds: 0,
 	})
 	if err != nil {
+		_ = auditStepRun(context.Background(), e.Audit, sc, invocationID, launcherclient.RunResult{InvocationID: invocationID, Status: "error"})
 		return domain.StepRun{}, fmt.Errorf("launch deterministic-step %s: %w", sc.Step.StepID, err)
 	}
 
+	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
+	if err != nil {
+		return domain.StepRun{}, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err)
+	}
+
+	if err := auditStepRun(ctx, e.Audit, sc, invocationID, result); err != nil {
+		return domain.StepRun{}, fmt.Errorf("audit deterministic-step %s: %w", sc.Step.StepID, err)
+	}
+
 	return domain.StepRun{
-		Round:        sc.Round,
-		StepID:       sc.Step.StepID,
-		StepType:     StepTypeDeterministicStep,
-		InvocationID: result.InvocationID,
-		Blocking:     sc.Step.Blocking,
-		ExitCode:     result.ExitCode,
-		HasFinding:   result.ExitCode != 0,
+		Round:            sc.Round,
+		StepID:           sc.Step.StepID,
+		StepType:         StepTypeDeterministicStep,
+		InvocationID:     result.InvocationID,
+		Blocking:         sc.Step.Blocking,
+		ExitCode:         result.ExitCode,
+		HasFinding:       result.ExitCode != 0,
+		StructuredResult: logs.StructuredResultJSON,
 	}, nil
 }

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kniemiec/AiCodAgHar/schemas/policy.schema.json",
+  "title": "Policy overrides (.harness/policy.yaml)",
+  "description": "Narrow-only override shape: this repo-local file may restrict what the global-baseline policy and stages.yaml allow, never grant new scopes or steps.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "risk_tier_overrides": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["match", "risk_tier"],
+        "properties": {
+          "match": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "files_touched_patterns": { "type": "array", "items": { "type": "string" } },
+              "task_type": { "type": "string" }
+            }
+          },
+          "risk_tier": { "type": "string" }
+        }
+      }
+    },
+    "require_human_approval": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step_id"],
+        "properties": {
+          "step_id": { "type": "string" },
+          "risk_tier": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "quota_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope", "max_per_window", "window_seconds"],
+        "properties": {
+          "scope": { "type": "string" },
+          "max_per_window": { "type": "integer", "minimum": 1 },
+          "window_seconds": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  }
+}

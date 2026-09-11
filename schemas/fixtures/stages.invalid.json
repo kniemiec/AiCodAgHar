@@ -1,0 +1,9 @@
+[
+  {
+    "id": "run-unit-tests",
+    "type": "deterministic-step",
+    "bot_account": "ci-bot",
+    "task_type": "pr-review-round",
+    "blocking": true
+  }
+]

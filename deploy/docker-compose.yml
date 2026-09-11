@@ -1,0 +1,143 @@
+name: orchestrator-mvp
+
+networks:
+  orchestrator-net: {}
+
+volumes:
+  postgres-data:
+  forgejo-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set in deploy/.env}
+      FORGEJO_DB_PASSWORD: ${FORGEJO_DB_PASSWORD:?set in deploy/.env}
+      ORCHESTRATOR_DB_PASSWORD: ${ORCHESTRATOR_DB_PASSWORD:?set in deploy/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks: [orchestrator-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:16
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: postgres:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: forgejo
+      FORGEJO__database__PASSWD: ${FORGEJO_DB_PASSWORD:?set in deploy/.env}
+      FORGEJO__server__DOMAIN: localhost
+      FORGEJO__server__ROOT_URL: http://localhost:3001/
+      FORGEJO__server__SSH_DOMAIN: localhost
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__security__INSTALL_LOCK: "true"
+    volumes:
+      - forgejo-data:/data
+    ports:
+      - "3001:3000"
+      - "2222:22"
+    networks: [orchestrator-net]
+
+  secrets-mock:
+    build:
+      context: ..
+      dockerfile: deploy/docker/secrets-mock.Dockerfile
+    restart: unless-stopped
+    environment:
+      ADDR: ":8080"
+      SECRETS_MOCK_POOL_JSON: ${SECRETS_MOCK_POOL_JSON:-}
+    ports:
+      - "8082:8080"
+    networks: [orchestrator-net]
+
+  pdp-mock:
+    build:
+      context: ..
+      dockerfile: deploy/docker/pdp-mock.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      forgejo:
+        condition: service_started
+    environment:
+      ADDR: ":8080"
+      FORGEJO_URL: "http://forgejo:3000"
+      # Empty until `make bootstrap-admin` has run and deploy/.env carries a
+      # real token — this container crash-loops with a clear log message
+      # until then; `make bootstrap-admin` recreates it once the token exists.
+      FORGEJO_TOKEN: ${FORGEJO_ADMIN_TOKEN}
+      PDP_MOCK_REF: "main"
+      # Phase 6: platform-owned global-baseline policy repo `make seed`
+      # creates. Optional — pdp-mock works target-repo-only if unset.
+      GLOBAL_BASELINE_REPO: ${FORGEJO_ADMIN_USERNAME:-}/platform-baseline-policy
+    ports:
+      - "8081:8080"
+    networks: [orchestrator-net]
+
+  launcher-mock:
+    build:
+      context: ..
+      dockerfile: deploy/docker/launcher-mock.Dockerfile
+    restart: unless-stopped
+    environment:
+      ADDR: ":9443"
+      TLS_CA_CERT: /certs/ca.crt
+      TLS_SERVER_CERT: /certs/server.crt
+      TLS_SERVER_KEY: /certs/server.key
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "9443:9443"
+    networks: [orchestrator-net]
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: deploy/docker/control-plane.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      forgejo:
+        condition: service_started
+      pdp-mock:
+        condition: service_started
+      secrets-mock:
+        condition: service_started
+      launcher-mock:
+        condition: service_started
+    environment:
+      ADDR: ":8080"
+      FORGEJO_URL: "http://forgejo:3000"
+      # Same first-boot caveat as pdp-mock: empty until `make bootstrap-admin`
+      # has run; crash-loops with a clear log message until then.
+      FORGEJO_TOKEN: ${FORGEJO_ADMIN_TOKEN}
+      PDP_MOCK_URL: "http://pdp-mock:8080"
+      SECRETS_MOCK_URL: "http://secrets-mock:8080"
+      LAUNCHER_ADDR: "launcher-mock:9443"
+      TLS_CA_CERT: /certs/ca.crt
+      TLS_CLIENT_CERT: /certs/client.crt
+      TLS_CLIENT_KEY: /certs/client.key
+      # Phase 5: requires deploy/migrations to have been applied (`make
+      # migrate`) — the orchestrator_audit_writer role/schema must exist.
+      AUDIT_DB_DSN: ${AUDIT_DB_INTERNAL_DSN:?set in deploy/.env}
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "8080:8080"
+    networks: [orchestrator-net]

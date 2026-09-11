@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kniemiec/AiCodAgHar/schemas/stages.schema.json",
+  "title": "Stage list (.harness/stages.yaml)",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["id", "type", "bot_account", "task_type", "blocking"],
+    "properties": {
+      "id": { "type": "string" },
+      "type": { "type": "string", "enum": ["agent-stage", "deterministic-step"] },
+      "bot_account": { "type": "string" },
+      "task_type": { "type": "string" },
+      "blocking": { "type": "boolean" },
+      "conditions": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "risk_tier": { "type": "array", "items": { "type": "string" } },
+          "files_touched_patterns": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "command": { "type": "string" },
+      "working_dir": { "type": "string" },
+      "timeout_seconds": { "type": "integer", "minimum": 1 },
+      "expected_exit_codes": {
+        "type": "array",
+        "items": { "type": "integer" },
+        "default": [0]
+      }
+    },
+    "allOf": [
+      {
+        "if": {
+          "properties": { "type": { "const": "deterministic-step" } },
+          "required": ["type"]
+        },
+        "then": {
+          "required": ["command", "working_dir", "timeout_seconds"]
+        }
+      },
+      {
+        "if": {
+          "properties": { "type": { "const": "agent-stage" } },
+          "required": ["type"]
+        },
+        "then": {
+          "not": { "required": ["command"] }
+        }
+      }
+    ]
+  }
+}

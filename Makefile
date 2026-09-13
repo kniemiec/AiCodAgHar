@@ -1,6 +1,6 @@
 .PHONY: build test test-spike test-integration test-e2e compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
 
-BUF := $(shell go env GOPATH)/bin/buf
+BUF := buf
 
 build:
 	go build ./...

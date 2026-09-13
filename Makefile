@@ -1,6 +1,6 @@
 .PHONY: build test test-spike test-integration test-e2e compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
 
-BUF := $(shell go env GOPATH)/bin/buf
+BUF := buf
 
 build:
 	go build ./...
@@ -54,6 +54,9 @@ tidy:
 
 # buf is installed as a standalone binary (not an in-module go tool) to avoid
 # pulling its large dependency tree into this module's go.mod/go.sum.
+# If you use mise (see .mise.toml), `mise install` gets you the same pinned
+# buf version alongside the repo's pinned Go — this target is the fallback
+# for anyone not using mise.
 install-buf:
 	go install github.com/bufbuild/buf/cmd/buf@v1.72.0
 

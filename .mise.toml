@@ -1,0 +1,10 @@
+# Pins the external tool versions this repo needs, so `mise install` gives
+# any macOS/Linux machine the same toolchain without hand-tracking versions.
+#
+# go: matches the version pinned in go.mod (`go 1.25.10`) so mise's go and
+# go.mod's toolchain auto-download never disagree.
+# buf: matches the version `make install-buf` installs (see Makefile) — buf
+# is deliberately kept out of go.mod's own dependency graph.
+[tools]
+go = "1.25.10"
+buf = "1.72.0"

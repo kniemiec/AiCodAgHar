@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/kniemiec/AiCodAgHar/internal/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
@@ -430,5 +431,151 @@ func TestRunner_ReconcileTask_NonRunningTaskIsNoop(t *testing.T) {
 	}
 	if result.Outcome != "" {
 		t.Fatalf("expected a no-op Result for an unknown task, got %+v", result)
+	}
+}
+
+// approvePhasePolicy resolves an approve-phase gate plus a publish-phase
+// step that only ever dispatches once that gate is satisfied — the shape
+// design §4.4's approve tests below share.
+func approvePhasePolicy() *fakes.FakePolicyClient {
+	return &fakes.FakePolicyClient{
+		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+			return policyclient.PolicyDecision{
+				Decision: "allow",
+				ResolvedSteps: []policyclient.ResolvedStep{
+					{StepID: "human-signoff", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhaseApprove},
+					{StepID: "notify", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhasePublish},
+				},
+			}, nil
+		},
+	}
+}
+
+// TestRunner_ApprovePhase_PausesThenResumesOnApproval exercises design
+// §4.4's full pause/resume cycle end to end: an unmet approve gate persists
+// waiting_approval with an issue number and leaves current_round at the
+// last *completed* round (0 here, since round 1 never completes) —
+// ReconcileTask/Resume's own "+1" convention depends on that not changing.
+// RecordApproval + Resume then continues the same round to publish and
+// stop-success, using approval.RealApprovalVerifier (not the scripted fake)
+// since this specifically exercises reading back what RecordApproval wrote.
+func TestRunner_ApprovePhase_PausesThenResumesOnApproval(t *testing.T) {
+	launcher := &fakes.FakeContainerLauncher{}
+	git := &fakes.FakeGitHostClient{}
+	store := &fakes.FakeTaskStore{}
+	deps := newDeps(launcher, approvePhasePolicy(), store, &fakes.FakeAuditWriter{})
+	deps.Coreloop.IssueOpener = git
+	deps.Coreloop.Approval = &approval.RealApprovalVerifier{Reader: taskrunner.NewTaskApprovalReader(store)}
+	runner := taskrunner.NewRunner(deps)
+	ctx := context.Background()
+
+	taskID, done, err := runner.Start(ctx, domain.Task{ID: "task-1", TargetRepo: "acme/widgets"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	result := <-done
+	if result.Outcome != coreloop.OutcomeWaitingApproval {
+		t.Fatalf("expected waiting-approval, got %v (%s)", result.Outcome, result.Reason)
+	}
+	if len(launcher.Launches()) != 0 {
+		t.Fatalf("expected zero launches before approval, got %d", len(launcher.Launches()))
+	}
+
+	rec, ok, err := store.GetTask(ctx, taskID)
+	if err != nil || !ok {
+		t.Fatalf("GetTask: ok=%v err=%v", ok, err)
+	}
+	if rec.State.Status != domain.TaskStatusWaitingApproval {
+		t.Fatalf("expected persisted status waiting_approval, got %q", rec.State.Status)
+	}
+	if rec.State.ApprovalIssueNumber == nil || *rec.State.ApprovalIssueNumber == 0 {
+		t.Fatalf("expected a non-zero persisted approval_issue_number, got %v", rec.State.ApprovalIssueNumber)
+	}
+	if rec.State.CurrentRound != 0 {
+		t.Fatalf("expected current_round to stay 0 (round 1 never completed), got %d", rec.State.CurrentRound)
+	}
+
+	if err := runner.RecordApproval(ctx, taskID, "alice", "issue labeled approved by alice"); err != nil {
+		t.Fatalf("RecordApproval: %v", err)
+	}
+	rec, _, _ = store.GetTask(ctx, taskID)
+	if rec.State.Status != domain.TaskStatusRunning || rec.State.ApprovedBy != "alice" {
+		t.Fatalf("expected status=running, approved_by=alice after RecordApproval, got %+v", rec.State)
+	}
+
+	result2, err := runner.Resume(ctx, taskID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if result2.Outcome != coreloop.OutcomeStopSuccess {
+		t.Fatalf("expected stop-success after approval, got %v (%s)", result2.Outcome, result2.Reason)
+	}
+	if launches := launcher.Launches(); len(launches) != 1 || launches[0].StepID != "notify" {
+		t.Fatalf("expected exactly one launch, for the publish-phase step, got %+v", launches)
+	}
+
+	rec, _, _ = store.GetTask(ctx, taskID)
+	if rec.State.Status != domain.TaskStatusStopSuccess {
+		t.Fatalf("expected final persisted status stop_success, got %q", rec.State.Status)
+	}
+}
+
+// TestRunner_ApprovePhase_RejectionEscalatesWithoutResuming exercises
+// RecordRejection's whole terminal path: unlike approval, a rejection never
+// gets to Resume — it's stop-escalate on its own.
+func TestRunner_ApprovePhase_RejectionEscalatesWithoutResuming(t *testing.T) {
+	launcher := &fakes.FakeContainerLauncher{}
+	store := &fakes.FakeTaskStore{}
+	deps := newDeps(launcher, approvePhasePolicy(), store, &fakes.FakeAuditWriter{})
+	deps.Coreloop.IssueOpener = &fakes.FakeGitHostClient{}
+	runner := taskrunner.NewRunner(deps)
+	ctx := context.Background()
+
+	taskID, done, err := runner.Start(ctx, domain.Task{ID: "task-1", TargetRepo: "acme/widgets"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if result := <-done; result.Outcome != coreloop.OutcomeWaitingApproval {
+		t.Fatalf("expected waiting-approval, got %v", result.Outcome)
+	}
+
+	if err := runner.RecordRejection(ctx, taskID, "bob", "issue labeled rejected by bob"); err != nil {
+		t.Fatalf("RecordRejection: %v", err)
+	}
+
+	rec, ok, err := store.GetTask(ctx, taskID)
+	if err != nil || !ok {
+		t.Fatalf("GetTask: ok=%v err=%v", ok, err)
+	}
+	if rec.State.Status != domain.TaskStatusStopEscalate {
+		t.Fatalf("expected persisted status stop_escalate, got %q", rec.State.Status)
+	}
+	if rec.State.Reason == "" {
+		t.Fatal("expected a non-empty persisted reason")
+	}
+	if len(launcher.Launches()) != 0 {
+		t.Fatalf("expected zero launches (never resumed), got %d", len(launcher.Launches()))
+	}
+}
+
+// TestRunner_RecordApproval_RejectsNonWaitingTask guards RecordApproval and
+// RecordRejection against a stale/duplicate webhook delivery arriving after
+// the task already moved on (a second "approved" label event on an issue
+// whose task already resumed and finished, say) — both must fail rather
+// than silently reopening or double-processing it.
+func TestRunner_RecordApproval_RejectsNonWaitingTask(t *testing.T) {
+	store := &fakes.FakeTaskStore{}
+	runner := taskrunner.NewRunner(newDeps(&fakes.FakeContainerLauncher{}, &fakes.FakePolicyClient{}, store, &fakes.FakeAuditWriter{}))
+	ctx := context.Background()
+	task := domain.Task{ID: "task-1"}
+	if err := store.CreateTask(ctx, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	if err := runner.RecordApproval(ctx, task.ID, "alice", "evidence"); err == nil {
+		t.Fatal("expected RecordApproval to fail for a task that isn't waiting_approval")
+	}
+	if err := runner.RecordRejection(ctx, task.ID, "bob", "evidence"); err == nil {
+		t.Fatal("expected RecordRejection to fail for a task that isn't waiting_approval")
 	}
 }

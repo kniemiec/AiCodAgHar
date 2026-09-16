@@ -9,7 +9,9 @@ package taskrunner
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/kniemiec/AiCodAgHar/internal/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
 	"github.com/kniemiec/AiCodAgHar/internal/domain"
 )
@@ -51,9 +53,22 @@ type TaskStore interface {
 	// launched/completed/failed before deciding what to (re)dispatch.
 	ListStepRuns(ctx context.Context, taskID string, round int) ([]domain.StepRun, error)
 
+	// ListStepRunsForTask returns every step_runs row for a task across all
+	// of its rounds, in (round, dispatch) order — GET /tasks/{id}'s (design
+	// §4.3) view of a task's full step history, as opposed to
+	// ListStepRuns' single-round scope.
+	ListStepRunsForTask(ctx context.Context, taskID string) ([]domain.StepRun, error)
+
 	// ListRunningTaskIDs returns every task currently status=running — the
 	// startup-reconciliation scan's entry point.
 	ListRunningTaskIDs(ctx context.Context) ([]string, error)
+
+	// FindWaitingApprovalTask looks up the task currently waiting on
+	// issueNumber in targetRepo (design §4.4 step 3's webhook-handler
+	// lookup). ok is false if no such task exists — already resolved, the
+	// wrong repo/issue, or a stale/duplicate webhook delivery — which the
+	// caller treats as a 200 no-op, not an error.
+	FindWaitingApprovalTask(ctx context.Context, targetRepo string, issueNumber int) (taskID string, ok bool, err error)
 }
 
 // stepRunRecorder adapts a TaskStore into coreloop.StepRunRecorder — the
@@ -69,4 +84,30 @@ func (r stepRunRecorder) RecordLaunched(ctx context.Context, taskID string, roun
 
 func (r stepRunRecorder) RecordCompleted(ctx context.Context, taskID string, invocationID string, run domain.StepRun, execErr error) error {
 	return r.store.CompleteStepRun(ctx, taskID, invocationID, run, execErr)
+}
+
+// taskApprovalReader adapts a TaskStore into approval.TaskApprovalReader —
+// the narrow interface RealApprovalVerifier needs, so internal/approval
+// doesn't import taskrunner (which imports coreloop, which imports
+// approval), mirroring stepRunRecorder's adapter pattern above.
+type taskApprovalReader struct {
+	store TaskStore
+}
+
+// NewTaskApprovalReader adapts store into an approval.TaskApprovalReader,
+// for wiring approval.RealApprovalVerifier (design §4.4) — exported because
+// that wiring happens in cmd/control-plane's main.go, outside this package.
+func NewTaskApprovalReader(store TaskStore) approval.TaskApprovalReader {
+	return taskApprovalReader{store: store}
+}
+
+func (a taskApprovalReader) ApprovedBy(ctx context.Context, taskID string) (string, error) {
+	rec, ok, err := a.store.GetTask(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("taskrunner: approval check: no such task %s", taskID)
+	}
+	return rec.State.ApprovedBy, nil
 }

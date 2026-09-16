@@ -73,13 +73,24 @@ func main() {
 		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
 	)
 
+	// Real ApprovalVerifier (design §4.4): the actual verification work
+	// happens in handleForgejoWebhook; this just reads back what it
+	// persisted. WEBHOOK_APPROVAL_ENABLED opts in explicitly — without a
+	// webhook configured (e.g. local dev), NoopApprovalVerifier's fail-closed
+	// default is safer than a verifier that can never actually be satisfied.
+	var approvalVerifier approval.ApprovalVerifier = approval.NoopApprovalVerifier{}
+	if os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true" {
+		approvalVerifier = &approval.RealApprovalVerifier{Reader: taskrunner.NewTaskApprovalReader(taskStore)}
+	}
+
 	runner := taskrunner.NewRunner(taskrunner.Dependencies{
 		Coreloop: coreloop.Dependencies{
 			Policy:                 policy,
-			Approval:               approval.NoopApprovalVerifier{},
+			Approval:               approvalVerifier,
 			Audit:                  auditWriter,
 			Executors:              registry,
 			OrchestratorInstanceID: orchestratorInstanceID,
+			IssueOpener:            git,
 		},
 		Store:    taskStore,
 		Launcher: launcher,
@@ -92,7 +103,7 @@ func main() {
 		log.Fatalf("control-plane: startup reconciliation: %v", err)
 	}
 
-	srv := &server{git: git, runner: runner}
+	srv := &server{git: git, secrets: secrets, runner: runner}
 
 	log.Printf("control-plane listening on %s", addr)
 	if err := http.ListenAndServe(addr, logRequests(newServeMux(srv))); err != nil {

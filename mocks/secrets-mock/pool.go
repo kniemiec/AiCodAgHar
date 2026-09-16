@@ -62,3 +62,20 @@ func (p *pool) revoke(id string) bool {
 	p.issued[id] = cred
 	return true
 }
+
+// webhookSecretPool is design §4.4/§7's static pre-provisioned per-repo
+// webhook-HMAC-secret pool — a separate concept from pool's bot-token
+// credentials: a long-lived shared secret read back by repo key, not a
+// per-invocation credential with a TTL or a revoke path.
+type webhookSecretPool struct {
+	secretsByRepo map[string]string // "owner/name" -> secret
+}
+
+func newWebhookSecretPool(secretsByRepo map[string]string) *webhookSecretPool {
+	return &webhookSecretPool{secretsByRepo: secretsByRepo}
+}
+
+func (p *webhookSecretPool) get(repo string) (string, bool) {
+	secret, ok := p.secretsByRepo[repo]
+	return secret, ok
+}

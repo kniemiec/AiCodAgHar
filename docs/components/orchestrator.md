@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Living document — describes the current implementation; update it in the same change that makes it stale (see [`docs/components/README.md`](README.md)) |
 | **Component** | `cmd/control-plane` and the `internal/*` packages it's built from |
-| **Design docs** | [`orchestrator-design.md`](../designs/orchestrator-design.md) (original MVP), [`full-pipeline-async-approval-design.md`](../designs/next/full-pipeline-async-approval-design.md) (in-flight follow-up — implementation sequence §8: steps 1–2 landed, steps 3–4 not yet) |
+| **Design docs** | [`orchestrator-design.md`](../designs/orchestrator-design.md) (original MVP), [`full-pipeline-async-approval-design.md`](../designs/next/full-pipeline-async-approval-design.md) (follow-up — implementation sequence §8: all four steps landed) |
 | **Related ADRs** | [ADR-7](../architecture/week1-adr-7-multi-agent-review-workflow.md) (core loop), [ADR-9](../architecture/week2-adr-9-orchestrator-foundations.md) (foundations/test-seam interfaces), [ADR-11](../architecture/week3-adr-11-orchestrator-execution-engine.md) (execution engine) |
 | **Running it locally** | [`docs/local-development.md`](../local-development.md) — this document covers the orchestrator itself, not the local dev/test stack |
 
@@ -19,13 +19,13 @@ It talks to four dependencies — a Git host, a Policy Decision Point (PDP), a s
 | Package | Responsibility |
 |---|---|
 | `internal/domain` | The nouns everything else operates on. `Task` is a request's immutable config; `TaskState` is its live, persisted status/round/approval fields — split because only `TaskState` changes as a task runs. |
-| `internal/coreloop` | `RunRound(ctx, deps, task, round, priorFindings, alreadyCompleted)` — PDP-evaluate → group resolved steps by phase → fan out concurrently → aggregate → return `continue` / `stop-success` / `stop-escalate` for **this round only**. No DB, no loop across rounds — everything it needs comes in through `Dependencies` or its own parameters. |
-| `internal/taskrunner` | `Runner.Start` kicks off round 1 in a goroutine and hands back a completion channel; `runLoop` calls `coreloop.RunRound` once per round, persists `TaskState` after each one via `TaskStore`, and stops at the round cap or a terminal outcome. `Runner.Resume` continues a specific task from its next round. `Runner.Reconcile`/`ReconcileTask` — called once at startup — resumes every task left `status=running`, skipping steps already `completed`, resolving ones still `launched` against the launcher, and escalating (not guessing) if one can't be resolved. |
-| `internal/executor` | `Registry` is a closed map from step `type` (`agent-stage` \| `deterministic-step`) to a `StepExecutor`. Both executors mint a scoped credential, dispatch through `ContainerLauncher`, extract logs, and return a `domain.StepRun`. |
-| `internal/clients/*` | One Go interface + one production implementation per dependency boundary: `gitclient` (`GitHostClient`), `policyclient` (`PolicyClient`), `secretsclient` (`SecretsClient`), `launcherclient` (`ContainerLauncher`). `gitclient` also exposes provisioning-only methods on its concrete `*Client` (repo/user/token bootstrapping), deliberately outside the `GitHostClient` interface — the orchestrator's own runtime never calls them. |
-| `internal/audit` | `AuditWriter` interface; `PostgresWriter` writes `audit.invocation_audit`, one hash-chained row per PDP decision / step / task outcome. |
-| `internal/approval` | `ApprovalVerifier` interface; `NoopApprovalVerifier` always returns `Approved: false` — the real Forgejo issue/label/webhook-HMAC flow is [design §4.4](../designs/next/full-pipeline-async-approval-design.md), not yet built. |
-| `internal/config` | Parses and JSON-Schema-validates `.harness/stages.yaml` / `.harness/policy.yaml`. |
+| `internal/coreloop` | `RunRound(ctx, deps, task, round, priorFindings, alreadyCompleted)` — PDP-evaluate → fan out generate/review concurrently → aggregate → if no outstanding blocking findings, gate on `approve` (design §4.4) → dispatch `publish` → return `continue` / `stop-success` / `stop-escalate` / `waiting-approval` for **this round only**. No DB, no loop across rounds — everything it needs comes in through `Dependencies` or its own parameters. |
+| `internal/taskrunner` | `Runner.Start` kicks off round 1 in a goroutine and hands back a completion channel (kept for tests' benefit — `cmd/control-plane`'s handler no longer reads it, since §4.3 landed); `runLoop` calls `coreloop.RunRound` once per round, persists `TaskState` after each one via `TaskStore`, and stops at the round cap or a terminal outcome. `Runner.GetTaskStatus` composes a task's live state with its full step-run history — `GET /tasks/{id}`'s read path. `Runner.RecordApproval`/`RecordRejection` persist a webhook-verified decision (design §4.4); `Runner.Resume` then re-evaluates the same round it paused on, via `loadAlreadyCompleted`, so already-finished generate/review steps aren't redispatched — only whatever the approve gate was blocking (typically `publish`) actually runs. `Runner.Reconcile`/`ReconcileTask` — called once at startup — resumes every task left `status=running` (a paused `waiting_approval` task is untouched: nothing to reconcile until the webhook arrives), skipping steps already `completed`, resolving ones still `launched` against the launcher, and escalating (not guessing) if one can't be resolved. |
+| `internal/executor` | `Registry` is a closed map from step `type` (`agent-stage` \| `deterministic-step`) to a `StepExecutor`. Both executors mint a scoped credential, dispatch through `ContainerLauncher`, extract logs, and return a `domain.StepRun`. `approve`-phase steps are never dispatched through this registry at all — no container to launch for "wait until a human says yes." |
+| `internal/clients/*` | One Go interface + one production implementation per dependency boundary: `gitclient` (`GitHostClient`, now including `CreateOrReuseIssue`/`ListIssueLabels` for design §4.4), `policyclient` (`PolicyClient`), `secretsclient` (`SecretsClient`, now including `GetWebhookSecret`), `launcherclient` (`ContainerLauncher`). `gitclient` also exposes provisioning-only methods on its concrete `*Client` (repo/user/token bootstrapping), deliberately outside the `GitHostClient` interface — the orchestrator's own runtime never calls them. |
+| `internal/audit` | `AuditWriter` interface; `PostgresWriter` writes `audit.invocation_audit`, one hash-chained row per PDP decision / step / approval event (`step_type='approval'`) / task outcome. |
+| `internal/approval` | `ApprovalVerifier` interface. `NoopApprovalVerifier` always returns `Approved: false` — the fail-closed default when no webhook is configured. `RealApprovalVerifier` (design §4.4) just reads back `orchestrator.tasks.approved_by` via its narrow `TaskApprovalReader` — all the actual verification (HMAC signature, `APPROVERS`-file membership, live collaborator-role check) already happened in `cmd/control-plane`'s webhook handler. |
+| `internal/config` | Parses and JSON-Schema-validates `.harness/stages.yaml` / `.harness/policy.yaml`, and (design §4.4) `.harness/APPROVERS` (`ParseApprovers` — one Forgejo username per line, `#`-comments and blank lines ignored). |
 
 ## 3. Execution model: `coreloop` vs. `taskrunner`
 
@@ -44,9 +44,12 @@ flowchart TB
     RL -->|"RunRound(task, round, priorFindings, alreadyCompleted)"| CL
 
     subgraph CL["internal/coreloop.RunRound — pure, one round"]
-        PDP["Policy.Evaluate"] --> Group["groupStepsByPhase\ngenerate → review → approve → publish"]
-        Group --> FanOut["fan out per phase\nconcurrent StepExecutor.Execute"]
-        FanOut --> Agg["aggregate → continue / stop-success / stop-escalate"]
+        PDP["Policy.Evaluate"] --> FanOut["fan out generate/review\nconcurrent StepExecutor.Execute"]
+        FanOut --> Agg{"aggregate:\nblocking finding?"}
+        Agg -->|yes| Continue["continue → next round"]
+        Agg -->|no| Approve{"approve phase resolved\nand unmet?"}
+        Approve -->|yes| Wait["IssueOpener.CreateOrReuseIssue\n→ waiting-approval"]
+        Approve -->|no| Publish["dispatch publish\n→ stop-success"]
     end
 
     FanOut -->|"RecordLaunched / RecordCompleted"| Store
@@ -54,15 +57,16 @@ flowchart TB
     Exec --> Launcher["ContainerLauncher\ngRPC + mTLS"]
 ```
 
-- **`coreloop.RunRound` is a pure, single-round function.** Given `Dependencies` (the same `PolicyClient`/`ApprovalVerifier`/`Executors`/`Audit` every round needs) plus the round number and the previous round's findings, it always does the same thing: evaluate policy, group resolved steps into the fixed `generate → review → approve → publish` phase order (`approve` currently fails closed — no PDP decision can produce it until design §4.4 lands), dispatch each non-empty phase group concurrently, and aggregate. It has no idea what round it's on relative to any cap, and no idea whether this is a fresh task or a resumed one.
-- **`taskrunner.Runner` owns everything RunRound doesn't**: the loop across rounds up to `coreloop.MaxRounds`, persisting `TaskState` (`status`, `current_round`, `prior_findings`, ...) after every round, writing the final "task-outcome" audit row, and resuming a task from wherever it left off.
-- **Crash recovery is per-step, not just per-round.** `coreloop.Dependencies.Recorder` (a narrow `StepRunRecorder`, backed by `TaskStore` when wired via `taskrunner.NewRunner`) is called by `fanOut` immediately before and after dispatching each step — so a `step_runs` row exists (`status=launched`) from the moment a step is dispatched, updated to `completed`/`failed` once it resolves. `RunRound`'s `alreadyCompleted` parameter is how a caller (only `Reconcile` uses this today) tells it to skip re-dispatching steps a prior, interrupted attempt already finished.
+- **`coreloop.RunRound` is a pure, single-round function.** Given `Dependencies` (the same `PolicyClient`/`ApprovalVerifier`/`IssueOpener`/`Executors`/`Audit` every round needs) plus the round number and the previous round's findings, it always does the same thing: evaluate policy, fan out generate then review concurrently, aggregate — and only if that finds no outstanding blocking finding, check whether this round resolved an `approve`-phase step (design §4.4) and, if so, whether `ApprovalVerifier.VerifyApproval` already reports it satisfied. Satisfied (or absent) → dispatch `publish` → `stop-success`. Unmet → `IssueOpener.CreateOrReuseIssue` and return `waiting-approval` without ever dispatching `publish`. It has no idea what round it's on relative to any cap, and no idea whether this is a fresh task or a resumed one.
+- **`taskrunner.Runner` owns everything RunRound doesn't**: the loop across rounds up to `coreloop.MaxRounds`, persisting `TaskState` (`status`, `current_round`, `prior_findings`, ...) after every round, writing the final "task-outcome" audit row, and resuming a task from wherever it left off — including a paused approve-phase gate, which resumes the *same* round (not the next one) once `RecordApproval` has run.
+- **Crash recovery is per-step, not just per-round.** `coreloop.Dependencies.Recorder` (a narrow `StepRunRecorder`, backed by `TaskStore` when wired via `taskrunner.NewRunner`) is called by `fanOut` immediately before and after dispatching each step — so a `step_runs` row exists (`status=launched`) from the moment a step is dispatched, updated to `completed`/`failed` once it resolves. `RunRound`'s `alreadyCompleted` parameter is how a caller tells it to skip re-dispatching steps a prior attempt already finished — `taskrunner.loadAlreadyCompleted` builds it for both `Reconcile`'s crash-recovery path and `Resume`'s post-approval continuation, so a re-evaluated round only actually (re)dispatches what it hasn't already completed.
 - **There is no launcher "get status by invocation ID" RPC.** Reconciling a still-`launched` step reuses `ContainerLauncher.ExtractLogs` (documented as "independently callable, decoupled from Launch"). This recovers an agent-stage step's finding correctly; a resolved deterministic-step's `HasFinding` is approximated as `false` since `ExtractLogs`' response carries no exit code — a known, deliberate simplification against today's launcher implementation.
-- **`waiting_approval` is reserved but not yet reachable.** The `orchestrator.tasks.status` column and `TaskStatusWaitingApproval` constant exist; nothing produces that state yet, since the `approve` phase still fails closed and `require_human_approval` is still the old synchronous, non-pausing check. Design §4.4 changes this.
+- **A resumed round's PDP re-evaluation gets its own audit row, not a suppressed duplicate.** `coreloop`'s `pdp-decision` invocation ID includes a nanosecond disambiguator specifically because both `Resume` and `ReconcileTask` can legitimately re-evaluate an already-audited round — `invocation_audit`'s unique constraint on `invocation_id` would otherwise reject the second write.
+- **`current_round` means "last *completed* round," even while `waiting_approval`.** A round paused on an unmet approve gate hasn't completed, so `current_round` still reflects the round *before* it; `Resume`/`ReconcileTask` both rely on `current_round + 1` to find their way back to the paused round.
 
 ## 4. API
 
-One endpoint today, still synchronous (design §4.3 will flip this to `202` + `GET /tasks/{id}`):
+Async since design §4.3 landed: `POST /tasks` starts a task and returns immediately; `GET /tasks/{id}` polls its progress.
 
 ```
 POST /tasks
@@ -85,28 +89,57 @@ Request body:
 }
 ```
 
-`target_repo`, `branch`, and `task_type` are required. The handler opens/reuses the review PR (`CreateOrUpdatePR`) before starting the task, then calls `taskrunner.Runner.Start` and blocks on its completion channel until the task reaches a terminal outcome.
+`target_repo`, `branch`, and `task_type` are required. The handler opens/reuses the review PR (`CreateOrUpdatePR`) synchronously, then calls `taskrunner.Runner.Start` — which persists the task row and kicks off round 1 in a goroutine — and replies without waiting for any round to finish.
+
+Response (`202`):
+
+```json
+{ "task_id": "task-...", "status": "running" }
+```
+
+Errors: `400` (bad request body), `502` (couldn't open the PR), `500` (`Start` failed to persist the task row).
+
+```
+GET /tasks/{id}
+```
 
 Response (`200`):
 
 ```json
 {
   "task_id": "task-...",
-  "pr_number": 1,
-  "outcome": "stop-success",
-  "rounds_run": 1,
-  "reason": "",
+  "status": "waiting_approval",
+  "current_round": 2,
+  "pr_number": 7,
+  "approval_issue_number": 12,
   "step_runs": [
     {
       "round": 1, "step_id": "review-with-commit", "step_type": "agent-stage",
-      "invocation_id": "...", "blocking": true, "exit_code": 0,
-      "has_finding": false, "structured_result": {"has_blocking_finding": false}
+      "invocation_id": "...", "blocking": true, "status": "completed",
+      "exit_code": 0, "has_finding": false, "structured_result": {"has_blocking_finding": false}
     }
   ]
 }
 ```
 
-`outcome` is one of `stop-success` / `stop-escalate` (`coreloop.Outcome`, hyphenated). Errors: `400` (bad request body), `502` (couldn't open the PR), `500` (infra failure — a dependency unreachable, or the completion channel returned `Result.Err`), `504` (the request's own context was cancelled before the task finished).
+`status` is `orchestrator.tasks.status`'s own underscore vocabulary (`running` | `waiting_approval` | `stop_success` | `stop_escalate`) — not `coreloop.Outcome`'s hyphenated wire vocabulary; `taskrunner` is what translates between the two. `step_runs` spans every round the task has run so far (`TaskStore.ListStepRunsForTask`), each carrying its own `status` (`launched` | `completed` | `failed`) since a poll can land mid-round, before a step resolves. `approval_issue_number` is set once a round's `approve`-phase gate opens an issue (design §4.4). `404` if no such task exists.
+
+**Access rights** (design §4.3): `GET /tasks/{id}` is meant to require the same access rights as the task's original `POST /tasks`, once any exist — there is no authentication/authorization layer anywhere in `control-plane` today, so both endpoints are unauthenticated in the current implementation.
+
+```
+POST /webhooks/forgejo
+```
+
+Design §4.4's approval receiver — Forgejo calls this on a repo's labeling events. Never trusts the delivery's own claims:
+
+1. Verify `X-Forgejo-Signature` (raw hex HMAC-SHA256 over the raw body — confirmed empirically against a real Forgejo instance, not just the design prose) against that repo's secret (`SecretsClient.GetWebhookSecret`). Bad/unprovisioned secret → `403`.
+2. `action != "label_updated"` → `200`, no-op (Forgejo's `issues` webhook event category covers several sub-events; only label changes matter here).
+3. Look up `orchestrator.tasks WHERE target_repo = ? AND approval_issue_number = ? AND status = 'waiting_approval'` (`Runner.FindWaitingApprovalTask`). No match → `200`, no-op.
+4. Independently re-read the issue's current labels (`GitHostClient.ListIssueLabels`) — the payload's own labels are never trusted. Neither `approved` nor `rejected` present → `200`, no-op.
+5. Confirm the labeling user (`sender.login`) is listed in `.harness/APPROVERS` at the task's base branch (`GetFileContents` + `config.ParseApprovers`), **and** independently holds live `RoleWrite` (`VerifyCollaboratorRole`) — both required. Either fails → `200`, logged only; the task stays `waiting_approval` (fail-closed, not escalated — a misconfiguration must never manufacture a false approval or a false escalation).
+6. All pass: `rejected` → `Runner.RecordRejection` (terminal `stop_escalate`, no resume). `approved` → `Runner.RecordApproval`, then `Runner.Resume` in a new goroutine so the response returns fast.
+
+No request body/response schema beyond what Forgejo itself sends — this isn't a contract the orchestrator publishes, only one it consumes.
 
 ## 5. Contracts
 
@@ -116,7 +149,7 @@ The orchestrator's own dependency contracts — each is a versioned artifact, re
 |---|---|---|
 | Git host | No separate spec — `internal/clients/gitclient.GitHostClient` wraps `code.gitea.io/sdk/gitea`, which is Forgejo's own contract | `internal/clients/gitclient` |
 | Policy Decision Point | AuthZEN + `resolved_steps` extension | `api/openapi/pdp-authzen.yaml` → `internal/clients/policyclient` |
-| Secrets / credential issuer | OpenBao-shaped subset | `api/openapi/secrets.yaml` → `internal/clients/secretsclient` |
+| Secrets / credential issuer | OpenBao-shaped subset, plus a `GetWebhookSecret` read (design §4.4/§7 — a long-lived shared secret, not a minted per-invocation credential, but still sourced from a static pre-provisioned pool) | `api/openapi/secrets.yaml` → `internal/clients/secretsclient` |
 | Step launcher | gRPC + mTLS | `api/proto/launcher/v1/launcher.proto` → generated into `api/gen/go/launcher/v1/` (`make proto-gen`, buf) → `internal/clients/launcherclient` |
 
 `.harness/stages.yaml` and `.harness/policy.yaml` — the config a task's target repo carries, that the PDP resolves against — are their own contracts too: `schemas/stages.schema.json` / `schemas/policy.schema.json` (+ fixtures), mirrored as Go structs in `internal/config`.
@@ -137,6 +170,7 @@ Environment variables `cmd/control-plane/main.go` reads:
 | `ORCHESTRATOR_DB_DSN` | Yes | Postgres DSN for `orchestrator.{tasks,rounds,step_runs}` (role `orchestrator_app`) |
 | `ADDR` | No (default `:8080`) | HTTP listen address |
 | `ORCHESTRATOR_INSTANCE_ID` | No (default `control-plane-dev`) | Carried on every `PolicyRequest` |
+| `WEBHOOK_APPROVAL_ENABLED` | No (default `false`) | `"true"` wires `approval.RealApprovalVerifier`; otherwise `NoopApprovalVerifier` (fail-closed — an approve-phase gate can open an issue but can never actually clear without a webhook configured) |
 
 A missing required var makes the process `log.Fatalf` immediately (fail-fast, not fail-open). `PDP_MOCK_URL`/`SECRETS_MOCK_URL` are named for what currently sits behind them (see [`docs/local-development.md`](../local-development.md)) — the orchestrator itself only cares that something implementing `PolicyClient`/`SecretsClient` answers there.
 
@@ -152,9 +186,11 @@ Two Postgres schemas in the one `orchestrator` database:
 | `rounds` | `(task_id, round_number)` PK — exists so `step_runs` has something to FK against |
 | `step_runs` | `id` PK, `(task_id, round_number)` FK, `step_id`, `step_type`, `invocation_id` (unique), `blocking`, `status` (`launched`\|`completed`\|`failed`), `exit_code`, `has_finding`, `structured_result` (jsonb, nullable — unknown until the step resolves) |
 
-**`audit` schema** (role `orchestrator_audit_writer`, `SELECT`+`INSERT` only — no `UPDATE`/`DELETE`) — the append-only hash-chained trail: `audit.invocation_audit`, one row per PDP decision (`step_type='pdp-decision'`), per dispatched step (`step_type` = the step's own type), and per task's terminal outcome (`step_type='task-outcome'`). See `internal/audit`'s package doc and `ComputeRowHash`/`VerifyChain` for the hash-chain mechanics.
+**`audit` schema** (role `orchestrator_audit_writer`, `SELECT`+`INSERT` only — no `UPDATE`/`DELETE`) — the append-only hash-chained trail: `audit.invocation_audit`, one row per PDP decision (`step_type='pdp-decision'`), per dispatched step (`step_type` = the step's own type), per verified approval (`step_type='approval'`, design §4.4), and per task's terminal outcome (`step_type='task-outcome'`; a verified rejection's terminal row carries `approved=false`/`approved_by`/`evidence` too). See `internal/audit`'s package doc and `ComputeRowHash`/`VerifyChain` for the hash-chain mechanics.
 
-Migrations: `deploy/migrations/001_roles.sql` → `002_orchestrator_schema.sql` → `003_audit_schema.sql` → `004_task_state.sql`, applied via `make migrate`.
+Migrations: `deploy/migrations/001_roles.sql` → `002_orchestrator_schema.sql` → `003_audit_schema.sql` → `004_task_state.sql`, applied via `make migrate`. No new migration for design §4.4 — every column it needs (`approval_issue_number`, `approved_by`, `reason`; `audit.invocation_audit`'s `approved`/`approved_by`/`evidence`) already existed, reserved but unpopulated, since `004_task_state.sql`.
+
+A repo enabling the approve-phase gate also needs a `.harness/APPROVERS` file (one Forgejo username per line, `#`-comments/blank lines ignored) and a webhook registered against `POST /webhooks/forgejo` with a secret provisioned in `SecretsClient`'s webhook-secret pool — see [`docs/local-development.md`](../local-development.md).
 
 ## 8. Running it
 
@@ -178,14 +214,15 @@ For a complete local stack to develop and test against, see [`docs/local-develop
 | Spike (SDK coverage) | Yes | `make test-spike` |
 | E2E smoke | Yes | `make test-e2e` |
 
-Unit tests are the primary spec for `coreloop` (`internal/coreloop/coreloop_test.go` — phase dispatch order, cardinality rules, prior-findings plumbing, the `alreadyCompleted` skip path) and `taskrunner` (`internal/taskrunner/taskrunner_test.go` — round cap, blocking→advisory transitions, task-outcome auditing, and reconciliation across a mix of no-row/`launched`/`completed`/unresolvable `step_runs`), run entirely against `internal/fakes` (one in-memory implementation per dependency interface) — no live dependency needed. See [`docs/local-development.md`](../local-development.md) for what the live-dependency layers need running and how to run them.
+Unit tests are the primary spec for `coreloop` (`internal/coreloop/coreloop_test.go` — phase dispatch order, cardinality rules, prior-findings plumbing, the `alreadyCompleted` skip path, and the approve-phase gate's pause/skip behavior), `taskrunner` (`internal/taskrunner/taskrunner_test.go` — round cap, blocking→advisory transitions, task-outcome auditing, reconciliation across a mix of no-row/`launched`/`completed`/unresolvable `step_runs`, and the full approve/reject pause-resume cycle using `approval.RealApprovalVerifier` against a fake store, not the scripted fake verifier), and the HTTP layer (`cmd/control-plane/handler_test.go` — `POST /tasks` replies `202` without waiting, `GET /tasks/{id}` reflects the eventual terminal outcome and 404s for an unknown task; `cmd/control-plane/webhook_test.go` — signature verification, the full approved/rejected paths, and both APPROVERS-membership and live-collaborator-role fail-closed cases), run entirely against `internal/fakes` (one in-memory implementation per dependency interface) — no live dependency needed. See [`docs/local-development.md`](../local-development.md) for what the live-dependency layers need running and how to run them.
+
+`internal/e2e/smoke_test.go`'s `TestSmoke_ApprovalWebhookFlow` drives design §4.4 against the real running stack end to end: a real Forgejo label event, a real signed webhook delivery, real independent re-verification. It needs its own fixed scratch repo's webhook secret pre-provisioned in `SECRETS_MOCK_WEBHOOK_POOL_JSON` (single-quoted in `deploy/.env` — `make test-e2e`/`test-integration` source that file with real bash, which strips *unquoted* embedded double quotes, unlike Docker Compose's own `.env` parser) — see `deploy/.env.example`. `TestSmoke_RequireHumanApprovalViaBaselinePolicy` changed meaning under this design: an approve-phase gate now dispatches its round's normal steps and reaches `waiting_approval`, not an immediate zero-launch `stop_escalate`.
 
 ## 10. Known gaps
 
-Tracked by [`full-pipeline-async-approval-design.md`](../designs/next/full-pipeline-async-approval-design.md)'s implementation sequence (§8):
+[`full-pipeline-async-approval-design.md`](../designs/next/full-pipeline-async-approval-design.md)'s implementation sequence (§8) is fully landed. Remaining gaps are pre-existing, not tracked by that design:
 
-- **Async API** (§4.3, step 3) — `POST /tasks` is still synchronous (`200`, blocks until terminal); `GET /tasks/{id}` doesn't exist yet.
-- **Real human approval** (§4.4, step 4) — `NoopApprovalVerifier` always denies; no Forgejo issue/label/webhook-HMAC flow; `approve`-phase resolved steps fail closed.
 - **No launcher status-query RPC** — reconciliation approximates via `ExtractLogs` ([§3](#3-execution-model-coreloop-vs-taskrunner) above); a real implementation would want a dedicated status call.
-- **No real `ContainerLauncher`/jailer/Firecracker implementation, OPA policy engine, or secrets backend yet** — the orchestrator depends on these purely through the contracts in [§5](#5-contracts), so a conforming implementation can be substituted with no orchestrator code changes.
+- **No real `ContainerLauncher`/jailer/Firecracker implementation, OPA policy engine, or secrets backend yet** — the orchestrator depends on these purely through the contracts in [§5](#5-contracts), so a conforming implementation can be substituted with no orchestrator code changes. `secrets-mock`'s webhook-secret pool (§7) is the same kind of static stand-in as its bot-token pool.
 - **No horizontal control-plane scaling** — one process, one `TaskStore` connection pool; `Reconcile` assumes it's the only writer.
+- **The solo-pilot approver/principal overlap** (ADR-9 §B's named limitation) — nothing stops the task's own `triggering_principal` from also being the one who labels the approval issue; a real second-approver requirement isn't enforced.

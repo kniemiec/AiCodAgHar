@@ -66,19 +66,25 @@ func (d *decider) decide(ctx context.Context, repoRef gitclient.RepoRef, req eva
 		resolved = append(resolved, resolvedStepWire{StepID: s.ID, Type: s.Type, Blocking: s.Blocking, BotAccount: s.BotAccount, Phase: phase})
 	}
 
-	decision := "allow"
+	// design §4.4: a require_human_approval match no longer flips the
+	// round's Decision (dropped to allow|deny) — it adds a synthetic
+	// phase:approve resolved step instead, the same way "needs a security
+	// reviewer" is expressed, gating the round without a dedicated decision
+	// value of its own.
 	reason := ""
 	for _, ra := range policy.RequireHumanApproval {
 		for _, r := range resolved {
 			if r.StepID == ra.StepID && (len(ra.RiskTier) == 0 || slices.Contains(ra.RiskTier, riskTier)) {
-				decision = "require_human_approval"
 				reason = fmt.Sprintf("step %s requires human approval at risk tier %s", ra.StepID, riskTier)
+				resolved = append(resolved, resolvedStepWire{
+					StepID: ra.StepID + ":approval", Type: "deterministic-step", Phase: "approve",
+				})
 			}
 		}
 	}
 
 	return evaluationResponseWire{
-		Decision:            decision,
+		Decision:            "allow",
 		GrantedScopes:       req.Context.RequestedScopes,
 		Reason:              reason,
 		PolicyBundleVersion: "pdp-mock:live-read@" + d.ref,

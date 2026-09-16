@@ -14,6 +14,6 @@ type FakeApprovalVerifier struct {
 	Err    error
 }
 
-func (f *FakeApprovalVerifier) VerifyApproval(ctx context.Context, req approval.ApprovalCheckRequest) (approval.ApprovalResult, error) {
+func (f *FakeApprovalVerifier) VerifyApproval(ctx context.Context, taskID string) (approval.ApprovalResult, error) {
 	return f.Result, f.Err
 }

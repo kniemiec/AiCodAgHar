@@ -47,6 +47,12 @@ services:
       FORGEJO__server__SSH_DOMAIN: localhost
       FORGEJO__service__DISABLE_REGISTRATION: "true"
       FORGEJO__security__INSTALL_LOCK: "true"
+      # Forgejo's webhook SSRF guard blocks delivery to private/loopback
+      # addresses by default — but control-plane (design §4.4's webhook
+      # target) is only ever reachable at a private compose-network address
+      # from Forgejo's side, so the default would silently break every
+      # approval webhook delivery in this exact topology.
+      FORGEJO__webhook__ALLOWED_HOST_LIST: "private,loopback"
     volumes:
       - forgejo-data:/data
     ports:
@@ -62,6 +68,9 @@ services:
     environment:
       ADDR: ":8080"
       SECRETS_MOCK_POOL_JSON: ${SECRETS_MOCK_POOL_JSON:-}
+      # design §4.4/§7: per-repo Forgejo webhook HMAC secrets, keyed
+      # "owner/name", e.g. {"owner/repo":"some-shared-secret"}.
+      SECRETS_MOCK_WEBHOOK_POOL_JSON: ${SECRETS_MOCK_WEBHOOK_POOL_JSON:-}
     ports:
       - "8082:8080"
     networks: [orchestrator-net]
@@ -139,6 +148,11 @@ services:
       # internal/taskrunner's persisted task/round/step_runs state (design
       # docs/designs/next/full-pipeline-async-approval-design.md §4.2).
       ORCHESTRATOR_DB_DSN: ${ORCHESTRATOR_DB_INTERNAL_DSN:?set in deploy/.env}
+      # design §4.4: real Forgejo issue/label/webhook-HMAC approval, backed
+      # by POST /webhooks/forgejo. Local compose always has that endpoint
+      # reachable from Forgejo, so there's no reason to run this stack with
+      # NoopApprovalVerifier's permanently-unsatisfiable fail-closed default.
+      WEBHOOK_APPROVAL_ENABLED: "true"
     volumes:
       - ./certs:/certs:ro
     ports:

@@ -3,6 +3,7 @@ package fakes
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
@@ -136,6 +137,37 @@ func (f *FakeTaskStore) ListStepRuns(ctx context.Context, taskID string, round i
 	out := make([]domain.StepRun, len(rows))
 	copy(out, rows)
 	return out, nil
+}
+
+func (f *FakeTaskStore) ListStepRunsForTask(ctx context.Context, taskID string) ([]domain.StepRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+
+	rounds := make([]int, 0, len(f.stepRuns[taskID]))
+	for round := range f.stepRuns[taskID] {
+		rounds = append(rounds, round)
+	}
+	sort.Ints(rounds)
+
+	var out []domain.StepRun
+	for _, round := range rounds {
+		out = append(out, f.stepRuns[taskID][round]...)
+	}
+	return out, nil
+}
+
+func (f *FakeTaskStore) FindWaitingApprovalTask(ctx context.Context, targetRepo string, issueNumber int) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	for id, rec := range f.tasks {
+		if rec.Task.TargetRepo == targetRepo && rec.State.Status == domain.TaskStatusWaitingApproval &&
+			rec.State.ApprovalIssueNumber != nil && *rec.State.ApprovalIssueNumber == issueNumber {
+			return id, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 func (f *FakeTaskStore) ListRunningTaskIDs(ctx context.Context) ([]string, error) {

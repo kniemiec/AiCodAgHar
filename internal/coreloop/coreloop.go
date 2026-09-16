@@ -1,10 +1,9 @@
 // Package coreloop implements ADR-7's fixed per-round decision logic:
-// PDP-evaluate (resolve steps) -> fan out, phase-grouped and dispatched in
-// the fixed generate -> review -> approve -> publish order (see
-// groupStepsByPhase; "approve" isn't dispatchable yet — docs/designs/next/
-// full-pipeline-async-approval-design.md §4.4 lands that) -> aggregate
-// (combine step outcomes) -> evaluate (continue / stop-success /
-// stop-escalate).
+// PDP-evaluate (resolve steps) -> fan out generate/review (phase-grouped,
+// see groupStepsByPhase) -> aggregate -> if no outstanding blocking
+// findings, gate on approve (design §4.4: at least one verified approval,
+// no verified rejection) -> dispatch publish -> evaluate (continue /
+// stop-success / stop-escalate / waiting-approval).
 //
 // RunRound runs exactly one round — internal/taskrunner (design §4.2) owns
 // looping across rounds up to the round cap, persistence, and pause/resume;
@@ -16,10 +15,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/audit"
+	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
 	"github.com/kniemiec/AiCodAgHar/internal/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/executor"
@@ -40,6 +42,14 @@ const (
 	OutcomeContinue     Outcome = "continue"
 	OutcomeStopSuccess  Outcome = "stop-success"
 	OutcomeStopEscalate Outcome = "stop-escalate"
+
+	// OutcomeWaitingApproval means this round's approve-phase gate (design
+	// §4.4) is unmet: no outstanding blocking findings, but no verified
+	// approval recorded yet either. Not task-terminal — the caller persists
+	// RoundResult.ApprovalIssueNumber and status=waiting_approval, and stops
+	// until an external event (the webhook handler, after verifying an
+	// approval) calls back in for this same round.
+	OutcomeWaitingApproval Outcome = "waiting-approval"
 )
 
 // Dependencies are the test-seam interfaces RunRound needs, plus the
@@ -60,6 +70,18 @@ type Dependencies struct {
 	// value — e.g. every coreloop-level unit test that isn't exercising
 	// persistence — and fanOut treats a nil Recorder as a no-op.
 	Recorder StepRunRecorder
+
+	// IssueOpener opens (or reuses) the approval issue an unmet approve-phase
+	// gate needs (design §4.4). Any GitHostClient implementation satisfies
+	// this structurally; kept narrow so coreloop doesn't need the rest of
+	// that interface. Nil is only valid for a task whose config never
+	// resolves an approve-phase step.
+	IssueOpener IssueOpener
+}
+
+// IssueOpener is Dependencies.IssueOpener's interface.
+type IssueOpener interface {
+	CreateOrReuseIssue(ctx context.Context, repo gitclient.RepoRef, title, body string) (gitclient.Issue, error)
 }
 
 // StepRunRecorder is Dependencies.Recorder's interface — kept narrow and
@@ -87,6 +109,9 @@ type RoundResult struct {
 	// PriorFindings is this round's marshaled findings, for the next
 	// round's generate-phase dispatch. Set iff Outcome == OutcomeContinue.
 	PriorFindings []byte
+	// ApprovalIssueNumber is the Forgejo issue a human approves/rejects
+	// against. Set iff Outcome == OutcomeWaitingApproval.
+	ApprovalIssueNumber int
 }
 
 // RunRound executes ADR-7's decision logic once for one round: PDP-evaluate
@@ -101,7 +126,14 @@ type RoundResult struct {
 // still included in RoundResult.StepRuns and still participate in
 // aggregate/evaluate, exactly as if they'd been dispatched just now.
 func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round int, priorFindings []byte, alreadyCompleted map[string]domain.StepRun) (RoundResult, error) {
-	pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval", task.ID, round)
+	// The nanosecond suffix is what makes this unique per actual call to
+	// RunRound, not just per (task, round): design §4.4's approve-phase
+	// resume, and startup reconciliation's crash recovery (design §4.2),
+	// can both re-evaluate an already-audited round — a plain "task:round-N:
+	// pdp-eval" invocation_id would collide with invocation_audit's unique
+	// constraint on the second evaluation. Two real "pdp-decision" rows for
+	// the same round is correct, not noise: PDP really was asked twice.
+	pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval:%d", task.ID, round, time.Now().UnixNano())
 	decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round, pdpInvocationID))
 	if err != nil {
 		return RoundResult{}, fmt.Errorf("round %d: policy evaluate: %w", round, err)
@@ -114,19 +146,8 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 	switch decision.Decision {
 	case "deny":
 		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "policy denied: " + decision.Reason}, nil
-
-	case "require_human_approval":
-		res, err := deps.Approval.VerifyApproval(ctx, approval.ApprovalCheckRequest{TargetRepo: task.TargetRepo})
-		if err != nil {
-			return RoundResult{}, fmt.Errorf("round %d: verify approval: %w", round, err)
-		}
-		if !res.Approved {
-			return RoundResult{Outcome: OutcomeStopEscalate, Reason: "human approval required and not granted"}, nil
-		}
-
 	case "allow":
 		// proceed to fan-out below
-
 	default:
 		return RoundResult{}, fmt.Errorf("round %d: unknown policy decision %q", round, decision.Decision)
 	}
@@ -137,7 +158,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 	}
 
 	var runs []domain.StepRun
-	for _, phase := range dispatchOrder {
+	for _, phase := range []string{policyclient.PhaseGenerate, policyclient.PhaseReview} {
 		steps := groups[phase]
 		if len(steps) == 0 {
 			continue
@@ -153,15 +174,67 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		runs = append(runs, phaseRuns...)
 	}
 
-	if !aggregate(runs) {
-		return RoundResult{Outcome: OutcomeStopSuccess, StepRuns: runs}, nil
+	if aggregate(runs) {
+		findings, err := marshalFindings(runs)
+		if err != nil {
+			return RoundResult{}, fmt.Errorf("round %d: marshal prior findings: %w", round, err)
+		}
+		return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings}, nil
 	}
 
-	findings, err := marshalFindings(runs)
-	if err != nil {
-		return RoundResult{}, fmt.Errorf("round %d: marshal prior findings: %w", round, err)
+	// No outstanding blocking findings. Before publish, an approve-phase
+	// gate (design §4.4) — if this round resolved one — must already have a
+	// verified approval; otherwise open (or reuse) the approval issue and
+	// pause here, resumed for this same round once the webhook handler
+	// verifies one.
+	if approveSteps := groups[policyclient.PhaseApprove]; len(approveSteps) > 0 {
+		res, err := deps.Approval.VerifyApproval(ctx, task.ID)
+		if err != nil {
+			return RoundResult{}, fmt.Errorf("round %d: verify approval: %w", round, err)
+		}
+		if !res.Approved {
+			issue, err := deps.IssueOpener.CreateOrReuseIssue(ctx, approvalRepoRef(task), approvalIssueTitle(task, round), approvalIssueBody(task, round))
+			if err != nil {
+				return RoundResult{}, fmt.Errorf("round %d: open approval issue: %w", round, err)
+			}
+			return RoundResult{Outcome: OutcomeWaitingApproval, StepRuns: runs, ApprovalIssueNumber: issue.Number}, nil
+		}
 	}
-	return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings}, nil
+
+	if publishSteps := groups[policyclient.PhasePublish]; len(publishSteps) > 0 {
+		phaseRuns, err := fanOut(ctx, deps, task, round, publishSteps, decision.GrantedScopes, nil, alreadyCompleted)
+		if err != nil {
+			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, policyclient.PhasePublish, err)
+		}
+		runs = append(runs, phaseRuns...)
+	}
+
+	return RoundResult{Outcome: OutcomeStopSuccess, StepRuns: runs}, nil
+}
+
+// approvalRepoRef splits task.TargetRepo ("owner/name") into a
+// gitclient.RepoRef — coreloop only ever sees TargetRepo as a plain string
+// (it's also PDP's resource ID and the audit trail's own field), so this
+// stays a local, throwaway parse rather than changing domain.Task's shape.
+func approvalRepoRef(task domain.Task) gitclient.RepoRef {
+	owner, name, _ := strings.Cut(task.TargetRepo, "/")
+	return gitclient.RepoRef{Owner: owner, Name: name}
+}
+
+// approvalIssueTitle is deliberately stable across repeated calls for the
+// same (task, round) — CreateOrReuseIssue matches on exact title, so this is
+// what makes reopening the issue after a crash idempotent instead of
+// duplicating it.
+func approvalIssueTitle(task domain.Task, round int) string {
+	return fmt.Sprintf("[approval] task %s round %d", task.ID, round)
+}
+
+func approvalIssueBody(task domain.Task, round int) string {
+	return fmt.Sprintf(
+		"Round %d of task `%s` (PR #%d on %s) needs human approval before it can publish.\n\n"+
+			"Label this issue `approved` to continue, or `rejected` to escalate the task.",
+		round, task.ID, task.PRNumber, task.TargetRepo,
+	)
 }
 
 func policyRequest(deps Dependencies, task domain.Task, round int, invocationID string) policyclient.PolicyRequest {
@@ -200,17 +273,13 @@ func auditPDPDecision(ctx context.Context, w audit.AuditWriter, task domain.Task
 	})
 }
 
-// dispatchOrder is the fixed phase dispatch order (design §4.1). "approve"
-// is deliberately absent: it's never dispatched through StepExecutor
-// (§4.4) — groupStepsByPhase fails closed if any resolved step declares it,
-// since nothing yet produces or satisfies an approve-phase gate.
-var dispatchOrder = []string{policyclient.PhaseGenerate, policyclient.PhaseReview, policyclient.PhasePublish}
-
 // groupStepsByPhase buckets a round's resolved steps by phase (defaulting
 // unset/empty phases to "review", normalized onto the bucketed copy so no
 // downstream consumer needs to re-derive the default) and enforces §4.1's
-// cardinality rules: at most one generate step, at most one publish step,
-// and — until §4.4 lands the approve gate — no approve steps at all.
+// cardinality rules: at most one generate step, at most one publish step.
+// approve has no cardinality rule (§4.1: "not a step count") — RunRound only
+// ever checks whether the group is non-empty, never dispatches its members
+// through StepExecutor.
 func groupStepsByPhase(steps []policyclient.ResolvedStep) (map[string][]policyclient.ResolvedStep, error) {
 	groups := make(map[string][]policyclient.ResolvedStep)
 	for _, s := range steps {
@@ -231,9 +300,6 @@ func groupStepsByPhase(steps []policyclient.ResolvedStep) (map[string][]policycl
 	}
 	if n := len(groups[policyclient.PhasePublish]); n > 1 {
 		return nil, fmt.Errorf("at most one publish-phase step per round, got %d", n)
-	}
-	if n := len(groups[policyclient.PhaseApprove]); n > 0 {
-		return nil, fmt.Errorf("approve-phase steps are not yet supported (%d resolved)", n)
 	}
 	return groups, nil
 }

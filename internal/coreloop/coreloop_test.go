@@ -102,36 +102,54 @@ func TestRunRound_FanOutRunsStepsConcurrently(t *testing.T) {
 	}
 }
 
-func TestRunRound_RequireHumanApproval(t *testing.T) {
-	t.Run("not approved stops escalate before launch", func(t *testing.T) {
-		launcher := &fakes.FakeContainerLauncher{}
-		policy := &fakes.FakePolicyClient{
-			EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
-				return policyclient.PolicyDecision{Decision: "require_human_approval"}, nil
-			},
-		}
-
-		res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
-			Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher), Audit: &fakes.FakeAuditWriter{},
-		}, domain.Task{ID: "task-1"}, 1, nil, nil)
-		if err != nil {
-			t.Fatalf("RunRound: %v", err)
-		}
-		if res.Outcome != coreloop.OutcomeStopEscalate {
-			t.Fatalf("expected stop-escalate, got %v", res.Outcome)
-		}
-		if len(launcher.Launches()) != 0 {
-			t.Fatalf("expected no launches before approval, got %d", len(launcher.Launches()))
-		}
-	})
-
-	t.Run("approved proceeds to fan-out", func(t *testing.T) {
+// TestRunRound_ApprovePhase exercises design §4.4's approve gate: an unmet
+// gate opens (or reuses) the approval issue and pauses without ever
+// dispatching publish; an already-verified approval skips straight through
+// to publish and stop-success.
+func TestRunRound_ApprovePhase(t *testing.T) {
+	t.Run("unapproved opens the issue and waits, without dispatching publish", func(t *testing.T) {
 		launcher := &fakes.FakeContainerLauncher{}
 		policy := &fakes.FakePolicyClient{
 			EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
 				return policyclient.PolicyDecision{
-					Decision:      "require_human_approval",
-					ResolvedSteps: []policyclient.ResolvedStep{{StepID: "review", Type: executor.StepTypeAgentStage}},
+					Decision: "allow",
+					ResolvedSteps: []policyclient.ResolvedStep{
+						{StepID: "human-signoff", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhaseApprove},
+						{StepID: "notify", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhasePublish},
+					},
+				}, nil
+			},
+		}
+		git := &fakes.FakeGitHostClient{}
+
+		res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+			Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher),
+			Audit: &fakes.FakeAuditWriter{}, IssueOpener: git,
+		}, domain.Task{ID: "task-1", TargetRepo: "acme/widgets"}, 1, nil, nil)
+		if err != nil {
+			t.Fatalf("RunRound: %v", err)
+		}
+		if res.Outcome != coreloop.OutcomeWaitingApproval {
+			t.Fatalf("expected waiting-approval, got %v (%s)", res.Outcome, res.Reason)
+		}
+		if res.ApprovalIssueNumber == 0 {
+			t.Fatal("expected a non-zero ApprovalIssueNumber")
+		}
+		if len(launcher.Launches()) != 0 {
+			t.Fatalf("expected zero launches (publish must not dispatch until approved), got %d", len(launcher.Launches()))
+		}
+	})
+
+	t.Run("already approved proceeds to publish and stop-success", func(t *testing.T) {
+		launcher := &fakes.FakeContainerLauncher{}
+		policy := &fakes.FakePolicyClient{
+			EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+				return policyclient.PolicyDecision{
+					Decision: "allow",
+					ResolvedSteps: []policyclient.ResolvedStep{
+						{StepID: "human-signoff", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhaseApprove},
+						{StepID: "notify", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhasePublish},
+					},
 				}, nil
 			},
 		}
@@ -148,8 +166,8 @@ func TestRunRound_RequireHumanApproval(t *testing.T) {
 		if res.Outcome != coreloop.OutcomeStopSuccess {
 			t.Fatalf("expected stop-success, got %v (%s)", res.Outcome, res.Reason)
 		}
-		if len(launcher.Launches()) != 1 {
-			t.Fatalf("expected one launch after approval, got %d", len(launcher.Launches()))
+		if len(launcher.Launches()) != 1 || launcher.Launches()[0].StepID != "notify" {
+			t.Fatalf("expected exactly one launch, for the publish-phase step, got %+v", launcher.Launches())
 		}
 	})
 }
@@ -303,12 +321,18 @@ func TestRunRound_CardinalityViolation_TwoGenerateStepsFailsClosed(t *testing.T)
 	}
 }
 
-// TestRunRound_ApprovePhaseStepsNotYetSupported pins §4.4's boundary: an
-// approve-phase resolved step isn't dispatchable through StepExecutor at
-// all yet (no container to launch for "wait until a human says yes"), so
-// it must fail closed rather than silently launch or silently no-op.
-func TestRunRound_ApprovePhaseStepsNotYetSupported(t *testing.T) {
-	launcher := &fakes.FakeContainerLauncher{}
+// TestRunRound_ApprovePhaseNeverDispatchedThroughStepExecutor pins §4.4's
+// invariant: an approve-phase resolved step is never dispatched through
+// StepExecutor (no container to launch for "wait until a human says yes") —
+// even if it's the only step present, a FakeContainerLauncher that would
+// fail any Launch call proves nothing was ever attempted.
+func TestRunRound_ApprovePhaseNeverDispatchedThroughStepExecutor(t *testing.T) {
+	launcher := &fakes.FakeContainerLauncher{
+		LaunchFunc: func(ctx context.Context, req launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+			t.Fatalf("unexpected Launch call for approve-phase step %s", req.StepID)
+			return launcherclient.RunResult{}, nil
+		},
+	}
 	policy := &fakes.FakePolicyClient{
 		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
 			return policyclient.PolicyDecision{
@@ -321,19 +345,14 @@ func TestRunRound_ApprovePhaseStepsNotYetSupported(t *testing.T) {
 	}
 
 	res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
-		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher), Audit: &fakes.FakeAuditWriter{},
+		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher),
+		Audit: &fakes.FakeAuditWriter{}, IssueOpener: &fakes.FakeGitHostClient{},
 	}, domain.Task{ID: "task-1"}, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("RunRound: %v", err)
 	}
-	if res.Outcome != coreloop.OutcomeStopEscalate {
-		t.Fatalf("expected stop-escalate, approve-phase steps aren't dispatchable yet, got %v", res.Outcome)
-	}
-	if !strings.Contains(res.Reason, "approve") {
-		t.Fatalf("expected reason to mention the unsupported approve phase, got %q", res.Reason)
-	}
-	if len(launcher.Launches()) != 0 {
-		t.Fatalf("expected zero launches, got %d", len(launcher.Launches()))
+	if res.Outcome != coreloop.OutcomeWaitingApproval {
+		t.Fatalf("expected waiting-approval, got %v (%s)", res.Outcome, res.Reason)
 	}
 }
 

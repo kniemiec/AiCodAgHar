@@ -125,7 +125,13 @@ components:
       properties:
         decision:
           type: string
-          enum: [allow, deny, require_human_approval]
+          enum: [allow, deny]
+          description: >
+            Follow-up design (docs/designs/next/full-pipeline-async-approval-design.md
+            §4.4) dropped require_human_approval from this enum — "this
+            round needs a human" is now expressed as a resolved step with
+            phase "approve" on an ordinary allow, not a third decision
+            value.
         granted_scopes:
           type: array
           items:

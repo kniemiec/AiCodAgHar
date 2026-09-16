@@ -23,11 +23,29 @@ type credentialWire struct {
 	Scopes    []string  `json:"scopes"`
 }
 
-func newServeMux(p *pool) *http.ServeMux {
+type webhookSecretWire struct {
+	Secret string `json:"secret"`
+}
+
+func newServeMux(p *pool, wp *webhookSecretPool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /credentials", handleIssue(p))
 	mux.HandleFunc("DELETE /credentials/{id}", handleRevoke(p))
+	mux.HandleFunc("GET /webhook-secrets/{owner}/{name}", handleGetWebhookSecret(wp))
 	return mux
+}
+
+func handleGetWebhookSecret(wp *webhookSecretPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		repo := r.PathValue("owner") + "/" + r.PathValue("name")
+		secret, ok := wp.get(repo)
+		if !ok {
+			http.Error(w, "no webhook secret provisioned for "+repo, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(webhookSecretWire{Secret: secret})
+	}
 }
 
 func handleIssue(p *pool) http.HandlerFunc {

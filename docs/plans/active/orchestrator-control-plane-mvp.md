@@ -45,9 +45,9 @@ Single Go module (monorepo), consistent with ADR-11's Go decision and its `runc`
 | Deployable | Role | ADR-9 interfaces |
 |---|---|---|
 | `cmd/control-plane` | The real, unprivileged production binary — REST API, task/round state machine, `StepExecutor` registry/dispatch, PDP calls, audit writes | Consumes all six: `GitHostClient`, `PolicyClient`, `SecretsClient`, `AuditWriter`, `ApprovalVerifier`, `ContainerLauncher` |
-| `cmd/pdp-mock` | Standalone AuthZEN-shaped HTTP service; decisions computed from the two seeded config repos, incl. `resolved_steps` | Implements `PolicyClient`'s server side |
-| `cmd/secrets-mock` | Standalone HTTP service, static pre-provisioned bot-token pool | Implements `SecretsClient`'s server side |
-| `cmd/launcher-mock` | Standalone gRPC/mTLS service — fixture-driven, but performs real Forgejo calls | Implements `ContainerLauncher`'s server side; future slot for the real ADR-10 jailer/Firecracker launcher, untouched by this plan |
+| `mocks/pdp-mock` | Standalone AuthZEN-shaped HTTP service; decisions computed from the two seeded config repos, incl. `resolved_steps` | Implements `PolicyClient`'s server side |
+| `mocks/secrets-mock` | Standalone HTTP service, static pre-provisioned bot-token pool | Implements `SecretsClient`'s server side |
+| `mocks/launcher-mock` | Standalone gRPC/mTLS service — fixture-driven, but performs real Forgejo calls | Implements `ContainerLauncher`'s server side; future slot for the real ADR-10 jailer/Firecracker launcher, untouched by this plan |
 | `cmd/seed` | One-shot idempotent CLI: bootstraps Forgejo bot accounts, the global-baseline repo, and the sample target repo (with `.harness/policy.yaml` + `.harness/stages.yaml`) | Uses `GitHostClient`'s production impl |
 
 `internal/` layout:

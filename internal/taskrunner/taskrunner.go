@@ -238,10 +238,14 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 		return Result{TaskID: taskID}, nil
 	}
 
-	round := rec.State.CurrentRound
-	if round == 0 {
-		round = 1 // crashed before round 1's first EnsureRound ever landed
-	}
+	// CurrentRound records the last *completed* round (0 if none has
+	// completed yet), so resuming — like Resume — means the round after
+	// it. Using CurrentRound as-is would re-inspect an already-finished
+	// round's step_runs (all "completed") while silently skipping the
+	// round actually in flight when the crash happened, leading to either
+	// a duplicate "task-outcome" audit write or a fresh, blind re-dispatch
+	// of that in-flight round's agent work.
+	round := rec.State.CurrentRound + 1
 
 	stepRuns, err := r.deps.Store.ListStepRuns(ctx, taskID, round)
 	if err != nil {

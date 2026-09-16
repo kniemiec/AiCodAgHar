@@ -291,6 +291,81 @@ func TestRunner_ReconcileTask_SkipsCompletedResolvesLaunchedDispatchesMissing(t 
 	}
 }
 
+// TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted guards against a
+// regression of the bug where ReconcileTask resumed from
+// TaskState.CurrentRound instead of CurrentRound+1: CurrentRound records the
+// last *completed* round, so a task that crashed while dispatching the round
+// after it must reconcile that next round — not re-inspect the
+// already-finished one (whose step_runs are all "completed" already) while
+// silently ignoring the round actually in flight, which would otherwise get
+// blindly re-dispatched from scratch by the normal loop.
+func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
+	launcher := &fakes.FakeContainerLauncher{
+		ExtractLogsFunc: func(ctx context.Context, invocationID string) (launcherclient.LogBundle, error) {
+			if invocationID == "task-1:2:step-1" {
+				return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": false}`)}, nil
+			}
+			return launcherclient.LogBundle{}, nil
+		},
+	}
+	policy := &fakes.FakePolicyClient{
+		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+			return policyclient.PolicyDecision{
+				Decision:      "allow",
+				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "step-1", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseReview, Blocking: true}},
+			}, nil
+		},
+	}
+	store := &fakes.FakeTaskStore{}
+	runner := taskrunner.NewRunner(newDeps(launcher, policy, store, &fakes.FakeAuditWriter{}))
+	ctx := context.Background()
+	task := domain.Task{ID: "task-1"}
+
+	// Round 1 ran to completion with an outstanding blocking finding (a
+	// normal "continue" round) before the process crashed while dispatching
+	// round 2.
+	if err := store.CreateTask(ctx, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
+		t.Fatalf("EnsureRound(1): %v", err)
+	}
+	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:1:step-1"); err != nil {
+		t.Fatalf("RecordStepLaunched(round 1): %v", err)
+	}
+	if err := store.CompleteStepRun(ctx, task.ID, "task-1:1:step-1", domain.StepRun{HasFinding: true}, nil); err != nil {
+		t.Fatalf("CompleteStepRun(round 1): %v", err)
+	}
+	if err := store.UpdateTaskState(ctx, domain.TaskState{TaskID: task.ID, Status: domain.TaskStatusRunning, CurrentRound: 1}); err != nil {
+		t.Fatalf("UpdateTaskState: %v", err)
+	}
+
+	// Round 2 started (its step launched) but never resolved before the crash.
+	if err := store.EnsureRound(ctx, task.ID, 2); err != nil {
+		t.Fatalf("EnsureRound(2): %v", err)
+	}
+	if err := store.RecordStepLaunched(ctx, task.ID, 2, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:2:step-1"); err != nil {
+		t.Fatalf("RecordStepLaunched(round 2): %v", err)
+	}
+
+	result, err := runner.ReconcileTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("ReconcileTask: %v", err)
+	}
+	if result.Err != nil {
+		t.Fatalf("ReconcileTask result error: %v", result.Err)
+	}
+	if result.RoundsRun != 2 {
+		t.Fatalf("expected reconciliation to resume at round 2 (round 1 already completed), got RoundsRun=%d", result.RoundsRun)
+	}
+	if result.Outcome != coreloop.OutcomeStopSuccess {
+		t.Fatalf("expected stop-success (round 2's step reports no blocking finding), got %v (%s)", result.Outcome, result.Reason)
+	}
+	if launches := launcher.Launches(); len(launches) != 0 {
+		t.Fatalf("expected no (re)launches — round 1's step is already completed and round 2's step must be resolved via ExtractLogs, not relaunched; got %+v", launches)
+	}
+}
+
 // TestRunner_ReconcileTask_UnresolvableLaunchedStepEscalates exercises the
 // fail-closed path: a still-"launched" step the launcher no longer knows
 // about (e.g. launcher-mock itself also restarted) must not be silently

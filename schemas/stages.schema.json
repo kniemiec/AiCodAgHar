@@ -13,6 +13,11 @@
       "bot_account": { "type": "string" },
       "task_type": { "type": "string" },
       "blocking": { "type": "boolean" },
+      "phase": {
+        "type": "string",
+        "enum": ["generate", "review", "approve", "publish"],
+        "default": "review"
+      },
       "conditions": {
         "type": "object",
         "additionalProperties": false,

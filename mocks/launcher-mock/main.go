@@ -2,7 +2,7 @@
 // ContainerLauncher's server side (api/proto/launcher/v1/launcher.proto).
 // Per plan Decision 6, it is fixture-driven but performs real Forgejo
 // side-effects via a small closed set of fixture-driven behaviors
-// (cmd/launcher-mock/fixtures.go), proving the credential round-trip and
+// (mocks/launcher-mock/fixtures.go), proving the credential round-trip and
 // real git-visible outcomes without any real sandbox mechanics. It is a
 // placeholder for the real ADR-10 jailer/Firecracker launcher behind the
 // same gRPC contract.

@@ -1,7 +1,15 @@
-// Package coreloop implements ADR-7's fixed state machine: generate (PDP
-// evaluate + resolve steps) -> fan out (dispatch steps concurrently) ->
-// aggregate (combine step outcomes) -> evaluate (continue / stop-success /
-// stop-escalate), with a hardcoded round cap of 5.
+// Package coreloop implements ADR-7's fixed per-round decision logic:
+// PDP-evaluate (resolve steps) -> fan out, phase-grouped and dispatched in
+// the fixed generate -> review -> approve -> publish order (see
+// groupStepsByPhase; "approve" isn't dispatchable yet — docs/designs/next/
+// full-pipeline-async-approval-design.md §4.4 lands that) -> aggregate
+// (combine step outcomes) -> evaluate (continue / stop-success /
+// stop-escalate).
+//
+// RunRound runs exactly one round — internal/taskrunner (design §4.2) owns
+// looping across rounds up to the round cap, persistence, and pause/resume;
+// coreloop stays a pure, single-round function apart from what Dependencies
+// provides.
 package coreloop
 
 import (
@@ -17,18 +25,24 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/executor"
 )
 
-// MaxRounds is ADR-7's hardcoded round cap.
+// MaxRounds is ADR-7's hardcoded round cap. internal/taskrunner is
+// responsible for stopping at it — RunRound itself has no notion of a
+// cap, since it only ever runs one round.
 const MaxRounds = 5
 
-// Outcome is the terminal state Run reaches for a task.
+// Outcome is the result RunRound reaches for one round.
 type Outcome string
 
 const (
+	// OutcomeContinue means this round found an outstanding blocking
+	// finding: not a task-terminal outcome — the caller should dispatch
+	// another round (up to MaxRounds) using RoundResult.PriorFindings.
+	OutcomeContinue     Outcome = "continue"
 	OutcomeStopSuccess  Outcome = "stop-success"
 	OutcomeStopEscalate Outcome = "stop-escalate"
 )
 
-// Dependencies are the test-seam interfaces Run needs, plus the
+// Dependencies are the test-seam interfaces RunRound needs, plus the
 // orchestrator process identity PolicyRequest carries. SecretsClient is
 // wired into internal/executor directly (credential issuance happens per
 // step, not per round).
@@ -38,93 +52,116 @@ type Dependencies struct {
 	Audit                  audit.AuditWriter
 	Executors              *executor.Registry
 	OrchestratorInstanceID string
+
+	// Recorder is internal/taskrunner's crash-recovery hook into fan-out
+	// (design §4.2): when set, fanOut calls it immediately before and after
+	// dispatching each step, so a step_runs row exists from the instant a
+	// step launches, not only once it resolves. Nil is a valid, common
+	// value — e.g. every coreloop-level unit test that isn't exercising
+	// persistence — and fanOut treats a nil Recorder as a no-op.
+	Recorder StepRunRecorder
 }
 
-// Result is Run's outcome for one task.
-type Result struct {
-	TaskID    string
-	Outcome   Outcome
-	RoundsRun int
-	Reason    string
-	StepRuns  []domain.StepRun
+// StepRunRecorder is Dependencies.Recorder's interface — kept narrow and
+// coreloop-local (rather than taskrunner's whole TaskStore) so coreloop
+// stays decision-logic-only and doesn't import taskrunner.
+type StepRunRecorder interface {
+	// RecordLaunched inserts a step_runs row the instant a step is
+	// dispatched, before its outcome is known.
+	RecordLaunched(ctx context.Context, taskID string, round int, step policyclient.ResolvedStep, invocationID string) error
+	// RecordCompleted updates that row in place once the step resolves.
+	// execErr is exec.Execute's own error (nil on success) — it decides
+	// step_runs.status (failed vs completed); run's fields are only
+	// meaningful when execErr is nil.
+	RecordCompleted(ctx context.Context, taskID string, invocationID string, run domain.StepRun, execErr error) error
 }
 
-// Run executes the core loop for one task until it reaches a terminal
-// outcome or exhausts MaxRounds. Every PDP decision and the task's terminal
-// outcome are audited (internal/executor's step executors audit their own
-// invocations) — an audit write failure fails the task, matching this
-// project's fail-closed posture elsewhere (ADR-3/ADR-9).
-func Run(ctx context.Context, deps Dependencies, task domain.Task) (Result, error) {
-	var allRuns []domain.StepRun
+// RoundResult is RunRound's outcome for one round of one task.
+type RoundResult struct {
+	Outcome Outcome
+	Reason  string
+	// StepRuns holds only this round's step runs (steps skipped via
+	// alreadyCompleted are included too, so callers see a complete picture
+	// of the round regardless of what was actually (re)dispatched).
+	StepRuns []domain.StepRun
+	// PriorFindings is this round's marshaled findings, for the next
+	// round's generate-phase dispatch. Set iff Outcome == OutcomeContinue.
+	PriorFindings []byte
+}
 
-	for round := 1; round <= MaxRounds; round++ {
-		pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval", task.ID, round)
-		decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round, pdpInvocationID))
+// RunRound executes ADR-7's decision logic once for one round: PDP-evaluate
+// -> phase-grouped fan-out -> aggregate -> evaluate. priorFindings is the
+// previous round's marshaled findings (nil on round 1), passed through to
+// the generate phase's step only.
+//
+// alreadyCompleted lets a caller skip re-dispatching steps a prior,
+// interrupted attempt at this same round already completed — internal/
+// taskrunner's startup reconciliation (design §4.2) is the only caller that
+// passes a non-empty map; every other caller passes nil. Skipped steps are
+// still included in RoundResult.StepRuns and still participate in
+// aggregate/evaluate, exactly as if they'd been dispatched just now.
+func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round int, priorFindings []byte, alreadyCompleted map[string]domain.StepRun) (RoundResult, error) {
+	pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval", task.ID, round)
+	decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round, pdpInvocationID))
+	if err != nil {
+		return RoundResult{}, fmt.Errorf("round %d: policy evaluate: %w", round, err)
+	}
+
+	if err := auditPDPDecision(ctx, deps.Audit, task, round, pdpInvocationID, decision); err != nil {
+		return RoundResult{}, fmt.Errorf("round %d: audit PDP decision: %w", round, err)
+	}
+
+	switch decision.Decision {
+	case "deny":
+		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "policy denied: " + decision.Reason}, nil
+
+	case "require_human_approval":
+		res, err := deps.Approval.VerifyApproval(ctx, approval.ApprovalCheckRequest{TargetRepo: task.TargetRepo})
 		if err != nil {
-			return Result{}, fmt.Errorf("round %d: policy evaluate: %w", round, err)
+			return RoundResult{}, fmt.Errorf("round %d: verify approval: %w", round, err)
+		}
+		if !res.Approved {
+			return RoundResult{Outcome: OutcomeStopEscalate, Reason: "human approval required and not granted"}, nil
 		}
 
-		if err := auditPDPDecision(ctx, deps.Audit, task, round, pdpInvocationID, decision); err != nil {
-			return Result{}, fmt.Errorf("round %d: audit PDP decision: %w", round, err)
+	case "allow":
+		// proceed to fan-out below
+
+	default:
+		return RoundResult{}, fmt.Errorf("round %d: unknown policy decision %q", round, decision.Decision)
+	}
+
+	groups, err := groupStepsByPhase(decision.ResolvedSteps)
+	if err != nil {
+		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "invalid phase configuration: " + err.Error()}, nil
+	}
+
+	var runs []domain.StepRun
+	for _, phase := range dispatchOrder {
+		steps := groups[phase]
+		if len(steps) == 0 {
+			continue
 		}
-
-		switch decision.Decision {
-		case "deny":
-			result := Result{
-				TaskID: task.ID, Outcome: OutcomeStopEscalate, RoundsRun: round,
-				Reason: "policy denied: " + decision.Reason, StepRuns: allRuns,
-			}
-			if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
-				return Result{}, fmt.Errorf("round %d: audit task outcome: %w", round, err)
-			}
-			return result, nil
-
-		case "require_human_approval":
-			res, err := deps.Approval.VerifyApproval(ctx, approval.ApprovalCheckRequest{TargetRepo: task.TargetRepo})
-			if err != nil {
-				return Result{}, fmt.Errorf("round %d: verify approval: %w", round, err)
-			}
-			if !res.Approved {
-				result := Result{
-					TaskID: task.ID, Outcome: OutcomeStopEscalate, RoundsRun: round,
-					Reason: "human approval required and not granted", StepRuns: allRuns,
-				}
-				if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
-					return Result{}, fmt.Errorf("round %d: audit task outcome: %w", round, err)
-				}
-				return result, nil
-			}
-
-		case "allow":
-			// proceed to fan-out below
-
-		default:
-			return Result{}, fmt.Errorf("round %d: unknown policy decision %q", round, decision.Decision)
+		var pf []byte
+		if phase == policyclient.PhaseGenerate {
+			pf = priorFindings
 		}
-
-		runs, err := fanOut(ctx, deps, task, round, decision.ResolvedSteps, decision.GrantedScopes)
+		phaseRuns, err := fanOut(ctx, deps, task, round, steps, decision.GrantedScopes, pf, alreadyCompleted)
 		if err != nil {
-			return Result{}, fmt.Errorf("round %d: fan out: %w", round, err)
+			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, phase, err)
 		}
-		allRuns = append(allRuns, runs...)
-
-		if !aggregate(runs) {
-			result := Result{TaskID: task.ID, Outcome: OutcomeStopSuccess, RoundsRun: round, StepRuns: allRuns}
-			if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
-				return Result{}, fmt.Errorf("round %d: audit task outcome: %w", round, err)
-			}
-			return result, nil
-		}
+		runs = append(runs, phaseRuns...)
 	}
 
-	result := Result{
-		TaskID: task.ID, Outcome: OutcomeStopEscalate, RoundsRun: MaxRounds,
-		Reason: "round cap reached with blocking findings outstanding", StepRuns: allRuns,
+	if !aggregate(runs) {
+		return RoundResult{Outcome: OutcomeStopSuccess, StepRuns: runs}, nil
 	}
-	if err := auditTaskOutcome(ctx, deps.Audit, task, result); err != nil {
-		return Result{}, fmt.Errorf("audit task outcome: %w", err)
+
+	findings, err := marshalFindings(runs)
+	if err != nil {
+		return RoundResult{}, fmt.Errorf("round %d: marshal prior findings: %w", round, err)
 	}
-	return result, nil
+	return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings}, nil
 }
 
 func policyRequest(deps Dependencies, task domain.Task, round int, invocationID string) policyclient.PolicyRequest {
@@ -163,31 +200,61 @@ func auditPDPDecision(ctx context.Context, w audit.AuditWriter, task domain.Task
 	})
 }
 
-// auditTaskOutcome writes one "task-outcome" row per task — the terminal
-// stop-success/stop-escalate decision point ADR-1's execution-outcome
-// merge otherwise has nowhere to land, since it isn't scoped to any single
-// invocation.
-func auditTaskOutcome(ctx context.Context, w audit.AuditWriter, task domain.Task, result Result) error {
-	return w.WriteInvocationRecord(ctx, audit.InvocationAuditRecord{
-		InvocationID: fmt.Sprintf("%s:outcome", task.ID),
-		TaskID:       task.ID,
-		Round:        result.RoundsRun,
-		StepType:     "task-outcome",
-		BotAccount:   task.BotAccount,
-		TargetRepo:   task.TargetRepo,
-		Status:       string(result.Outcome),
-		Evidence:     result.Reason,
-	})
+// dispatchOrder is the fixed phase dispatch order (design §4.1). "approve"
+// is deliberately absent: it's never dispatched through StepExecutor
+// (§4.4) — groupStepsByPhase fails closed if any resolved step declares it,
+// since nothing yet produces or satisfies an approve-phase gate.
+var dispatchOrder = []string{policyclient.PhaseGenerate, policyclient.PhaseReview, policyclient.PhasePublish}
+
+// groupStepsByPhase buckets a round's resolved steps by phase (defaulting
+// unset/empty phases to "review", normalized onto the bucketed copy so no
+// downstream consumer needs to re-derive the default) and enforces §4.1's
+// cardinality rules: at most one generate step, at most one publish step,
+// and — until §4.4 lands the approve gate — no approve steps at all.
+func groupStepsByPhase(steps []policyclient.ResolvedStep) (map[string][]policyclient.ResolvedStep, error) {
+	groups := make(map[string][]policyclient.ResolvedStep)
+	for _, s := range steps {
+		phase := s.Phase
+		if phase == "" {
+			phase = policyclient.PhaseReview
+		}
+		switch phase {
+		case policyclient.PhaseGenerate, policyclient.PhaseReview, policyclient.PhaseApprove, policyclient.PhasePublish:
+		default:
+			return nil, fmt.Errorf("resolved step %q has unknown phase %q", s.StepID, phase)
+		}
+		s.Phase = phase
+		groups[phase] = append(groups[phase], s)
+	}
+	if n := len(groups[policyclient.PhaseGenerate]); n > 1 {
+		return nil, fmt.Errorf("at most one generate-phase step per round, got %d", n)
+	}
+	if n := len(groups[policyclient.PhasePublish]); n > 1 {
+		return nil, fmt.Errorf("at most one publish-phase step per round, got %d", n)
+	}
+	if n := len(groups[policyclient.PhaseApprove]); n > 0 {
+		return nil, fmt.Errorf("approve-phase steps are not yet supported (%d resolved)", n)
+	}
+	return groups, nil
 }
 
-// fanOut dispatches every PDP-resolved step concurrently through the
-// registry and waits for all of them to finish.
-func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int, steps []policyclient.ResolvedStep, grantedScopes []string) ([]domain.StepRun, error) {
+// fanOut dispatches one phase group's steps concurrently through the
+// registry and waits for all of them to finish. priorFindings is passed
+// through to every step's StepContext as-is — callers only supply it for
+// the generate phase (§4.1). A step present in alreadyCompleted is not
+// re-dispatched (and not re-recorded) — its cached domain.StepRun is
+// reused as-is.
+func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int, steps []policyclient.ResolvedStep, grantedScopes []string, priorFindings []byte, alreadyCompleted map[string]domain.StepRun) ([]domain.StepRun, error) {
 	runs := make([]domain.StepRun, len(steps))
 	errs := make([]error, len(steps))
 
 	var wg sync.WaitGroup
 	for i, step := range steps {
+		if cached, ok := alreadyCompleted[step.StepID]; ok {
+			runs[i] = cached
+			continue
+		}
+
 		wg.Add(1)
 		go func(i int, step policyclient.ResolvedStep) {
 			defer wg.Done()
@@ -196,9 +263,24 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 				errs[i] = fmt.Errorf("no executor registered for step type %q", step.Type)
 				return
 			}
+
+			invocationID := executor.InvocationID(executor.StepContext{Task: task, Round: round, Step: step})
+			if deps.Recorder != nil {
+				if err := deps.Recorder.RecordLaunched(ctx, task.ID, round, step, invocationID); err != nil {
+					errs[i] = fmt.Errorf("record launched step_run for %s: %w", step.StepID, err)
+					return
+				}
+			}
+
 			run, err := exec.Execute(ctx, executor.StepContext{
-				Task: task, Round: round, Step: step, GrantedScopes: grantedScopes,
+				Task: task, Round: round, Step: step, GrantedScopes: grantedScopes, PriorFindings: priorFindings,
 			})
+
+			if deps.Recorder != nil {
+				if rerr := deps.Recorder.RecordCompleted(ctx, task.ID, invocationID, run, err); rerr != nil && err == nil {
+					err = fmt.Errorf("record completed step_run for %s: %w", step.StepID, rerr)
+				}
+			}
 			if err != nil {
 				errs[i] = err
 				return
@@ -214,6 +296,31 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 		}
 	}
 	return runs, nil
+}
+
+// findingSummary is PRIOR_FINDINGS_JSON's wire shape — untrusted content
+// fed into the next round's generate-phase env (design §7): a coding agent
+// should treat it as review output to act on, not as trusted instruction.
+type findingSummary struct {
+	StepID           string          `json:"step_id"`
+	Blocking         bool            `json:"blocking"`
+	StructuredResult json.RawMessage `json:"structured_result,omitempty"`
+}
+
+// marshalFindings collects every StepRun that reported a finding this round
+// (blocking or advisory) into PRIOR_FINDINGS_JSON for the next round's
+// generate-phase dispatch.
+func marshalFindings(runs []domain.StepRun) ([]byte, error) {
+	var findings []findingSummary
+	for _, r := range runs {
+		if !r.HasFinding {
+			continue
+		}
+		findings = append(findings, findingSummary{
+			StepID: r.StepID, Blocking: r.Blocking, StructuredResult: r.StructuredResult,
+		})
+	}
+	return json.Marshal(findings)
 }
 
 // aggregate combines step outcomes into a single blocking/non-blocking

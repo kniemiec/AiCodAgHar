@@ -44,6 +44,7 @@ type resolvedStepWire struct {
 	Type       string `json:"type"`
 	Blocking   bool   `json:"blocking"`
 	BotAccount string `json:"bot_account"`
+	Phase      string `json:"phase,omitempty"`
 }
 
 type evaluationResponseWire struct {

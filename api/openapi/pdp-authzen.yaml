@@ -111,6 +111,14 @@ components:
           type: boolean
         bot_account:
           type: string
+        phase:
+          type: string
+          description: >
+            Follow-up design (docs/designs/next/full-pipeline-async-approval-design.md)
+            addition — which of the fixed generate/review/approve/publish
+            phases this step belongs to. Defaults to "review" when absent,
+            for compatibility with resolved steps that predate this field.
+          enum: [generate, review, approve, publish]
     EvaluationResponse:
       type: object
       required: [decision]

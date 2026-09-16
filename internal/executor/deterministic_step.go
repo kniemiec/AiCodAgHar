@@ -27,7 +27,7 @@ type DeterministicStepExecutor struct {
 }
 
 func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext) (domain.StepRun, error) {
-	invocationID := invocationID(sc)
+	invocationID := InvocationID(sc)
 
 	cred, err := mintCredential(ctx, e.Secrets, sc)
 	if err != nil {

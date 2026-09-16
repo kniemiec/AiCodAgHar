@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/executor"
+	"github.com/kniemiec/AiCodAgHar/internal/taskrunner"
 )
 
 func main() {
@@ -60,21 +62,37 @@ func main() {
 	}
 	defer auditWriter.Close()
 
+	taskStore, err := taskrunner.NewPostgresTaskStore(requireEnv("ORCHESTRATOR_DB_DSN"))
+	if err != nil {
+		log.Fatalf("control-plane: task store: %v", err)
+	}
+	defer taskStore.Close()
+
 	registry := executor.NewRegistry(
 		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
 		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
 	)
 
-	srv := &server{
-		git: git,
-		loop: coreloop.Dependencies{
+	runner := taskrunner.NewRunner(taskrunner.Dependencies{
+		Coreloop: coreloop.Dependencies{
 			Policy:                 policy,
 			Approval:               approval.NoopApprovalVerifier{},
 			Audit:                  auditWriter,
 			Executors:              registry,
 			OrchestratorInstanceID: orchestratorInstanceID,
 		},
+		Store:    taskStore,
+		Launcher: launcher,
+	})
+
+	// Startup reconciliation (design §4.2): resume any task left
+	// status=running from a prior process's in-flight execution — a
+	// restart survives at any point, not only while waiting on approval.
+	if err := runner.Reconcile(context.Background()); err != nil {
+		log.Fatalf("control-plane: startup reconciliation: %v", err)
 	}
+
+	srv := &server{git: git, runner: runner}
 
 	log.Printf("control-plane listening on %s", addr)
 	if err := http.ListenAndServe(addr, logRequests(newServeMux(srv))); err != nil {

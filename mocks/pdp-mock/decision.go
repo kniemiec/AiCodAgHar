@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/config"
@@ -55,17 +56,21 @@ func (d *decider) decide(ctx context.Context, repoRef gitclient.RepoRef, req eva
 		if s.TaskType != req.Action.Name {
 			continue
 		}
-		if s.Conditions != nil && len(s.Conditions.RiskTier) > 0 && !containsString(s.Conditions.RiskTier, riskTier) {
+		if s.Conditions != nil && len(s.Conditions.RiskTier) > 0 && !slices.Contains(s.Conditions.RiskTier, riskTier) {
 			continue
 		}
-		resolved = append(resolved, resolvedStepWire{StepID: s.ID, Type: s.Type, Blocking: s.Blocking, BotAccount: s.BotAccount})
+		phase := s.Phase
+		if phase == "" {
+			phase = "review"
+		}
+		resolved = append(resolved, resolvedStepWire{StepID: s.ID, Type: s.Type, Blocking: s.Blocking, BotAccount: s.BotAccount, Phase: phase})
 	}
 
 	decision := "allow"
 	reason := ""
 	for _, ra := range policy.RequireHumanApproval {
 		for _, r := range resolved {
-			if r.StepID == ra.StepID && (len(ra.RiskTier) == 0 || containsString(ra.RiskTier, riskTier)) {
+			if r.StepID == ra.StepID && (len(ra.RiskTier) == 0 || slices.Contains(ra.RiskTier, riskTier)) {
 				decision = "require_human_approval"
 				reason = fmt.Sprintf("step %s requires human approval at risk tier %s", ra.StepID, riskTier)
 			}
@@ -114,13 +119,4 @@ func (d *decider) loadMergedPolicy(ctx context.Context, repoRef gitclient.RepoRe
 		merged.QuotaRules = append(merged.QuotaRules, target.QuotaRules...)
 	}
 	return merged, nil
-}
-
-func containsString(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }

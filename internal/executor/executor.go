@@ -19,6 +19,12 @@ type StepContext struct {
 	Round         int
 	Step          policyclient.ResolvedStep
 	GrantedScopes []string
+
+	// PriorFindings is the previous round's aggregated findings, JSON-
+	// encoded — set only when dispatching a generate-phase step (design
+	// docs/designs/next/full-pipeline-async-approval-design.md §4.1). Nil
+	// on round 1 and for every non-generate-phase step.
+	PriorFindings []byte
 }
 
 // StepExecutor runs one resolved step and reports its outcome as a

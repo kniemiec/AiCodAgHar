@@ -2,7 +2,7 @@
 
 // Policy-gate reconciliation: launch count vs. PDP-allow count. This is an
 // offline query/test, not something the running system checks itself — it
-// drives a few real scenarios through coreloop.Run (against the real
+// drives a few real scenarios through coreloop.RunRound (against the real
 // Postgres AuditWriter, fakes for everything else) and then asserts, via
 // SQL, that step-level audit rows exist for a (task_id, round) if and only
 // if that round's pdp-decision row says "allow", and that the count always
@@ -132,10 +132,10 @@ func runScenario(t *testing.T, writer *audit.PostgresWriter, taskID string, poli
 		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: writer},
 	)
 
-	_, err := coreloop.Run(context.Background(), coreloop.Dependencies{
+	_, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
 		Policy: policy, Approval: appr, Audit: writer, Executors: registry, OrchestratorInstanceID: "recon-test",
-	}, domain.Task{ID: taskID, TargetRepo: "owner/repo"})
+	}, domain.Task{ID: taskID, TargetRepo: "owner/repo"}, 1, nil, nil)
 	if err != nil {
-		t.Fatalf("coreloop.Run(%s): %v", taskID, err)
+		t.Fatalf("coreloop.RunRound(%s): %v", taskID, err)
 	}
 }

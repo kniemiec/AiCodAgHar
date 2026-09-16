@@ -37,7 +37,21 @@ type ResolvedStep struct {
 	Type       string `json:"type"` // agent-stage | deterministic-step
 	Blocking   bool   `json:"blocking"`
 	BotAccount string `json:"bot_account"`
+
+	// Phase is the follow-up design's addition
+	// (docs/designs/next/full-pipeline-async-approval-design.md §4.1):
+	// generate | review | approve | publish. Empty means "review", the
+	// default for steps resolved before this field existed.
+	Phase string `json:"phase,omitempty"`
 }
+
+// The fixed, hardcoded phase set and dispatch order (design §4.1).
+const (
+	PhaseGenerate = "generate"
+	PhaseReview   = "review"
+	PhaseApprove  = "approve"
+	PhasePublish  = "publish"
+)
 
 // PolicyDecision mirrors api/openapi/pdp-authzen.yaml's EvaluationResponse.
 type PolicyDecision struct {

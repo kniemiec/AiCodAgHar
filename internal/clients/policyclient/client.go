@@ -61,6 +61,7 @@ type resolvedStepWire struct {
 	Type       string `json:"type"`
 	Blocking   bool   `json:"blocking"`
 	BotAccount string `json:"bot_account"`
+	Phase      string `json:"phase,omitempty"`
 }
 
 type evaluationResponseWire struct {
@@ -114,7 +115,7 @@ func (c *Client) Evaluate(ctx context.Context, req PolicyRequest) (PolicyDecisio
 
 	resolved := make([]ResolvedStep, len(out.ResolvedSteps))
 	for i, s := range out.ResolvedSteps {
-		resolved[i] = ResolvedStep{StepID: s.StepID, Type: s.Type, Blocking: s.Blocking, BotAccount: s.BotAccount}
+		resolved[i] = ResolvedStep{StepID: s.StepID, Type: s.Type, Blocking: s.Blocking, BotAccount: s.BotAccount, Phase: s.Phase}
 	}
 
 	return PolicyDecision{

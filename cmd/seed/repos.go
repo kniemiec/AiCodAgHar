@@ -34,15 +34,29 @@ const globalBaselinePolicyYAML = `require_human_approval:
 // sampleStagesYAML: ≥1 agent-stage entry and ≥1 deterministic-step entry,
 // as Phase 6 requires. Step IDs double as launcher-mock fixture keys in
 // this mocked environment (see internal/executor's PayloadRef doc
-// comments) — "review-with-commit" and "unit-tests" are real fixtures in
-// cmd/launcher-mock/fixtures.go.
-const sampleStagesYAML = `- id: review-with-commit
+// comments) — "implement", "review-with-commit", and "unit-tests" are real
+// fixtures in mocks/launcher-mock/fixtures.go.
+//
+// All three entries share task_type "pr-review-round" so pdp-mock resolves
+// them together in one PDP.Evaluate call (docs/designs/next/full-pipeline-
+// async-approval-design.md §4.1's flowchart); "implement" is the round's
+// generate-phase step, dispatched alone and first, before the review-phase
+// fan-out.
+const sampleStagesYAML = `- id: implement
   type: agent-stage
+  phase: generate
+  bot_account: coding-agent
+  task_type: pr-review-round
+  blocking: true
+- id: review-with-commit
+  type: agent-stage
+  phase: review
   bot_account: review-bot
   task_type: pr-review-round
   blocking: true
 - id: unit-tests
   type: deterministic-step
+  phase: review
   bot_account: ci-bot
   task_type: pr-review-round
   blocking: true

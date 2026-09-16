@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
-	"github.com/kniemiec/AiCodAgHar/internal/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/taskrunner"
 )
 
 type createTaskRequest struct {
@@ -47,8 +47,8 @@ type createTaskResponse struct {
 
 // server holds the wired dependencies the HTTP handlers close over.
 type server struct {
-	git  gitclient.GitHostClient
-	loop coreloop.Dependencies
+	git    gitclient.GitHostClient
+	runner *taskrunner.Runner
 }
 
 func newServeMux(s *server) *http.ServeMux {
@@ -106,9 +106,25 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		PRNumber:            pr.Number,
 	}
 
-	result, err := coreloop.Run(ctx, s.loop, task)
+	// design docs/designs/next/full-pipeline-async-approval-design.md §4.2
+	// (sequence step 2): taskrunner.Start returns immediately, but the API
+	// stays synchronous for now — block on the completion channel rather
+	// than replying 202. §4.3 flips this to a real async POST /tasks.
+	_, done, err := s.runner.Start(ctx, task)
 	if err != nil {
-		http.Error(w, "run core loop: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "start task: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var result taskrunner.Result
+	select {
+	case result = <-done:
+	case <-ctx.Done():
+		http.Error(w, "run task: "+ctx.Err().Error(), http.StatusGatewayTimeout)
+		return
+	}
+	if result.Err != nil {
+		http.Error(w, "run task: "+result.Err.Error(), http.StatusInternalServerError)
 		return
 	}
 

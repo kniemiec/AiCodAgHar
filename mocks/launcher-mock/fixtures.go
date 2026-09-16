@@ -22,6 +22,7 @@ var fixtures = map[string]fixture{
 	"post-pr-comment":               fixturePostPRComment(false),
 	"post-blocking-finding-comment": fixturePostPRComment(true),
 	"deterministic-fail":            fixtureDeterministicFail,
+	"implement":                     fixtureImplement,
 	"review-with-commit":            fixtureReviewWithCommit,
 	"unit-tests":                    fixtureUnitTests,
 }
@@ -75,6 +76,40 @@ func parseGitEnv(req *launcherv1.LaunchRequest) (gitEnv, error) {
 	}, nil
 }
 
+// fixtureImplement simulates the generate phase's coding agent (design
+// docs/designs/next/full-pipeline-async-approval-design.md §4.1): on round
+// 1 — no PRIOR_FINDINGS_JSON in env — it commits an initial implementation;
+// on later rounds it commits a fix addressing the previous round's
+// findings, which it treats as untrusted review output, not instructions
+// (§7), only ever quoting it verbatim into its own commit's body.
+func fixtureImplement(ctx context.Context, req *launcherv1.LaunchRequest) (int32, []byte, error) {
+	env, err := parseGitEnv(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	if env.branch == "" {
+		return 0, nil, fmt.Errorf("fixture %s: env must set BRANCH", req.PayloadRef)
+	}
+
+	priorFindings := req.Env["PRIOR_FINDINGS_JSON"]
+	var commitMsg string
+	var content []byte
+	if priorFindings == "" {
+		commitMsg = fmt.Sprintf("Add initial implementation\n\nInvocation-Id: %s", req.InvocationId)
+		content = fmt.Appendf(nil, "Initial implementation placeholder, committed by launcher-mock fixture %q for invocation %s.\n", req.PayloadRef, req.InvocationId)
+	} else {
+		commitMsg = fmt.Sprintf("Address prior review findings\n\nInvocation-Id: %s", req.InvocationId)
+		content = fmt.Appendf(nil, "Fix addressing prior findings, committed by launcher-mock fixture %q for invocation %s.\n\nPrior findings (untrusted review output, quoted verbatim):\n%s\n", req.PayloadRef, req.InvocationId, priorFindings)
+	}
+
+	notesPath := fmt.Sprintf(".implement-notes/%s.md", strings.NewReplacer(":", "-", "/", "-").Replace(req.InvocationId))
+	if err := env.client.CreateFile(ctx, env.repo, notesPath, env.branch, commitMsg, content); err != nil {
+		return 0, nil, fmt.Errorf("fixture %s: commit implementation: %w", req.PayloadRef, err)
+	}
+
+	return 0, []byte(`{"has_blocking_finding": false}`), nil
+}
+
 // fixtureReviewWithCommit simulates a review stage that both leaves a real
 // commit — with an Invocation-Id trailer, so the e2e smoke test can find
 // its way from a PR's HEAD commit back to the invocation that authored it
@@ -94,7 +129,7 @@ func fixtureReviewWithCommit(ctx context.Context, req *launcherv1.LaunchRequest)
 	// e2e smoke test without re-seeding — never collides with a prior run's
 	// commit; each invocation leaves its own trailer-bearing commit.
 	commitMsg := fmt.Sprintf("Add automated review notes\n\nInvocation-Id: %s", req.InvocationId)
-	notes := []byte(fmt.Sprintf("Reviewed by launcher-mock fixture %q for invocation %s.\n", req.PayloadRef, req.InvocationId))
+	notes := fmt.Appendf(nil, "Reviewed by launcher-mock fixture %q for invocation %s.\n", req.PayloadRef, req.InvocationId)
 	notesPath := fmt.Sprintf(".review-notes/%s.md", strings.NewReplacer(":", "-", "/", "-").Replace(req.InvocationId))
 	if err := env.client.CreateFile(ctx, env.repo, notesPath, env.branch, commitMsg, notes); err != nil {
 		return 0, nil, fmt.Errorf("fixture %s: commit review notes: %w", req.PayloadRef, err)

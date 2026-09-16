@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/secrets-mock ./cmd/secrets-mock
+RUN CGO_ENABLED=0 go build -o /out/secrets-mock ./mocks/secrets-mock
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/secrets-mock /secrets-mock

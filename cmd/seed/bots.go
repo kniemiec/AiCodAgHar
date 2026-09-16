@@ -24,6 +24,7 @@ type botAccount struct {
 var botAccounts = []botAccount{
 	{Username: "review-bot", Password: "seed-bot-password-review", Scopes: []string{"write:repository", "write:issue"}},
 	{Username: "ci-bot", Password: "seed-bot-password-ci", Scopes: []string{"write:repository", "write:issue"}},
+	{Username: "coding-agent", Password: "seed-bot-password-coding-agent", Scopes: []string{"write:repository", "write:issue"}},
 }
 
 // ensureBotAccountsAndMintTokens creates each bot account if it doesn't

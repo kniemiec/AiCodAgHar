@@ -19,7 +19,7 @@ const credentialTTL = 10 * time.Minute
 // bot account PDP resolved that step to run as.
 func mintCredential(ctx context.Context, secrets secretsclient.SecretsClient, sc StepContext) (secretsclient.Credential, error) {
 	cred, err := secrets.IssueCredential(ctx, secretsclient.CredentialRequest{
-		InvocationID: invocationID(sc),
+		InvocationID: InvocationID(sc),
 		BotAccount:   sc.Step.BotAccount,
 		TargetRepo:   sc.Task.TargetRepo,
 		Scopes:       sc.GrantedScopes,
@@ -45,6 +45,9 @@ func launchEnv(forgejoURL string, sc StepContext, cred secretsclient.Credential)
 	}
 	if sc.Task.PRNumber != 0 {
 		env["PR_NUMBER"] = strconv.Itoa(sc.Task.PRNumber)
+	}
+	if len(sc.PriorFindings) > 0 {
+		env["PRIOR_FINDINGS_JSON"] = string(sc.PriorFindings)
 	}
 	return env
 }

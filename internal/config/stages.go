@@ -13,7 +13,8 @@ type Condition struct {
 // schemas/stages.schema.json.
 type StageEntry struct {
 	ID                string     `yaml:"id"`
-	Type              string     `yaml:"type"` // agent-stage | deterministic-step
+	Type              string     `yaml:"type"`            // agent-stage | deterministic-step
+	Phase             string     `yaml:"phase,omitempty"` // generate | review | approve | publish, default "review"
 	BotAccount        string     `yaml:"bot_account"`
 	TaskType          string     `yaml:"task_type"`
 	Blocking          bool       `yaml:"blocking"`

@@ -136,6 +136,9 @@ services:
       # Phase 5: requires deploy/migrations to have been applied (`make
       # migrate`) — the orchestrator_audit_writer role/schema must exist.
       AUDIT_DB_DSN: ${AUDIT_DB_INTERNAL_DSN:?set in deploy/.env}
+      # internal/taskrunner's persisted task/round/step_runs state (design
+      # docs/designs/next/full-pipeline-async-approval-design.md §4.2).
+      ORCHESTRATOR_DB_DSN: ${ORCHESTRATOR_DB_INTERNAL_DSN:?set in deploy/.env}
     volumes:
       - ./certs:/certs:ro
     ports:

@@ -2,6 +2,7 @@
   {
     "id": "review-round",
     "type": "agent-stage",
+    "phase": "review",
     "bot_account": "review-bot",
     "task_type": "pr-review-round",
     "blocking": true,

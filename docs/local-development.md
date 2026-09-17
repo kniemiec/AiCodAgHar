@@ -82,7 +82,7 @@ The seeded sample repo doesn't have `.harness/APPROVERS` or a webhook, so a `wai
 4. Provision that same secret in `secrets-mock`: `SECRETS_MOCK_WEBHOOK_POOL_JSON='{"<owner>/<repo>":"<secret>"}'` in `deploy/.env` — **single-quote the whole value**. `make test-e2e`/`test-integration` source `deploy/.env` with real bash (`set -a; . deploy/.env`), which strips *unquoted* embedded double quotes; Docker Compose's own `.env` parser doesn't have this problem, but a value that has to work in both places needs the outer single quotes regardless.
 5. `GET /tasks/{id}` for `approval_issue_number`, then label that issue `approved` or `rejected` as the user from step 2.
 
-`internal/e2e/smoke_test.go`'s `TestSmoke_ApprovalWebhookFlow` does exactly this against its own fixed scratch repo — read it for a fully worked example, including the `webhook.ALLOWED_HOST_LIST` note below.
+`internal/control-plane/e2e/smoke_test.go`'s `TestSmoke_ApprovalWebhookFlow` does exactly this against its own fixed scratch repo — read it for a fully worked example, including the `webhook.ALLOWED_HOST_LIST` note below.
 
 Verify side effects directly:
 
@@ -111,7 +111,7 @@ docker compose -f deploy/docker-compose.yml exec -T postgres \
 |---|---|---|---|
 | Integration | `compose-up` + `bootstrap-admin` + `migrate` | `make test-integration` | Each production client against its real/stand-in counterpart — incl. mTLS enforcement, the Postgres-role privilege test, and the tamper-detection test |
 | Spike | `compose-up` + `bootstrap-admin` | `make test-spike` | `code.gitea.io/sdk/gitea` actually covers `GitHostClient`'s surface |
-| E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/e2e/smoke_test.go` |
+| E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/control-plane/e2e/smoke_test.go` |
 
 ## 6. Troubleshooting
 

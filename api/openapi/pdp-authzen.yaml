@@ -114,7 +114,7 @@ components:
         phase:
           type: string
           description: >
-            Follow-up design (docs/designs/next/full-pipeline-async-approval-design.md)
+            Follow-up design (docs/designs/completed/full-pipeline-async-approval-design.md)
             addition — which of the fixed generate/review/approve/publish
             phases this step belongs to. Defaults to "review" when absent,
             for compatibility with resolved steps that predate this field.
@@ -127,7 +127,7 @@ components:
           type: string
           enum: [allow, deny]
           description: >
-            Follow-up design (docs/designs/next/full-pipeline-async-approval-design.md
+            Follow-up design (docs/designs/completed/full-pipeline-async-approval-design.md
             §4.4) dropped require_human_approval from this enum — "this
             round needs a human" is now expressed as a resolved step with
             phase "approve" on an ordinary allow, not a third decision

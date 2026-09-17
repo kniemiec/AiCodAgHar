@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
-	"github.com/kniemiec/AiCodAgHar/internal/clients/secretsclient"
-	"github.com/kniemiec/AiCodAgHar/internal/domain"
-	"github.com/kniemiec/AiCodAgHar/internal/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 )
 
 type createTaskRequest struct {
@@ -133,7 +133,7 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		PRNumber:            pr.Number,
 	}
 
-	// design docs/designs/next/full-pipeline-async-approval-design.md §4.3:
+	// design docs/designs/completed/full-pipeline-async-approval-design.md §4.3:
 	// Start kicks off round 1 in the background and returns immediately —
 	// the handler replies 202 without waiting for a terminal outcome.
 	// GET /tasks/{id} is how a caller finds out what happened next.

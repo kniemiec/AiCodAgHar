@@ -77,7 +77,7 @@ func parseGitEnv(req *launcherv1.LaunchRequest) (gitEnv, error) {
 }
 
 // fixtureImplement simulates the generate phase's coding agent (design
-// docs/designs/next/full-pipeline-async-approval-design.md §4.1): on round
+// docs/designs/completed/full-pipeline-async-approval-design.md §4.1): on round
 // 1 — no PRIOR_FINDINGS_JSON in env — it commits an initial implementation;
 // on later rounds it commits a fix addressing the previous round's
 // findings, which it treats as untrusted review output, not instructions

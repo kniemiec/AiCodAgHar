@@ -1,6 +1,6 @@
 -- Wires up the orchestrator schema 002_orchestrator_schema.sql reserved but
 -- left unwritten: persisted, per-step-resumable task state, driven by the
--- new internal/taskrunner package (docs/designs/next/full-pipeline-async-
+-- new internal/control-plane/taskrunner package (docs/designs/next/full-pipeline-async-
 -- approval-design.md §4.2).
 
 ALTER TABLE orchestrator.tasks

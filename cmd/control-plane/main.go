@@ -2,7 +2,7 @@
 // docs/plans/active/orchestrator-control-plane-mvp.md). Wires all the real
 // client implementations — GitHostClient, PolicyClient, SecretsClient,
 // ContainerLauncher, ApprovalVerifier, and (Phase 5) the Postgres
-// AuditWriter — into internal/coreloop and exposes a REST endpoint to
+// AuditWriter — into internal/control-plane/coreloop and exposes a REST endpoint to
 // create a task.
 package main
 
@@ -12,15 +12,15 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/kniemiec/AiCodAgHar/internal/approval"
-	"github.com/kniemiec/AiCodAgHar/internal/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
-	"github.com/kniemiec/AiCodAgHar/internal/clients/launcherclient"
-	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
-	"github.com/kniemiec/AiCodAgHar/internal/clients/secretsclient"
-	"github.com/kniemiec/AiCodAgHar/internal/coreloop"
-	"github.com/kniemiec/AiCodAgHar/internal/executor"
-	"github.com/kniemiec/AiCodAgHar/internal/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/approval"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/policyclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 )
 
 func main() {

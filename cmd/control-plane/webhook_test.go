@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kniemiec/AiCodAgHar/internal/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
-	"github.com/kniemiec/AiCodAgHar/internal/clients/policyclient"
-	"github.com/kniemiec/AiCodAgHar/internal/coreloop"
-	"github.com/kniemiec/AiCodAgHar/internal/domain"
-	"github.com/kniemiec/AiCodAgHar/internal/executor"
-	"github.com/kniemiec/AiCodAgHar/internal/fakes"
-	"github.com/kniemiec/AiCodAgHar/internal/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/approval"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/policyclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/fakes"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 )
 
 const webhookTestSecret = "test-webhook-secret"

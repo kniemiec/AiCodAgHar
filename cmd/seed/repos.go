@@ -33,7 +33,7 @@ const globalBaselinePolicyYAML = `require_human_approval:
 
 // sampleStagesYAML: ≥1 agent-stage entry and ≥1 deterministic-step entry,
 // as Phase 6 requires. Step IDs double as launcher-mock fixture keys in
-// this mocked environment (see internal/executor's PayloadRef doc
+// this mocked environment (see internal/control-plane/executor's PayloadRef doc
 // comments) — "implement", "review-with-commit", and "unit-tests" are real
 // fixtures in mocks/launcher-mock/fixtures.go.
 //

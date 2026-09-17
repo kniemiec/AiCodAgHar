@@ -47,7 +47,7 @@ test-e2e:
 	TLS_CA_CERT=$(CURDIR)/deploy/certs/ca.crt \
 	TLS_CLIENT_CERT=$(CURDIR)/deploy/certs/client.crt \
 	TLS_CLIENT_KEY=$(CURDIR)/deploy/certs/client.key \
-	go test -tags e2e ./internal/e2e/... -v
+	go test -tags e2e ./internal/control-plane/e2e/... -v
 
 tidy:
 	go mod tidy

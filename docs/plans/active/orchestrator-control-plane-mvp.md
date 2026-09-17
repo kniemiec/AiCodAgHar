@@ -51,14 +51,14 @@ Single Go module (monorepo), consistent with ADR-11's Go decision and its `runc`
 | `cmd/seed` | One-shot idempotent CLI: bootstraps Forgejo bot accounts, the global-baseline repo, and the sample target repo (with `.harness/policy.yaml` + `.harness/stages.yaml`) | Uses `GitHostClient`'s production impl |
 
 `internal/` layout:
-- `internal/domain` — `Task`, `Round`, `StepRun`, `Invocation` models
-- `internal/coreloop` — ADR-7's fixed state machine, round cap = 5 hardcoded
-- `internal/executor` — `StepExecutor` interface, closed-set registry keyed by `type`, `AgentStageExecutor` + `DeterministicStepExecutor`
+- `internal/control-plane/domain` — `Task`, `Round`, `StepRun`, `Invocation` models
+- `internal/control-plane/coreloop` — ADR-7's fixed state machine, round cap = 5 hardcoded
+- `internal/control-plane/executor` — `StepExecutor` interface, closed-set registry keyed by `type`, `AgentStageExecutor` + `DeterministicStepExecutor`
 - `internal/clients/{gitclient,policyclient,secretsclient,launcherclient}` — one production implementation per ADR-9 interface
-- `internal/audit` — Postgres `AuditWriter` impl + hash-chain logic
-- `internal/approval` — `ApprovalVerifier` stub
+- `internal/control-plane/audit` — Postgres `AuditWriter` impl + hash-chain logic
+- `internal/control-plane/approval` — `ApprovalVerifier` stub
 - `internal/config` — Go structs + JSON Schema validation for `.harness/policy.yaml` / `.harness/stages.yaml`
-- `internal/fakes` — one in-memory fake per interface, used only in `internal/coreloop`'s unit tests
+- `internal/control-plane/fakes` — one in-memory fake per interface, used only in `internal/control-plane/coreloop`'s unit tests
 
 ## Contracts
 
@@ -88,7 +88,7 @@ message KillResponse { bool killed = 1; }
 message ExtractLogsRequest { string invocation_id = 1; }
 message ExtractLogsResponse { bytes stdout=1; bytes stderr=2; bytes structured_result_json=3; }
 ```
-Go interface (`internal/clients/launcherclient`):
+Go interface (`internal/control-plane/clients/launcherclient`):
 ```go
 type ContainerLauncher interface {
     Launch(ctx context.Context, req LaunchRequest) (RunResult, error)
@@ -184,7 +184,7 @@ Write `launcher.proto`, both OpenAPI specs, both JSON Schemas, and the six Go in
 *Done*: everything compiles; schema validator has passing/failing fixture tests.
 
 **Phase 2 — Control-plane skeleton + fakes + unit tests.**
-Domain models, `internal/coreloop` state machine, `StepExecutor` registry (two stub executors), in-memory fakes for all six interfaces. Unit tests: PDP-deny short-circuits before launch; round cap fires stop-escalate at round 5 (fake PDP always signals a blocking finding, no real time cost); fan-out runs steps concurrently; aggregate/evaluate transitions.
+Domain models, `internal/control-plane/coreloop` state machine, `StepExecutor` registry (two stub executors), in-memory fakes for all six interfaces. Unit tests: PDP-deny short-circuits before launch; round cap fires stop-escalate at round 5 (fake PDP always signals a blocking finding, no real time cost); fan-out runs steps concurrently; aggregate/evaluate transitions.
 *Done*: `go test ./...` green against fakes only, no live services needed.
 
 **Phase 3 — Mock services as real compose services.**
@@ -205,7 +205,7 @@ Migrations for both schemas/roles, `AuditWriter` wired at every decision point (
 
 ## Testing Strategy
 
-- **Unit** (fast, no live services): `internal/coreloop` against `internal/fakes` — PDP allow/deny/require-approval branches, round-cap-at-5 without real time cost, parallel fan-out, aggregation blocking-vs-advisory logic, registry dispatch-by-`type`, hash-chain math, JSON Schema fixture validation.
+- **Unit** (fast, no live services): `internal/control-plane/coreloop` against `internal/control-plane/fakes` — PDP allow/deny/require-approval branches, round-cap-at-5 without real time cost, parallel fan-out, aggregation blocking-vs-advisory logic, registry dispatch-by-`type`, hash-chain math, JSON Schema fixture validation.
 - **Integration** (`//go:build integration`, run against compose): each real client implementation against its real mocked counterpart or real infra — `PolicyClient` vs `pdp-mock`, `SecretsClient` vs `secrets-mock`, `ContainerLauncher` (gRPC/mTLS) vs `launcher-mock`, `GitHostClient` vs real seeded Forgejo, `AuditWriter` vs real Postgres — including a literal Postgres-role privilege test: attempt an `UPDATE` as the audit-writer role and confirm Postgres itself rejects it.
 - **One true e2e smoke test**: full stack up; seed script runs; POST a task against the sample repo; poll to terminal state; assert (1) a new PR exists with a commit trailer containing `invocation_id`, (2) the PR has ≥1 review comment from the `agent-stage` review executor, (3) the deterministic-step executor's structured result is present in its `step_run`, (4) `invocation_audit` has ≥3 rows under one `task_id` with a valid hash chain, (5) task status is `stop-success`. A second, narrower variant configures `pdp-mock` to always report a blocking finding, forcing all 5 rounds and asserting `stop-escalate` — cheap because `launcher-mock`'s fixtures return in milliseconds.
 

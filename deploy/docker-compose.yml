@@ -57,7 +57,7 @@ services:
       - forgejo-data:/data
     ports:
       - "3001:3000"
-      - "2222:22"
+      - "2223:22"
     networks: [orchestrator-net]
 
   secrets-mock:
@@ -145,8 +145,8 @@ services:
       # Phase 5: requires deploy/migrations to have been applied (`make
       # migrate`) — the orchestrator_audit_writer role/schema must exist.
       AUDIT_DB_DSN: ${AUDIT_DB_INTERNAL_DSN:?set in deploy/.env}
-      # internal/taskrunner's persisted task/round/step_runs state (design
-      # docs/designs/next/full-pipeline-async-approval-design.md §4.2).
+      # internal/control-plane/taskrunner's persisted task/round/step_runs state (design
+      # docs/designs/completed/full-pipeline-async-approval-design.md §4.2).
       ORCHESTRATOR_DB_DSN: ${ORCHESTRATOR_DB_INTERNAL_DSN:?set in deploy/.env}
       # design §4.4: real Forgejo issue/label/webhook-HMAC approval, backed
       # by POST /webhooks/forgejo. Local compose always has that endpoint

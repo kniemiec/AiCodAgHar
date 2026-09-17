@@ -19,7 +19,7 @@
 -- chain, and GetTaskChain is a read — so ADR-5's "INSERT-only" is
 -- interpreted here as "append-only, no mutation," verified by the
 -- Postgres-role privilege test in
--- internal/audit/postgres_integration_test.go (attempts an UPDATE as this
+-- internal/control-plane/audit/postgres_integration_test.go (attempts an UPDATE as this
 -- role and confirms Postgres itself rejects it).
 --
 -- resolved_steps is `text`, not `jsonb`: row_hash is computed over the

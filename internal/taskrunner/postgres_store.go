@@ -188,6 +188,39 @@ func (s *PostgresTaskStore) ListStepRuns(ctx context.Context, taskID string, rou
 	return runs, nil
 }
 
+func (s *PostgresTaskStore) ListStepRunsForTask(ctx context.Context, taskID string) ([]domain.StepRun, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT round_number, step_id, step_type, invocation_id, blocking,
+		       exit_code, has_finding, structured_result, status
+		FROM orchestrator.step_runs WHERE task_id = $1 ORDER BY round_number ASC, id ASC`,
+		taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("taskrunner: list step_runs for %s: %w", taskID, err)
+	}
+	defer rows.Close()
+
+	var runs []domain.StepRun
+	for rows.Next() {
+		var run domain.StepRun
+		var exitCode sql.NullInt32
+		var hasFinding sql.NullBool
+		if err := rows.Scan(
+			&run.Round, &run.StepID, &run.StepType, &run.InvocationID, &run.Blocking,
+			&exitCode, &hasFinding, &run.StructuredResult, &run.Status,
+		); err != nil {
+			return nil, fmt.Errorf("taskrunner: scan step_run for %s: %w", taskID, err)
+		}
+		run.ExitCode = exitCode.Int32
+		run.HasFinding = hasFinding.Bool
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("taskrunner: iterate step_runs for %s: %w", taskID, err)
+	}
+	return runs, nil
+}
+
 func (s *PostgresTaskStore) ListRunningTaskIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM orchestrator.tasks WHERE status = $1`, domain.TaskStatusRunning)
 	if err != nil {
@@ -207,6 +240,22 @@ func (s *PostgresTaskStore) ListRunningTaskIDs(ctx context.Context) ([]string, e
 		return nil, fmt.Errorf("taskrunner: iterate running tasks: %w", err)
 	}
 	return ids, nil
+}
+
+func (s *PostgresTaskStore) FindWaitingApprovalTask(ctx context.Context, targetRepo string, issueNumber int) (string, bool, error) {
+	var taskID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM orchestrator.tasks
+		WHERE target_repo = $1 AND approval_issue_number = $2 AND status = $3`,
+		targetRepo, issueNumber, domain.TaskStatusWaitingApproval,
+	).Scan(&taskID)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("taskrunner: find waiting-approval task for %s#%d: %w", targetRepo, issueNumber, err)
+	}
+	return taskID, true, nil
 }
 
 func nullableString(s string) any {

@@ -62,12 +62,14 @@ func TestPolicyGateReconciliation(t *testing.T) {
 		},
 	}, &fakes.FakeApprovalVerifier{})
 
-	// Scenario C: require_human_approval, not approved — zero launches.
+	// Scenario C: allow, with an unmet approve-phase gate (design §4.4) and
+	// no generate/review steps at all — zero launches, since approve is
+	// never dispatched through StepExecutor.
 	runScenario(t, writer, unapprovedTaskID, &fakes.FakePolicyClient{
 		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
 			return policyclient.PolicyDecision{
-				Decision:      "require_human_approval",
-				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "review", Type: executor.StepTypeAgentStage, BotAccount: "review-bot"}},
+				Decision:      "allow",
+				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "human-signoff", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseApprove}},
 			}, nil
 		},
 	}, &fakes.FakeApprovalVerifier{})
@@ -105,7 +107,7 @@ func TestPolicyGateReconciliation(t *testing.T) {
 		taskID string
 	}{
 		{"deny rounds: zero launches", denyTaskID},
-		{"unapproved require_human_approval rounds: zero launches", unapprovedTaskID},
+		{"unmet approve-phase gate rounds: zero launches", unapprovedTaskID},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var launchCount int
@@ -134,6 +136,7 @@ func runScenario(t *testing.T, writer *audit.PostgresWriter, taskID string, poli
 
 	_, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
 		Policy: policy, Approval: appr, Audit: writer, Executors: registry, OrchestratorInstanceID: "recon-test",
+		IssueOpener: &fakes.FakeGitHostClient{},
 	}, domain.Task{ID: taskID, TargetRepo: "owner/repo"}, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("coreloop.RunRound(%s): %v", taskID, err)

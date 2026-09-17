@@ -1,30 +1,22 @@
-// Package approval holds the ApprovalVerifier interface; its v1 fail-closed
-// stub, NoopApprovalVerifier, lands in Phase 2.
+// Package approval holds the ApprovalVerifier interface: v1's fail-closed
+// stub, NoopApprovalVerifier, and the real implementation, RealApprovalVerifier
+// (docs/designs/next/full-pipeline-async-approval-design.md §4.4) — the
+// actual issue/label/webhook-HMAC verification work happens in
+// cmd/control-plane's webhook handler; by the time VerifyApproval is called,
+// all that's left is reading back what the handler already persisted.
 package approval
 
 import "context"
-
-// ApprovalCheckRequest identifies the Forgejo issue/webhook evidence a human
-// approval would be verified against (ADR-9's issue+label+webhook-HMAC flow).
-type ApprovalCheckRequest struct {
-	TargetRepo       string
-	IssueNumber      int
-	WebhookSignature []byte
-	WebhookPayload   []byte
-}
 
 // ApprovalResult is the outcome of an approval check.
 type ApprovalResult struct {
 	Approved   bool
 	ApprovedBy string
-	Evidence   string
 }
 
-// ApprovalVerifier is ADR-9's human-approval test-seam interface. This plan
-// defers the real Forgejo issue+label+webhook-HMAC mechanism; its only
-// implementation here is NoopApprovalVerifier, a fail-closed stub that
-// always returns Approved: false, matching the ADR-3/ADR-9 fail-closed
-// posture.
+// ApprovalVerifier is ADR-9's human-approval test-seam interface.
 type ApprovalVerifier interface {
-	VerifyApproval(ctx context.Context, req ApprovalCheckRequest) (ApprovalResult, error)
+	// VerifyApproval reports whether taskID's pending approve-phase gate
+	// has a recorded, verified approval.
+	VerifyApproval(ctx context.Context, taskID string) (ApprovalResult, error)
 }

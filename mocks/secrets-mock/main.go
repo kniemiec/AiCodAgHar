@@ -30,6 +30,22 @@ func loadTokenPool() map[string]string {
 	return pool
 }
 
+// loadWebhookSecretPool mirrors loadTokenPool's convention: a static,
+// pre-provisioned pool sourced from a JSON env var, empty (not fatal) if
+// unset — design §4.4's webhook flow is opt-in, not every deployment needs
+// it configured.
+func loadWebhookSecretPool() map[string]string {
+	raw := os.Getenv("SECRETS_MOCK_WEBHOOK_POOL_JSON")
+	if raw == "" {
+		return map[string]string{}
+	}
+	var pool map[string]string
+	if err := json.Unmarshal([]byte(raw), &pool); err != nil {
+		log.Fatalf("secrets-mock: invalid SECRETS_MOCK_WEBHOOK_POOL_JSON: %v", err)
+	}
+	return pool
+}
+
 func main() {
 	addr := os.Getenv("ADDR")
 	if addr == "" {
@@ -37,8 +53,9 @@ func main() {
 	}
 
 	p := newPool(loadTokenPool())
+	wp := newWebhookSecretPool(loadWebhookSecretPool())
 	log.Printf("secrets-mock listening on %s", addr)
-	if err := http.ListenAndServe(addr, logRequests(newServeMux(p))); err != nil {
+	if err := http.ListenAndServe(addr, logRequests(newServeMux(p, wp))); err != nil {
 		log.Fatalf("secrets-mock: %v", err)
 	}
 }

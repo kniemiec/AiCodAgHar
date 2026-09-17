@@ -32,4 +32,12 @@ type Credential struct {
 type SecretsClient interface {
 	IssueCredential(ctx context.Context, req CredentialRequest) (Credential, error)
 	RevokeCredential(ctx context.Context, credentialID string) error
+
+	// GetWebhookSecret returns the per-repo HMAC secret design §4.4's
+	// webhook handler verifies X-Forgejo-Signature against. Unlike
+	// IssueCredential/RevokeCredential this isn't a per-invocation minted
+	// credential — it's a long-lived shared secret also configured on the
+	// repo's Forgejo webhook — but secrets-mock still sources it from the
+	// same kind of static pre-provisioned pool (design §7).
+	GetWebhookSecret(ctx context.Context, targetRepo string) (string, error)
 }

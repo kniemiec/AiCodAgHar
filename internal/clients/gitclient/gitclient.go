@@ -59,6 +59,14 @@ type Webhook struct {
 	Active bool
 }
 
+// Issue is the subset of a Forgejo issue the orchestrator needs — design
+// §4.4's approval issue.
+type Issue struct {
+	Number int
+	Title  string
+	Body   string
+}
+
 // GitHostClient is ADR-9's Forgejo test-seam interface. Its production
 // implementation wraps code.gitea.io/sdk/gitea (confirmed to cover this
 // surface by the Phase 0 spike, internal/clients/gitclient/spike_test.go);
@@ -73,4 +81,15 @@ type GitHostClient interface {
 	GetBranchProtection(ctx context.Context, repo RepoRef, branch string) (BranchProtection, error)
 	VerifyCollaboratorRole(ctx context.Context, repo RepoRef, username string, minRole Role) (bool, error)
 	CreateWebhook(ctx context.Context, repo RepoRef, cfg WebhookConfig) (Webhook, error)
+
+	// CreateOrReuseIssue opens the approval issue for a repo, or returns the
+	// existing open one with the same title if one already exists (design
+	// §4.4) — idempotent against a crash between opening the issue and
+	// persisting its number, which would otherwise duplicate it on retry.
+	CreateOrReuseIssue(ctx context.Context, repo RepoRef, title, body string) (Issue, error)
+
+	// ListIssueLabels independently re-reads an issue's current labels —
+	// design §4.4's webhook handler never trusts a webhook payload's own
+	// claim about what labels are present.
+	ListIssueLabels(ctx context.Context, repo RepoRef, issueNumber int) ([]string, error)
 }

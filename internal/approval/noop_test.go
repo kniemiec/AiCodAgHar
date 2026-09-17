@@ -9,7 +9,7 @@ import (
 
 func TestNoopApprovalVerifier_AlwaysFailsClosed(t *testing.T) {
 	v := approval.NoopApprovalVerifier{}
-	res, err := v.VerifyApproval(context.Background(), approval.ApprovalCheckRequest{TargetRepo: "owner/repo", IssueNumber: 1})
+	res, err := v.VerifyApproval(context.Background(), "task-1")
 	if err != nil {
 		t.Fatalf("VerifyApproval: %v", err)
 	}

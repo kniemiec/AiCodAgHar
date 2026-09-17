@@ -68,9 +68,21 @@ curl -s -X POST http://localhost:8080/tasks \
   }' | python3 -m json.tool
 ```
 
-See [`docs/components/orchestrator.md`§4](components/orchestrator.md#4-api) for the response shape. Other scenarios against the seeded sample repo:
-- `"risk_tier": "high"` → the global-baseline policy repo requires human approval at that tier; the task escalates immediately with zero launches.
+See [`docs/components/orchestrator.md`§4](components/orchestrator.md#4-api) for the response shape (a `202` — poll `GET /tasks/{id}` for progress). Other scenarios against the seeded sample repo:
+- `"risk_tier": "high"` → the global-baseline policy repo requires human approval at that tier; the task reaches `waiting_approval` once its normal round steps finish clean (design §4.4 — an approve-phase gate doesn't imply zero launches).
 - Request POSTed twice against the same branch → the existing PR is found and updated, not duplicated.
+
+### Trying the approval webhook flow (design §4.4)
+
+The seeded sample repo doesn't have `.harness/APPROVERS` or a webhook, so a `waiting_approval` task there will sit forever without one. To actually clear a gate locally:
+
+1. Set `WEBHOOK_APPROVAL_ENABLED=true` on `control-plane` (already the default in `deploy/docker-compose.yml`).
+2. Add a `.harness/APPROVERS` file to the target repo listing the Forgejo username that will label the issue.
+3. Register a webhook on that repo pointing at `http://control-plane:8080/webhooks/forgejo` (in-network address — Forgejo, not your host, delivers it), `content_type: json`, with some secret.
+4. Provision that same secret in `secrets-mock`: `SECRETS_MOCK_WEBHOOK_POOL_JSON='{"<owner>/<repo>":"<secret>"}'` in `deploy/.env` — **single-quote the whole value**. `make test-e2e`/`test-integration` source `deploy/.env` with real bash (`set -a; . deploy/.env`), which strips *unquoted* embedded double quotes; Docker Compose's own `.env` parser doesn't have this problem, but a value that has to work in both places needs the outer single quotes regardless.
+5. `GET /tasks/{id}` for `approval_issue_number`, then label that issue `approved` or `rejected` as the user from step 2.
+
+`internal/e2e/smoke_test.go`'s `TestSmoke_ApprovalWebhookFlow` does exactly this against its own fixed scratch repo — read it for a fully worked example, including the `webhook.ALLOWED_HOST_LIST` note below.
 
 Verify side effects directly:
 
@@ -107,3 +119,4 @@ docker compose -f deploy/docker-compose.yml exec -T postgres \
 - **`pdp-mock` / `control-plane` crash-looping with "required env var FORGEJO_TOKEN is not set."** Expected before `make bootstrap-admin` has minted a token on a first-ever `compose-up` — it recreates both containers once the token exists. If you see this after that, check `deploy/.env` actually has `FORGEJO_ADMIN_TOKEN` set.
 - **A migration you just applied doesn't seem to take effect.** Postgres client connections (including `control-plane`'s pool) can cache prepared-statement type metadata from before a schema change. Restart the affected container after altering a column type.
 - **`make seed` fails with a password/auth error for a bot account.** If a bot account already exists with a different password than `cmd/seed` expects, it deletes and recreates it — expected and safe for these throwaway local accounts.
+- **A webhook to `control-plane` never arrives; Forgejo logs `webhook can only call allowed HTTP servers (check your webhook.ALLOWED_HOST_LIST setting)`.** Forgejo's own SSRF guard blocks webhook delivery to private/loopback addresses by default — but `control-plane` is only ever reachable at a private compose-network address from Forgejo's side, so the default silently breaks every approval webhook in this exact topology. `deploy/docker-compose.yml` sets `FORGEJO__webhook__ALLOWED_HOST_LIST: "private,loopback"` on the `forgejo` service for this reason; if you're seeing this, that service definition changed or the container hasn't picked it up (`docker compose up -d forgejo` to recreate it).

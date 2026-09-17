@@ -99,7 +99,11 @@ func TestClient_Evaluate(t *testing.T) {
 		}
 	})
 
-	t.Run("require_human_approval via policy.yaml override", func(t *testing.T) {
+	t.Run("require_human_approval via policy.yaml override resolves an approve-phase step", func(t *testing.T) {
+		// Design §4.4: the PDP decision itself stays "allow" — a gate is now
+		// expressed as an additional resolved step with phase "approve",
+		// the same way "needs a security reviewer" is, not a third Decision
+		// value.
 		repoName := "policyclient-integration-approval"
 		repo, _, err := raw.CreateRepo(giteasdk.CreateRepoOption{Name: repoName, AutoInit: true})
 		if err != nil {
@@ -129,8 +133,17 @@ require_human_approval:
 		if err != nil {
 			t.Fatalf("Evaluate: %v", err)
 		}
-		if decision.Decision != "require_human_approval" {
-			t.Fatalf("expected require_human_approval, got %q", decision.Decision)
+		if decision.Decision != "allow" {
+			t.Fatalf("expected allow (the gate is now an approve-phase resolved step, not a decision value), got %q", decision.Decision)
+		}
+		foundApprove := false
+		for _, s := range decision.ResolvedSteps {
+			if s.Phase == policyclient.PhaseApprove {
+				foundApprove = true
+			}
+		}
+		if !foundApprove {
+			t.Fatalf("expected a resolved step with phase %q, got %+v", policyclient.PhaseApprove, decision.ResolvedSteps)
 		}
 	})
 }

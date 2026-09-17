@@ -197,6 +197,50 @@ func (c *Client) CreateWebhook(ctx context.Context, repo RepoRef, cfg WebhookCon
 	return Webhook{ID: hook.ID, Active: hook.Active}, nil
 }
 
+// CreateOrReuseIssue searches repo's open issues for one whose title exactly
+// matches title, returning it if found; otherwise it creates a new one.
+// Reuse-by-title is what makes this safe to call again after a crash
+// between creating an issue and the caller persisting its number.
+func (c *Client) CreateOrReuseIssue(ctx context.Context, repo RepoRef, title, body string) (Issue, error) {
+	if err := ctx.Err(); err != nil {
+		return Issue{}, err
+	}
+	open, _, err := c.sdk.ListRepoIssues(repo.Owner, repo.Name, gitea.ListIssueOption{State: gitea.StateOpen})
+	if err != nil {
+		return Issue{}, fmt.Errorf("gitclient: list open issues on %s/%s: %w", repo.Owner, repo.Name, err)
+	}
+	for _, existing := range open {
+		if existing.Title == title {
+			return toIssue(existing), nil
+		}
+	}
+
+	created, _, err := c.sdk.CreateIssue(repo.Owner, repo.Name, gitea.CreateIssueOption{Title: title, Body: body})
+	if err != nil {
+		return Issue{}, fmt.Errorf("gitclient: create issue on %s/%s: %w", repo.Owner, repo.Name, err)
+	}
+	return toIssue(created), nil
+}
+
+func (c *Client) ListIssueLabels(ctx context.Context, repo RepoRef, issueNumber int) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	labels, _, err := c.sdk.GetIssueLabels(repo.Owner, repo.Name, int64(issueNumber), gitea.ListLabelsOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("gitclient: get labels for issue #%d on %s/%s: %w", issueNumber, repo.Owner, repo.Name, err)
+	}
+	names := make([]string, len(labels))
+	for i, l := range labels {
+		names[i] = l.Name
+	}
+	return names, nil
+}
+
+func toIssue(iss *gitea.Issue) Issue {
+	return Issue{Number: int(iss.Index), Title: iss.Title, Body: iss.Body}
+}
+
 func toPullRequest(pr *gitea.PullRequest) PullRequest {
 	out := PullRequest{
 		Number: int(pr.Index),

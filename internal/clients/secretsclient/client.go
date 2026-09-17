@@ -96,6 +96,39 @@ func (c *Client) RevokeCredential(ctx context.Context, credentialID string) erro
 	return nil
 }
 
+type webhookSecretWire struct {
+	Secret string `json:"secret"`
+}
+
+func (c *Client) GetWebhookSecret(ctx context.Context, targetRepo string) (string, error) {
+	owner, name, ok := strings.Cut(targetRepo, "/")
+	if !ok {
+		return "", fmt.Errorf("secretsclient: target repo must be \"owner/name\", got %q", targetRepo)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/webhook-secrets/"+url.PathEscape(owner)+"/"+url.PathEscape(name), nil)
+	if err != nil {
+		return "", fmt.Errorf("secretsclient: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("secretsclient: get webhook secret: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("secretsclient: get webhook secret: unexpected status %d: %s", resp.StatusCode, readBody(resp.Body))
+	}
+
+	var wire webhookSecretWire
+	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
+		return "", fmt.Errorf("secretsclient: decode response: %w", err)
+	}
+	return wire.Secret, nil
+}
+
 func readBody(r io.Reader) string {
 	b, _ := io.ReadAll(r)
 	return string(b)

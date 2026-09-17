@@ -55,7 +55,10 @@ const (
 
 // PolicyDecision mirrors api/openapi/pdp-authzen.yaml's EvaluationResponse.
 type PolicyDecision struct {
-	Decision            string // allow | deny | require_human_approval
+	// Decision is allow | deny (design §4.4 dropped require_human_approval
+	// — a human-approval gate is now a resolved step with Phase ==
+	// PhaseApprove on an ordinary allow).
+	Decision            string
 	GrantedScopes       []string
 	Reason              string
 	PolicyBundleVersion string

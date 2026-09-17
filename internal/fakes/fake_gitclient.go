@@ -20,6 +20,9 @@ type FakeGitHostClient struct {
 	branchProtections map[string]gitclient.BranchProtection
 	collaboratorRoles map[string]gitclient.Role
 	webhooks          map[string][]gitclient.Webhook
+	issues            map[string][]gitclient.Issue // "owner/name" -> open issues, in creation order
+	nextIssueNumber   map[string]int               // "owner/name"
+	issueLabels       map[string][]string          // "owner/name#number" -> current labels
 }
 
 func repoKey(repo gitclient.RepoRef) string {
@@ -156,4 +159,48 @@ func (f *FakeGitHostClient) CreateWebhook(ctx context.Context, repo gitclient.Re
 	wh := gitclient.Webhook{ID: int64(len(f.webhooks[key]) + 1), Active: true}
 	f.webhooks[key] = append(f.webhooks[key], wh)
 	return wh, nil
+}
+
+// CreateOrReuseIssue mirrors Client's real by-title reuse semantics: an open
+// issue with the same title is returned as-is rather than duplicated.
+func (f *FakeGitHostClient) CreateOrReuseIssue(ctx context.Context, repo gitclient.RepoRef, title, body string) (gitclient.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := repoKey(repo)
+	for _, existing := range f.issues[key] {
+		if existing.Title == title {
+			return existing, nil
+		}
+	}
+	if f.issues == nil {
+		f.issues = map[string][]gitclient.Issue{}
+	}
+	if f.nextIssueNumber == nil {
+		f.nextIssueNumber = map[string]int{}
+	}
+	f.nextIssueNumber[key]++
+	issue := gitclient.Issue{Number: f.nextIssueNumber[key], Title: title, Body: body}
+	f.issues[key] = append(f.issues[key], issue)
+	return issue, nil
+}
+
+// SetIssueLabels preloads (or overwrites) an issue's current labels — how
+// tests simulate a human labeling an issue "approved"/"rejected" before the
+// webhook handler independently re-reads it.
+func (f *FakeGitHostClient) SetIssueLabels(repo gitclient.RepoRef, issueNumber int, labels []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.issueLabels == nil {
+		f.issueLabels = map[string][]string{}
+	}
+	f.issueLabels[fmt.Sprintf("%s#%d", repoKey(repo), issueNumber)] = labels
+}
+
+func (f *FakeGitHostClient) ListIssueLabels(ctx context.Context, repo gitclient.RepoRef, issueNumber int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	labels := f.issueLabels[fmt.Sprintf("%s#%d", repoKey(repo), issueNumber)]
+	out := make([]string, len(labels))
+	copy(out, labels)
+	return out, nil
 }

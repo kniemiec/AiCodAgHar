@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft — not implemented. Staged in `docs/designs/next/` pending review; move to `docs/designs/` (and update [`docs/components/orchestrator.md`](../../components/orchestrator.md)'s Known-gaps section) once adopted. |
+| **Status** | Completed — implementation sequence (§16) fully landed. See [`docs/components/container-launcher.md`](../../components/container-launcher.md) for the living, current-state description; this document is the historical design record. |
 | **Date** | 2026-09-17 |
 | **Builds on** | [ADR-4](../../architecture/week1-adr-4-blast-radius-and-sandboxing.md) (Firecracker chosen as default isolation; defense-in-depth stance) · [ADR-8](../../architecture/week1-adr-8-coding-agent-runtime-selection.md) (OpenHands headless invocation, the `--override-with-envs` gotcha) · [ADR-9](../../architecture/week2-adr-9-orchestrator-foundations.md) §C (`ContainerLauncher` is a single-implementation test-seam interface, not a multi-backend abstraction) · [ADR-10](../../architecture/week2-adr-10-microvm-launch-and-lifecycle-mechanics.md) (jailer/MMDS/vsock/egress mechanics this design implements, including the open questions it explicitly deferred here) · [ADR-11](../../architecture/week3-adr-11-orchestrator-execution-engine.md) (agent-stage / deterministic-step closed step-type set) |
 | **Scope** | A **lean v1** production `ContainerLauncherService` gRPC server that replaces `mocks/launcher-mock` behind the *unchanged* `api/proto/launcher/v1/launcher.proto` contract — the fastest correct path to one real OpenHands invocation, in a real microVM, producing a real PR, so the rest of the platform (still mocked elsewhere) can be tested end to end. Full production hardening (concurrency, egress-pool automation, teardown automation, kill-switch SLA validation) is explicitly named as [§15](#15-known-gaps--deferred-to-a-follow-up-design)'s follow-up design, not built here. |
@@ -24,7 +24,7 @@ This document designs that real replacement: a gRPC server, wire-compatible with
 | Host-side teardown automation (decision point 6) | [§8](#8-kill-switch-and-timeout-enforcement-v1-scope) | Basic happy-path + explicit-kill teardown; orphan-sweep/reconciler automation deferred |
 | Where jailer's root requirement sits in the deployment/privilege model | [§4](#4-privilege-model) | Single privileged gRPC server process (v1); helper-process split named as first hardening candidate |
 
-This is explicitly not an HTTP API design — there's no "Using it" curl-examples section, since it's a gRPC server implementing a contract already documented by [`orchestrator-design.md`](../completed/orchestrator-design.md) §4/§10.
+This is explicitly not an HTTP API design — there's no "Using it" curl-examples section, since it's a gRPC server implementing a contract already documented by [`orchestrator-design.md`](orchestrator-design.md) §4/§10.
 
 ## 2. What already exists — the contract this design implements
 
@@ -161,6 +161,7 @@ internal/launcher/
   mmds/        credential/task injection
   vsock/       log capture + redaction
   prompts/     StepID → OpenHands prompt / command registry
+  egress/      static tap/nftables/proxy setup (§10)
 mocks/launcher-mock/   unchanged — default local-dev backend
 ```
 
@@ -181,7 +182,7 @@ mocks/launcher-mock/   unchanged — default local-dev backend
 
 This cannot run in the existing `docker-compose` mock stack unmodified — it needs `/dev/kvm` passthrough, root for jailer, and host-level tap/nftables access, none of which fit `launcher-mock.Dockerfile`'s distroless, unprivileged pattern.
 
-**Recommended:** add it to `deploy/docker-compose.yml` behind a compose profile (e.g. `--profile real-launcher`) so default `compose-up` keeps using `launcher-mock`; the real service runs `privileged: true` with `/dev/kvm` device-mapped and `network_mode: host`, documented plainly as "Linux-with-KVM only — will not run on the macOS dev loop or unmodified hosted CI runners." A host-level systemd unit is a reasonable alternative, since a privileged container with host networking is barely different from running on the host directly; either way, `LAUNCHER_ADDR` and the mTLS cert SANs (`deploy/gen-certs.sh`) need to cover the real reachable address, not just the compose-network hostname.
+**Recommended:** a separate compose file, not a profile on the existing one. `deploy/docker-compose.yml` stays exactly as-is (mock-only, portable to macOS and hosted CI, no privileged/KVM syntax anywhere in it); a new `deploy/docker-compose.real-launcher.yml` defines the real service with `privileged: true`, `/dev/kvm` device-mapped, and `network_mode: host`, run standalone or as a `-f deploy/docker-compose.yml -f deploy/docker-compose.real-launcher.yml` overlay on a Linux-with-KVM host. This is a stronger boundary than a compose profile on the shared file: it keeps the default file's syntax valid and inert on every platform (nothing host-only for Compose to parse when nobody asked for it), and it makes the KVM-only invocation a visibly distinct command (`-f docker-compose.real-launcher.yml ...`) rather than an easy-to-typo flag on the everyday one — documented plainly as "Linux-with-KVM only — will not run on the macOS dev loop or unmodified hosted CI runners." A host-level systemd unit is a reasonable alternative, since a privileged container with host networking is barely different from running on the host directly; either way, `LAUNCHER_ADDR` and the mTLS cert SANs (`deploy/gen-certs.sh`) need to cover the real reachable address, not just the compose-network hostname.
 
 **CI:** standard hosted runners have no KVM. A new, explicitly KVM-gated Make target (e.g. `make test-launcher-kvm`) should fail fast with a clear message if `/dev/kvm` isn't present/writable, run only on a self-hosted or nested-virtualization-enabled runner — a known, hard constraint, not hidden. The bulk of test coverage ([§14](#14-testing-strategy)) should live in the KVM-independent unit layer precisely because of this constraint.
 
@@ -195,7 +196,7 @@ This cannot run in the existing `docker-compose` mock stack unmodified — it ne
 
 ## 15. Known gaps — deferred to a follow-up design
 
-The following are real, needed work — deliberately out of scope for this lean v1, and named here as the follow-up design's subject (mirroring how [`orchestrator-design.md`](../completed/orchestrator-design.md)'s MVP was followed by [`full-pipeline-async-approval-design.md`](../completed/full-pipeline-async-approval-design.md)):
+The following are real, needed work — deliberately out of scope for this lean v1, and named here as the follow-up design's subject (mirroring how [`orchestrator-design.md`](orchestrator-design.md)'s MVP was followed by [`full-pipeline-async-approval-design.md`](full-pipeline-async-approval-design.md)):
 
 - **Per-invocation COW/reflink rootfs provisioning and concurrency** (ADR-10 decision point 7) — v1's plain full-copy works for one invocation at a time; running many concurrently needs the reflink mechanism and a golden-image pooling/versioning story.
 - **Full egress-pool automation** — concurrent-invocation tap/IP allocation, and turning `GrantedScopes` into a real per-invocation proxy allowlist.

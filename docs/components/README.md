@@ -34,6 +34,7 @@ Keep each component file concise and developer-facing, not exhaustive. Prefer a 
 | File | Covers |
 |---|---|
 | [`orchestrator.md`](orchestrator.md) | `cmd/control-plane` and the `internal/*` packages it's built from |
+| [`container-launcher.md`](container-launcher.md) | `cmd/container-launcher` and the `internal/launcher/*` packages it's built from |
 
 More to come as they're built out: `pdp-mock`, `launcher-mock`, `secrets-mock` (all under `mocks/` — local stand-ins for the orchestrator's Policy Decision Point, step launcher, and secrets/credential issuer dependencies), `seed` (`cmd/seed`).
 

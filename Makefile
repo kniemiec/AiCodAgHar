@@ -1,4 +1,4 @@
-.PHONY: build test test-spike test-integration test-e2e compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
+.PHONY: build test test-spike test-integration test-e2e test-launcher-kvm compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
 
 BUF := buf
 
@@ -51,6 +51,20 @@ test-e2e:
 
 tidy:
 	go mod tidy
+
+# KVM-gated: needs a Linux host with hardware virtualization, root (jailer
+# requires it), and the real jailer/firecracker binaries + golden image env
+# vars cmd/container-launcher/config.go reads (LAUNCHER_JAILER_BINARY,
+# LAUNCHER_FIRECRACKER_BINARY, LAUNCHER_CHROOT_BASE_DIR, LAUNCHER_IMAGE_ROOT
+# — see docs/components/container-launcher.md §6). Fails fast, before ever
+# invoking go test, if /dev/kvm isn't present/writable — this can't run on
+# standard hosted CI runners or the macOS dev loop (design
+# docs/designs/completed/container-launcher-design.md §13), only a
+# self-hosted or nested-virtualization-enabled one.
+test-launcher-kvm:
+	@test -e /dev/kvm || { echo "test-launcher-kvm: /dev/kvm not found — this target requires a Linux host with hardware virtualization"; exit 1; }
+	@test -r /dev/kvm && test -w /dev/kvm || { echo "test-launcher-kvm: /dev/kvm exists but isn't readable/writable by $$(whoami) — add this user to the kvm group (or run with sufficient privileges)"; exit 1; }
+	go test -tags launcherkvm ./cmd/container-launcher/... -v
 
 # buf is installed as a standalone binary (not an in-module go tool) to avoid
 # pulling its large dependency tree into this module's go.mod/go.sum.

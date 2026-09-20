@@ -1,0 +1,11 @@
+[Unit]
+Description=container-launcher guest wrapper (agent-stage or deterministic-step, dispatched by MMDS)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/guest_wrapper.py
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

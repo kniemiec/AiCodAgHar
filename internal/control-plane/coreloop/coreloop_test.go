@@ -265,6 +265,7 @@ func TestRunRound_GeneratePhaseDispatchedBeforeReviewPhase(t *testing.T) {
 
 	res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
 		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher), Audit: &fakes.FakeAuditWriter{},
+		PRCreator: &fakes.FakeGitHostClient{},
 	}, domain.Task{ID: "task-1"}, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("RunRound: %v", err)
@@ -395,6 +396,7 @@ func TestRunRound_PriorFindingsPlumbedAcrossManualRounds(t *testing.T) {
 	}
 	deps := coreloop.Dependencies{
 		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher), Audit: &fakes.FakeAuditWriter{},
+		PRCreator: &fakes.FakeGitHostClient{},
 	}
 	task := domain.Task{ID: "task-1"}
 

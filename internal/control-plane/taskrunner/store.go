@@ -32,6 +32,12 @@ type TaskStore interface {
 	// selects the row; every other TaskState field is written as given.
 	UpdateTaskState(ctx context.Context, state domain.TaskState) error
 
+	// SetTaskPRNumber persists the review PR's number once coreloop opens
+	// it, after the generate phase's step completes with no blocking
+	// failure (design "Task Intent Propagation" §5) — a task no longer
+	// arrives with pr_number already set.
+	SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error
+
 	// EnsureRound inserts orchestrator.rounds' (task_id, round_number) row
 	// if it doesn't already exist — step_runs' foreign key requires it to
 	// exist before any step_runs row for that round can be inserted.

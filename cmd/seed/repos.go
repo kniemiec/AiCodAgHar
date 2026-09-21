@@ -15,8 +15,6 @@ const (
 	// SampleTargetRepoName is the sample repo the orchestrator actually
 	// operates against (plan Decision 3).
 	SampleTargetRepoName = "sample-repo"
-
-	sampleFeatureBranch = "feature-branch"
 )
 
 // globalBaselinePolicyYAML requires human approval for review-with-commit
@@ -37,35 +35,34 @@ const globalBaselinePolicyYAML = `require_human_approval:
 // comments) — "implement", "review-with-commit", and "unit-tests" are real
 // fixtures in mocks/launcher-mock/fixtures.go.
 //
-// All three entries share task_type "pr-review-round" so pdp-mock resolves
-// them together in one PDP.Evaluate call (docs/designs/next/full-pipeline-
-// async-approval-design.md §4.1's flowchart); "implement" is the round's
-// generate-phase step, dispatched alone and first, before the review-phase
-// fan-out.
+// All three entries share task_type "new-task" — the single live task type
+// (Task Intent Propagation design §4 retired pr-review-round as a separate,
+// parallel type) — so pdp-mock resolves them together in one PDP.Evaluate
+// call (docs/designs/next/full-pipeline-async-approval-design.md §4.1's
+// flowchart); "implement" is the round's generate-phase step, dispatched
+// alone and first, before the review-phase fan-out.
 const sampleStagesYAML = `- id: implement
   type: agent-stage
   phase: generate
   bot_account: coding-agent
-  task_type: pr-review-round
+  task_type: new-task
   blocking: true
 - id: review-with-commit
   type: agent-stage
   phase: review
   bot_account: review-bot
-  task_type: pr-review-round
+  task_type: new-task
   blocking: true
 - id: unit-tests
   type: deterministic-step
   phase: review
   bot_account: ci-bot
-  task_type: pr-review-round
+  task_type: new-task
   blocking: true
   command: "go test ./..."
   working_dir: "."
   timeout_seconds: 120
 `
-
-const sampleFeatureContent = "feature placeholder content, seeded by cmd/seed\n"
 
 // SeedRepos recreates the global-baseline and sample target repos from
 // scratch (delete-then-recreate is this CLI's idempotency strategy — see
@@ -93,9 +90,11 @@ func SeedRepos(ctx context.Context, git *gitclient.Client, owner string) (gitcli
 	}
 	// .harness/policy.yaml is deliberately not seeded — see
 	// globalBaselinePolicyYAML's doc comment.
-	if err := git.CreateFileOnNewBranch(ctx, targetRepo, "feature.txt", "main", sampleFeatureBranch, "seed: add feature branch", []byte(sampleFeatureContent)); err != nil {
-		return gitclient.RepoRef{}, fmt.Errorf("seed feature branch: %w", err)
-	}
+	//
+	// No feature branch is pre-seeded here anymore (Task Intent Propagation
+	// design §8): every task now starts from a clean repo state with no
+	// branch/PR, and the generate-phase step creates its own branch off
+	// BaseBranch as its first commit.
 
 	// The bot accounts stages.yaml assigns steps to need write access to
 	// actually commit/comment when launcher-mock's fixtures run as them.

@@ -74,6 +74,19 @@ func (f *FakeTaskStore) UpdateTaskState(ctx context.Context, state domain.TaskSt
 	return nil
 }
 
+func (f *FakeTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	rec, ok := f.tasks[taskID]
+	if !ok {
+		return fmt.Errorf("fakes: set pr_number: no such task %s", taskID)
+	}
+	rec.Task.PRNumber = prNumber
+	f.tasks[taskID] = rec
+	return nil
+}
+
 func (f *FakeTaskStore) EnsureRound(ctx context.Context, taskID string, round int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

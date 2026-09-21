@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/config"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
 )
 
 // maxWebhookBodyBytes bounds how much of a webhook request body this
@@ -33,13 +35,17 @@ const (
 )
 
 // forgejoIssueWebhook is the subset of a Forgejo "issues" webhook payload
-// (fired on label_updated, among other issue events) this handler needs.
-// repository.full_name is "owner/name", matching domain.Task.TargetRepo's
-// own convention directly.
+// (fired on label_updated and opened, among other issue events) this
+// handler needs. repository.full_name is "owner/name", matching
+// domain.Task.TargetRepo's own convention directly. Title/Body are only
+// populated on an "opened" delivery — Task Intent Propagation design §3's
+// task-creation trigger, where the issue body becomes the task description.
 type forgejoIssueWebhook struct {
 	Action string `json:"action"`
 	Issue  struct {
-		Number int `json:"number"`
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		Body   string `json:"body"`
 	} `json:"issue"`
 	Repository struct {
 		FullName string `json:"full_name"`
@@ -88,17 +94,23 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if payload.Action != "label_updated" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	owner, name, ok := strings.Cut(payload.Repository.FullName, "/")
 	if !ok {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	repo := gitclient.RepoRef{Owner: owner, Name: name}
+
+	switch payload.Action {
+	case "opened":
+		s.handleIssueOpened(ctx, w, repo, payload)
+		return
+	case "label_updated":
+		// falls through to the approval/rejection handling below
+	default:
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
 	taskID, ok, err := s.runner.FindWaitingApprovalTask(ctx, payload.Repository.FullName, payload.Issue.Number)
 	if err != nil {
@@ -181,6 +193,51 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 			log.Printf("webhook: resume %s: %v", taskID, result.Err)
 		}
 	}()
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleIssueOpened implements Task Intent Propagation design §3: a Forgejo
+// issue-opened event, once its signature has already verified (the caller's
+// job), starts a new task whose description is the issue body. taskID is
+// deterministic from (repo, issue number) so a webhook redelivery is a
+// no-op rather than a duplicate task. Authorization only requires "not an
+// arbitrary public stranger" — live Write collaborator access, the same
+// check the approval path already performs — since task creation, unlike
+// approving a publish, isn't itself irreversible. Every failure path is
+// fail-closed: logged, no task created, 200 returned regardless (never
+// revealing to an unauthorized caller why nothing happened).
+func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, repo gitclient.RepoRef, payload forgejoIssueWebhook) {
+	taskID := fmt.Sprintf("issue-%s-%d", strings.ReplaceAll(payload.Repository.FullName, "/", "-"), payload.Issue.Number)
+
+	if _, ok, err := s.runner.GetTaskStatus(ctx, taskID); err != nil {
+		log.Printf("webhook: check existing task %s: %v", taskID, err)
+		w.WriteHeader(http.StatusOK)
+		return
+	} else if ok {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	hasWrite, err := s.git.VerifyCollaboratorRole(ctx, repo, payload.Sender.Login, gitclient.RoleWrite)
+	if err != nil || !hasWrite {
+		log.Printf("webhook: %s failed live collaborator-role check on %s: hasWrite=%v err=%v", payload.Sender.Login, payload.Repository.FullName, hasWrite, err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	task := domain.Task{
+		ID:                  taskID,
+		Type:                "new-task",
+		TargetRepo:          payload.Repository.FullName,
+		TriggeringPrincipal: payload.Sender.Login,
+		RiskTier:            "low",
+		Branch:              fmt.Sprintf("task/issue-%d", payload.Issue.Number),
+		BaseBranch:          "main",
+		Description:         payload.Issue.Body,
+	}
+	if _, _, err := s.runner.Start(ctx, task); err != nil {
+		log.Printf("webhook: start task %s: %v", taskID, err)
+	}
 	w.WriteHeader(http.StatusOK)
 }
 

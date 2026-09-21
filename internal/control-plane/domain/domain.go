@@ -8,13 +8,16 @@ import "time"
 // and internal/control-plane/taskrunner's per-task loop (each round dispatched via
 // coreloop.RunRound) are both scoped to.
 //
-// Branch, BaseBranch, and PRNumber are Phase 4 additions: the control-plane
-// resolves (or creates) the review PR once, before the task starts, and
-// every step executor needs that PR number and branch to build its
-// LaunchRequest env (see internal/control-plane/executor's credential/env helpers).
+// Branch and BaseBranch are Phase 4 additions: every step executor needs
+// them to build its LaunchRequest env (see internal/control-plane/executor's
+// credential/env helpers). PRNumber starts at 0 — a task no longer arrives
+// with a branch/PR already open (Task Intent Propagation design §5):
+// coreloop itself opens the review PR once the generate-phase step
+// completes with no blocking failure, and persists the result back onto
+// this field.
 type Task struct {
 	ID                  string
-	Type                string // new-task | pr-review-round | review | security-triage
+	Type                string // new-task (only live value; field kept for future extensibility)
 	TargetRepo          string
 	TriggeringPrincipal string
 	BotAccount          string
@@ -22,6 +25,11 @@ type Task struct {
 	Branch              string
 	BaseBranch          string
 	PRNumber            int
+	// Description is the human-authored task description (Task Intent
+	// Propagation design §1/§2) — a Forgejo issue's body (§3) or POST
+	// /tasks' own description field — propagated into the implement and
+	// review-stage prompts as untrusted context (§6/§7).
+	Description string
 }
 
 // Round is one iteration of ADR-7's fixed core loop for a given Task.

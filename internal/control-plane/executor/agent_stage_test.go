@@ -62,6 +62,40 @@ func TestAgentStageExecutor_ParsesBlockingFindingFromStructuredResult(t *testing
 	}
 }
 
+// TestAgentStageExecutor_PropagatesTaskDescription exercises Task Intent
+// Propagation design §6: a non-empty Task.Description reaches the launch
+// env as TASK_DESCRIPTION, and is omitted entirely (not sent empty) when
+// the task has none.
+func TestAgentStageExecutor_PropagatesTaskDescription(t *testing.T) {
+	launcher := &fakes.FakeContainerLauncher{}
+	e := &executor.AgentStageExecutor{Launcher: launcher, Secrets: &fakes.FakeSecretsClient{}, Audit: &fakes.FakeAuditWriter{}}
+
+	_, err := e.Execute(context.Background(), executor.StepContext{
+		Task:  domain.Task{ID: "task-1", TargetRepo: "owner/repo", Description: "implement X"},
+		Round: 1,
+		Step:  policyclient.ResolvedStep{StepID: "implement", Type: executor.StepTypeAgentStage, BotAccount: "coding-agent"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := launcher.Launches()[0].Env["TASK_DESCRIPTION"]; got != "implement X" {
+		t.Fatalf("expected TASK_DESCRIPTION=%q, got %q", "implement X", got)
+	}
+
+	launcher2 := &fakes.FakeContainerLauncher{}
+	e2 := &executor.AgentStageExecutor{Launcher: launcher2, Secrets: &fakes.FakeSecretsClient{}, Audit: &fakes.FakeAuditWriter{}}
+	if _, err := e2.Execute(context.Background(), executor.StepContext{
+		Task:  domain.Task{ID: "task-2", TargetRepo: "owner/repo"},
+		Round: 1,
+		Step:  policyclient.ResolvedStep{StepID: "implement", Type: executor.StepTypeAgentStage, BotAccount: "coding-agent"},
+	}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if _, ok := launcher2.Launches()[0].Env["TASK_DESCRIPTION"]; ok {
+		t.Fatal("expected no TASK_DESCRIPTION key when Task.Description is empty")
+	}
+}
+
 func TestAgentStageExecutor_NoFindingWhenStructuredResultAbsent(t *testing.T) {
 	e := &executor.AgentStageExecutor{Launcher: &fakes.FakeContainerLauncher{}, Secrets: &fakes.FakeSecretsClient{}, Audit: &fakes.FakeAuditWriter{}}
 

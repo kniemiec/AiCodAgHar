@@ -91,6 +91,7 @@ func main() {
 			Executors:              registry,
 			OrchestratorInstanceID: orchestratorInstanceID,
 			IssueOpener:            git,
+			PRCreator:              git,
 		},
 		Store:    taskStore,
 		Launcher: launcher,

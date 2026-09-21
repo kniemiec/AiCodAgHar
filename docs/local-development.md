@@ -57,20 +57,16 @@ curl -s -X POST http://localhost:8080/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "target_repo": "forgejo-admin/sample-repo",
-    "branch": "feature-branch",
-    "base_branch": "main",
-    "task_type": "pr-review-round",
     "risk_tier": "low",
     "triggering_principal": "manual-test",
     "bot_account": "requesting-account",
-    "pr_title": "Manual test PR",
-    "pr_body": "Testing the orchestrator"
+    "description": "Manual test task — describe the change to implement here"
   }' | python3 -m json.tool
 ```
 
-See [`docs/components/orchestrator.md`§4](components/orchestrator.md#4-api) for the response shape (a `202` — poll `GET /tasks/{id}` for progress). Other scenarios against the seeded sample repo:
+Only `target_repo` is required — `branch` defaults to `task/<task_id>`, and there's no `task_type`/`pr_title`/`pr_body` anymore (task-intent-propagation design §5 dropped upfront PR creation from `POST /tasks` entirely, along with the fields that configured it). See [`docs/components/orchestrator.md`§4](components/orchestrator.md#4-api) for the response shape (a `202` — poll `GET /tasks/{id}` for progress) and how the review PR gets opened instead. Other scenarios against the seeded sample repo:
 - `"risk_tier": "high"` → the global-baseline policy repo requires human approval at that tier; the task reaches `waiting_approval` once its normal round steps finish clean (design §4.4 — an approve-phase gate doesn't imply zero launches).
-- Request POSTed twice against the same branch → the existing PR is found and updated, not duplicated.
+- Posting a real Forgejo issue titled/bodied with the change to implement, then opening it as a `write`-collaborator, triggers the same flow via the issue-opened webhook (task-intent-propagation design §3) instead of a direct `POST /tasks` call — see [`docs/components/orchestrator.md`§4](components/orchestrator.md#4-api)'s `POST /webhooks/forgejo` section.
 
 ### Trying the approval webhook flow (design §4.4)
 

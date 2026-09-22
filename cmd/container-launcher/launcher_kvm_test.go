@@ -101,17 +101,23 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
+	// TASK_DESCRIPTION is hand-authored here rather than propagated from a
+	// real domain.Task (that path is internal/control-plane/executor's
+	// credentials.go, exercised by agent_stage_test.go, not this in-process
+	// call) — this manual test drives *launcherServer directly, so there's
+	// no control-plane Task to source it from.
 	resp, err := srv.Launch(ctx, &launcherv1.LaunchRequest{
 		InvocationId: "kvm-smoke-agent-stage",
 		StepType:     stepTypeAgentStage,
 		PayloadRef:   "implement",
 		Env: map[string]string{
-			"FORGEJO_URL":   requireTestEnv(t, "FORGEJO_URL"),
-			"FORGEJO_TOKEN": requireTestEnv(t, "FORGEJO_TOKEN"),
-			"TARGET_REPO":   requireTestEnv(t, "TARGET_REPO"),
-			"BRANCH":        requireTestEnv(t, "BRANCH"),
-			"HTTP_PROXY":    proxyURL,
-			"HTTPS_PROXY":   proxyURL,
+			"FORGEJO_URL":      requireTestEnv(t, "FORGEJO_URL"),
+			"FORGEJO_TOKEN":    requireTestEnv(t, "FORGEJO_TOKEN"),
+			"TARGET_REPO":      requireTestEnv(t, "TARGET_REPO"),
+			"BRANCH":           requireTestEnv(t, "BRANCH"),
+			"HTTP_PROXY":       proxyURL,
+			"HTTPS_PROXY":      proxyURL,
+			"TASK_DESCRIPTION": "Add two more operations to the calculator: power(a, b) (a raised to the power b) and root(a, n) (the n-th root of a). Follow the existing style of the other operations already in the repo, including error handling and tests.",
 		},
 	})
 	if err != nil {

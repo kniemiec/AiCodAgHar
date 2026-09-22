@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Living document — describes the current implementation; update it in the same change that makes it stale (see [`docs/components/README.md`](README.md)) |
 | **Component** | `cmd/container-launcher` and the `internal/launcher/*` packages it's built from |
-| **Design docs** | [`container-launcher-design.md`](../designs/completed/container-launcher-design.md) (lean v1 — implementation sequence §16: all eight steps landed) |
+| **Design docs** | [`container-launcher-design.md`](../designs/completed/container-launcher-design.md) (lean v1 — implementation sequence §16: all eight steps landed); [`task-intent-propagation-design.md`](../designs/completed/task-intent-propagation-design.md) §6–7 (adds `TASK_DESCRIPTION` env → `templateData.Description` threading into `implement`/`implement-with-findings`/`review-with-commit`) |
 | **Related ADRs** | [ADR-4](../architecture/week1-adr-4-blast-radius-and-sandboxing.md) (isolation/kill-switch/egress requirements this implements), [ADR-10](../architecture/week2-adr-10-microvm-launch-and-lifecycle-mechanics.md) (jailer/MMDS/vsock/egress mechanics), [ADR-8](../architecture/week1-adr-8-coding-agent-runtime-selection.md) (OpenHands headless invocation) |
 | **Related plans** | [Firecracker MicroVM Launch PoC](../plans/firecracker-microvm-launch-poc.md) — the hands-on validation this implementation reuses directly rather than re-deriving |
 | **Running it locally** | `mocks/launcher-mock` is the default local-dev backend ([`docs/local-development.md`](../local-development.md)); this document covers the real `cmd/container-launcher` binary, which needs `/dev/kvm` + root and can't run in that stack |
@@ -62,8 +62,8 @@ Implements `api/proto/launcher/v1/launcher.proto`'s `ContainerLauncherService` �
 
 | `StepID` | Mode | Behavior |
 |---|---|---|
-| `implement` | `openhands-prompt` | Fresh-round or with-prior-findings template, chosen by whether `PRIOR_FINDINGS_JSON` is present |
-| `review-with-commit` | `openhands-prompt` | Review template |
+| `implement` | `openhands-prompt` | Fresh-round or with-prior-findings template, chosen by whether `PRIOR_FINDINGS_JSON` is present; both variants also splice in `TASK_DESCRIPTION` — the human-authored task description, quoted as explicitly-untrusted context — when present |
+| `review-with-commit` | `openhands-prompt` | Review template; also receives `TASK_DESCRIPTION` as untrusted background context when present — the first context ever injected into a review prompt (task-intent-propagation design §3/§7) |
 | `unit-tests` | `command` | A fixed guest shell command (`internal/launcher/prompts`'s small, closed `StepID`→command map — no path yet from a repo's own `.harness/stages.yaml` to a real per-repo test command, [§8](#8-known-gaps)) |
 | *(anything else)* | — | `codes.InvalidArgument` — fails closed, matching the mock's "unknown payload_ref" behavior |
 

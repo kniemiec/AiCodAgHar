@@ -39,10 +39,10 @@ func (s *PostgresTaskStore) CreateTask(ctx context.Context, task domain.Task) er
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO orchestrator.tasks (
 			id, type, target_repo, triggering_principal, bot_account, risk_tier,
-			branch, base_branch, pr_number, status, current_round
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'running',0)`,
+			branch, base_branch, pr_number, description, status, current_round
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',0)`,
 		task.ID, task.Type, task.TargetRepo, task.TriggeringPrincipal, task.BotAccount, task.RiskTier,
-		task.Branch, task.BaseBranch, task.PRNumber,
+		task.Branch, task.BaseBranch, task.PRNumber, task.Description,
 	)
 	if err != nil {
 		return fmt.Errorf("taskrunner: insert task %s: %w", task.ID, err)
@@ -57,12 +57,12 @@ func (s *PostgresTaskStore) GetTask(ctx context.Context, taskID string) (domain.
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, type, target_repo, triggering_principal, bot_account, risk_tier,
-		       branch, base_branch, pr_number,
+		       branch, base_branch, pr_number, description,
 		       status, current_round, approval_issue_number, approved_by, prior_findings, reason, updated_at
 		FROM orchestrator.tasks WHERE id = $1`, taskID,
 	).Scan(
 		&rec.Task.ID, &rec.Task.Type, &rec.Task.TargetRepo, &rec.Task.TriggeringPrincipal, &rec.Task.BotAccount, &rec.Task.RiskTier,
-		&rec.Task.Branch, &rec.Task.BaseBranch, &rec.Task.PRNumber,
+		&rec.Task.Branch, &rec.Task.BaseBranch, &rec.Task.PRNumber, &rec.Task.Description,
 		&rec.State.Status, &rec.State.CurrentRound, &approvalIssue, &approvedBy, &rec.State.PriorFindings, &reason, &rec.State.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -100,6 +100,17 @@ func (s *PostgresTaskStore) UpdateTaskState(ctx context.Context, state domain.Ta
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("taskrunner: update task state %s: no such task", state.TaskID)
+	}
+	return nil
+}
+
+func (s *PostgresTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE orchestrator.tasks SET pr_number = $2 WHERE id = $1`, taskID, prNumber)
+	if err != nil {
+		return fmt.Errorf("taskrunner: set pr_number for %s: %w", taskID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("taskrunner: set pr_number for %s: no such task", taskID)
 	}
 	return nil
 }

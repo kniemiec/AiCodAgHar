@@ -56,8 +56,8 @@ components:
       properties:
         name:
           type: string
-          description: TaskType (new-task | pr-review-round | review | security-triage).
-          example: pr-review-round
+          description: TaskType (new-task | review | security-triage). new-task is the only live value driving the generate->review->approve->publish pipeline.
+          example: new-task
     Context:
       type: object
       description: >

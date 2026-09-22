@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -95,7 +96,9 @@ func labelWebhookBody(t *testing.T, issueNumber int, senderLogin string) []byte 
 	body, err := json.Marshal(forgejoIssueWebhook{
 		Action: "label_updated",
 		Issue: struct {
-			Number int `json:"number"`
+			Number int    `json:"number"`
+			Title  string `json:"title"`
+			Body   string `json:"body"`
 		}{Number: issueNumber},
 		Repository: struct {
 			FullName string `json:"full_name"`
@@ -108,6 +111,143 @@ func labelWebhookBody(t *testing.T, issueNumber int, senderLogin string) []byte 
 		t.Fatalf("marshal webhook body: %v", err)
 	}
 	return body
+}
+
+// issueOpenedWebhookBody builds an "opened"-action payload — Task Intent
+// Propagation design §3's trigger — with body as the issue body that
+// becomes the new task's description.
+func issueOpenedWebhookBody(t *testing.T, issueNumber int, senderLogin, body string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(forgejoIssueWebhook{
+		Action: "opened",
+		Issue: struct {
+			Number int    `json:"number"`
+			Title  string `json:"title"`
+			Body   string `json:"body"`
+		}{Number: issueNumber, Title: "please implement", Body: body},
+		Repository: struct {
+			FullName string `json:"full_name"`
+		}{FullName: webhookTestRepo},
+		Sender: struct {
+			Login string `json:"login"`
+		}{Login: senderLogin},
+	})
+	if err != nil {
+		t.Fatalf("marshal webhook body: %v", err)
+	}
+	return raw
+}
+
+// newIssueOpenedTestServer wires a server with no tasks yet — the state
+// design §3's issue-opened trigger starts from, as opposed to
+// newWebhookTestServer's already-waiting-approval fixture.
+func newIssueOpenedTestServer(t *testing.T) (*server, *fakes.FakeGitHostClient, *fakes.FakeTaskStore) {
+	t.Helper()
+	launcher := &fakes.FakeContainerLauncher{}
+	policy := &fakes.FakePolicyClient{
+		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+			return policyclient.PolicyDecision{
+				Decision: "allow",
+				ResolvedSteps: []policyclient.ResolvedStep{
+					{StepID: "implement", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate, Blocking: false},
+				},
+			}, nil
+		},
+	}
+	secrets := &fakes.FakeSecretsClient{}
+	auditWriter := &fakes.FakeAuditWriter{}
+	git := &fakes.FakeGitHostClient{}
+	store := &fakes.FakeTaskStore{}
+	registry := executor.NewRegistry(
+		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter},
+		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter},
+	)
+	runner := taskrunner.NewRunner(taskrunner.Dependencies{
+		Coreloop: coreloop.Dependencies{
+			Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Audit: auditWriter, Executors: registry,
+			PRCreator: git,
+		},
+		Store:    store,
+		Launcher: launcher,
+	})
+
+	git.SetCollaboratorRole(gitclient.RepoRef{Owner: "acme", Name: "widgets"}, "alice", gitclient.RoleWrite)
+	secrets.WebhookSecrets = map[string]string{webhookTestRepo: webhookTestSecret}
+
+	return &server{git: git, secrets: secrets, runner: runner}, git, store
+}
+
+func TestHandleForgejoWebhook_IssueOpenedStartsTaskWithDescription(t *testing.T) {
+	s, _, store := newIssueOpenedTestServer(t)
+	mux := newServeMux(s)
+
+	resp := postSignedWebhook(t, mux, issueOpenedWebhookBody(t, 42, "alice", "implement a health check endpoint"))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	taskID := fmt.Sprintf("issue-%s-%d", "acme-widgets", 42)
+	rec, ok, err := store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
+		t.Fatalf("expected task %s to have been created: ok=%v err=%v", taskID, ok, err)
+	}
+	if rec.Task.Type != "new-task" {
+		t.Fatalf("expected type new-task, got %q", rec.Task.Type)
+	}
+	if rec.Task.Description != "implement a health check endpoint" {
+		t.Fatalf("expected the issue body as the task description, got %q", rec.Task.Description)
+	}
+	if rec.Task.Branch != "task/issue-42" {
+		t.Fatalf("expected a generated branch, got %q", rec.Task.Branch)
+	}
+	if rec.Task.TriggeringPrincipal != "alice" {
+		t.Fatalf("expected triggering_principal to be the issue's sender, got %q", rec.Task.TriggeringPrincipal)
+	}
+}
+
+// TestHandleForgejoWebhook_IssueOpenedRedeliveryIsNoop exercises design §3's
+// idempotency requirement: a Forgejo webhook redelivery for the same
+// (repo, issue number) must not create a second task or overwrite the
+// first one's description.
+func TestHandleForgejoWebhook_IssueOpenedRedeliveryIsNoop(t *testing.T) {
+	s, _, store := newIssueOpenedTestServer(t)
+	mux := newServeMux(s)
+
+	first := postSignedWebhook(t, mux, issueOpenedWebhookBody(t, 42, "alice", "first delivery"))
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", first.Code, first.Body.String())
+	}
+	second := postSignedWebhook(t, mux, issueOpenedWebhookBody(t, 42, "alice", "redelivered with different body"))
+	if second.Code != http.StatusOK {
+		t.Fatalf("expected 200 on redelivery (a no-op, not an error), got %d: %s", second.Code, second.Body.String())
+	}
+
+	taskID := fmt.Sprintf("issue-%s-%d", "acme-widgets", 42)
+	rec, ok, err := store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
+		t.Fatalf("GetTask: ok=%v err=%v", ok, err)
+	}
+	if rec.Task.Description != "first delivery" {
+		t.Fatalf("expected the redelivery to be a no-op, got description %q", rec.Task.Description)
+	}
+}
+
+// TestHandleForgejoWebhook_IssueOpenedRequiresWriteAccess exercises design
+// §3's fail-closed authorization gate: an opener without live Write
+// collaborator access on the repo must not get a task created for them.
+func TestHandleForgejoWebhook_IssueOpenedRequiresWriteAccess(t *testing.T) {
+	s, _, store := newIssueOpenedTestServer(t)
+	mux := newServeMux(s)
+
+	resp := postSignedWebhook(t, mux, issueOpenedWebhookBody(t, 7, "mallory", "do something"))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 (fail closed, not an error response), got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	taskID := fmt.Sprintf("issue-%s-%d", "acme-widgets", 7)
+	if _, ok, _ := store.GetTask(context.Background(), taskID); ok {
+		t.Fatal("expected no task to be created for a sender without write access")
+	}
 }
 
 func TestHandleForgejoWebhook_BadSignatureIs403(t *testing.T) {

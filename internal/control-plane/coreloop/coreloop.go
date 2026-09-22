@@ -77,11 +77,39 @@ type Dependencies struct {
 	// that interface. Nil is only valid for a task whose config never
 	// resolves an approve-phase step.
 	IssueOpener IssueOpener
+
+	// PRCreator opens (or reuses) a task's review PR (Task Intent
+	// Propagation design §5), once its generate-phase step completes with
+	// no blocking failure — a task no longer arrives with a PR already
+	// open. Any GitHostClient implementation satisfies this structurally.
+	// Nil is only valid for a task whose config never resolves a
+	// generate-phase step, or one whose PRNumber is already set.
+	PRCreator PRCreator
+
+	// PRRecorder persists the PR number PRCreator returns onto the task's
+	// stored record, so a later round (or a GET /tasks/{id} in between)
+	// doesn't reopen it or read back a stale zero. Any TaskStore
+	// implementation satisfies this structurally. Nil is a valid, common
+	// value — e.g. every coreloop-level unit test that isn't exercising
+	// persistence — mirroring Recorder: RunRound still sets task.PRNumber
+	// on its own in-memory copy either way, which is what the rest of this
+	// round's dispatch actually needs.
+	PRRecorder PRRecorder
 }
 
 // IssueOpener is Dependencies.IssueOpener's interface.
 type IssueOpener interface {
 	CreateOrReuseIssue(ctx context.Context, repo gitclient.RepoRef, title, body string) (gitclient.Issue, error)
+}
+
+// PRCreator is Dependencies.PRCreator's interface.
+type PRCreator interface {
+	CreateOrUpdatePR(ctx context.Context, repo gitclient.RepoRef, branch, base, title, body string) (gitclient.PullRequest, error)
+}
+
+// PRRecorder is Dependencies.PRRecorder's interface.
+type PRRecorder interface {
+	SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error
 }
 
 // StepRunRecorder is Dependencies.Recorder's interface — kept narrow and
@@ -112,6 +140,13 @@ type RoundResult struct {
 	// ApprovalIssueNumber is the Forgejo issue a human approves/rejects
 	// against. Set iff Outcome == OutcomeWaitingApproval.
 	ApprovalIssueNumber int
+	// PRNumber is this round's effective task.PRNumber — either what the
+	// caller passed in, or, if this round's generate phase just opened it
+	// (§5), the freshly-created PR's number. Always set (never a
+	// zero-vs-unset ambiguity beyond "no PR exists yet"), so a caller
+	// looping across rounds (internal/control-plane/taskrunner's runLoop) can carry it
+	// into the next round's call without re-reading the store.
+	PRNumber int
 }
 
 // RunRound executes ADR-7's decision logic once for one round: PDP-evaluate
@@ -172,6 +207,24 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, phase, err)
 		}
 		runs = append(runs, phaseRuns...)
+
+		// Task Intent Propagation design §5: a task no longer arrives with
+		// a PR already open, so once the generate phase's own step
+		// completes without a blocking failure, open (or reuse) the review
+		// PR here — before the review phase dispatches, since
+		// reviewWithCommitTmpl needs task.PRNumber.
+		if phase == policyclient.PhaseGenerate && task.PRNumber == 0 && !aggregate(phaseRuns) {
+			pr, err := deps.PRCreator.CreateOrUpdatePR(ctx, approvalRepoRef(task), task.Branch, task.BaseBranch, prTitle(task), task.Description)
+			if err != nil {
+				return RoundResult{}, fmt.Errorf("round %d: open review PR: %w", round, err)
+			}
+			task.PRNumber = pr.Number
+			if deps.PRRecorder != nil {
+				if err := deps.PRRecorder.SetTaskPRNumber(ctx, task.ID, pr.Number); err != nil {
+					return RoundResult{}, fmt.Errorf("round %d: persist PR number: %w", round, err)
+				}
+			}
+		}
 	}
 
 	if aggregate(runs) {
@@ -179,7 +232,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if err != nil {
 			return RoundResult{}, fmt.Errorf("round %d: marshal prior findings: %w", round, err)
 		}
-		return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings}, nil
+		return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings, PRNumber: task.PRNumber}, nil
 	}
 
 	// No outstanding blocking findings. Before publish, an approve-phase
@@ -197,7 +250,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 			if err != nil {
 				return RoundResult{}, fmt.Errorf("round %d: open approval issue: %w", round, err)
 			}
-			return RoundResult{Outcome: OutcomeWaitingApproval, StepRuns: runs, ApprovalIssueNumber: issue.Number}, nil
+			return RoundResult{Outcome: OutcomeWaitingApproval, StepRuns: runs, ApprovalIssueNumber: issue.Number, PRNumber: task.PRNumber}, nil
 		}
 	}
 
@@ -209,7 +262,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		runs = append(runs, phaseRuns...)
 	}
 
-	return RoundResult{Outcome: OutcomeStopSuccess, StepRuns: runs}, nil
+	return RoundResult{Outcome: OutcomeStopSuccess, StepRuns: runs, PRNumber: task.PRNumber}, nil
 }
 
 // approvalRepoRef splits task.TargetRepo ("owner/name") into a
@@ -219,6 +272,13 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 func approvalRepoRef(task domain.Task) gitclient.RepoRef {
 	owner, name, _ := strings.Cut(task.TargetRepo, "/")
 	return gitclient.RepoRef{Owner: owner, Name: name}
+}
+
+// prTitle is the review PR's title (Task Intent Propagation design §5) —
+// task.Description becomes the PR body directly, documenting the original
+// intent for human readers as a free side effect.
+func prTitle(task domain.Task) string {
+	return fmt.Sprintf("[new-task] %s", task.Branch)
 }
 
 // approvalIssueTitle is deliberately stable across repeated calls for the

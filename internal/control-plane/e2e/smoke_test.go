@@ -55,16 +55,20 @@ func requireEnv(t *testing.T) env {
 	return e
 }
 
+// createTaskRequest mirrors cmd/control-plane/handler.go's wire shape
+// (Task Intent Propagation design §5): branch is optional — a task no
+// longer arrives with one already pushed — and task_type/pr_title/pr_body
+// are gone; the server always sets type "new-task" and no longer opens a
+// PR from this request at all (coreloop does, once the generate phase
+// completes).
 type createTaskRequest struct {
 	TargetRepo          string `json:"target_repo"`
-	Branch              string `json:"branch"`
+	Branch              string `json:"branch,omitempty"`
 	BaseBranch          string `json:"base_branch"`
-	TaskType            string `json:"task_type"`
 	RiskTier            string `json:"risk_tier"`
 	TriggeringPrincipal string `json:"triggering_principal"`
 	BotAccount          string `json:"bot_account"`
-	PRTitle             string `json:"pr_title"`
-	PRBody              string `json:"pr_body"`
+	Description         string `json:"description"`
 }
 
 type stepRunWire struct {
@@ -195,15 +199,16 @@ func TestSmoke_MainFlow(t *testing.T) {
 
 	taskID := postTask(t, e.controlPlaneURL, createTaskRequest{
 		TargetRepo:          e.owner + "/sample-repo",
-		Branch:              "feature-branch",
 		BaseBranch:          "main",
-		TaskType:            "pr-review-round",
 		RiskTier:            "low",
 		TriggeringPrincipal: "e2e-smoke-test",
 		BotAccount:          "requesting-account",
-		PRTitle:             "e2e smoke test PR",
-		PRBody:              "Driven by internal/control-plane/e2e/smoke_test.go",
+		Description:         "Driven by internal/control-plane/e2e/smoke_test.go",
 	})
+	// Task Intent Propagation design §3/§5: a task no longer arrives with a
+	// branch already pushed — the server generates one (task/<task_id>) and
+	// the generate-phase step ("implement") creates it fresh off main.
+	branch := "task/" + taskID
 	resp := pollUntilTerminal(t, e.controlPlaneURL, taskID)
 
 	// (5) task status is stop_success.
@@ -219,7 +224,7 @@ func TestSmoke_MainFlow(t *testing.T) {
 	if pr.State != "open" {
 		t.Fatalf("expected PR #%d to be open, got %q", resp.PRNumber, pr.State)
 	}
-	commits, _, err := raw.ListRepoCommits(e.owner, "sample-repo", giteasdk.ListCommitOptions{SHA: "feature-branch"})
+	commits, _, err := raw.ListRepoCommits(e.owner, "sample-repo", giteasdk.ListCommitOptions{SHA: branch})
 	if err != nil {
 		t.Fatalf("ListRepoCommits: %v", err)
 	}
@@ -240,7 +245,7 @@ func TestSmoke_MainFlow(t *testing.T) {
 		}
 	}
 	if !foundTrailer {
-		t.Fatalf("expected a commit on feature-branch with trailer \"Invocation-Id: %s\"", reviewInvocationID)
+		t.Fatalf("expected a commit on %s with trailer \"Invocation-Id: %s\"", branch, reviewInvocationID)
 	}
 
 	// (2) the PR has >=1 review comment from the agent-stage review executor.
@@ -308,12 +313,11 @@ func TestSmoke_RequireHumanApprovalViaBaselinePolicy(t *testing.T) {
 
 	taskID := postTask(t, e.controlPlaneURL, createTaskRequest{
 		TargetRepo:          e.owner + "/sample-repo",
-		Branch:              "feature-branch",
 		BaseBranch:          "main",
-		TaskType:            "pr-review-round",
 		RiskTier:            "high",
 		TriggeringPrincipal: "e2e-smoke-test-baseline",
 		BotAccount:          "requesting-account",
+		Description:         "Driven by internal/control-plane/e2e/smoke_test.go (baseline-policy scenario)",
 	})
 	resp := pollUntilStatus(t, e.controlPlaneURL, taskID,
 		domain.TaskStatusWaitingApproval, domain.TaskStatusStopSuccess, domain.TaskStatusStopEscalate)
@@ -345,10 +349,22 @@ func TestSmoke_RoundCapForcesStopEscalate(t *testing.T) {
 	}
 	t.Cleanup(func() { raw.DeleteRepo(e.owner, repoName) })
 
-	stagesYAML := `- id: post-blocking-finding-comment
+	// Task Intent Propagation design §5: every task now needs a
+	// generate-phase step — coreloop only opens the review PR once it
+	// completes — so this fixture's always-blocking review step needs an
+	// "implement" step ahead of it, the same shape cmd/seed's sample repo
+	// uses, or PR_NUMBER would never reach post-blocking-finding-comment's
+	// env.
+	stagesYAML := `- id: implement
+  type: agent-stage
+  phase: generate
+  bot_account: coding-agent
+  task_type: new-task
+  blocking: true
+- id: post-blocking-finding-comment
   type: agent-stage
   bot_account: review-bot
-  task_type: pr-review-round
+  task_type: new-task
   blocking: true
 `
 	if _, _, err := raw.CreateFile(e.owner, repo.Name, ".harness/stages.yaml", giteasdk.CreateFileOptions{
@@ -357,21 +373,20 @@ func TestSmoke_RoundCapForcesStopEscalate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed stages.yaml: %v", err)
 	}
-	if _, _, err := raw.CreateFile(e.owner, repo.Name, "feature.txt", giteasdk.CreateFileOptions{
-		FileOptions: giteasdk.FileOptions{Message: "add feature", BranchName: "main", NewBranchName: "feature-branch"},
-		Content:     base64Encode("feature"),
-	}); err != nil {
-		t.Fatalf("seed feature branch: %v", err)
+	// coding-agent needs write access to push the generate-phase step's
+	// branch/commit, the same grant cmd/seed's sample repo gives it.
+	writeAccess := giteasdk.AccessModeWrite
+	if _, err := raw.AddCollaborator(e.owner, repo.Name, "coding-agent", giteasdk.AddCollaboratorOption{Permission: &writeAccess}); err != nil {
+		t.Fatalf("add coding-agent as collaborator: %v", err)
 	}
 
 	taskID := postTask(t, e.controlPlaneURL, createTaskRequest{
 		TargetRepo:          e.owner + "/" + repo.Name,
-		Branch:              "feature-branch",
 		BaseBranch:          "main",
-		TaskType:            "pr-review-round",
 		RiskTier:            "low",
 		TriggeringPrincipal: "e2e-smoke-test-escalate",
 		BotAccount:          "requesting-account",
+		Description:         "Driven by internal/control-plane/e2e/smoke_test.go (round-cap scenario)",
 	})
 	resp := pollUntilTerminal(t, e.controlPlaneURL, taskID)
 
@@ -409,10 +424,19 @@ func TestSmoke_ApprovalWebhookFlow(t *testing.T) {
 	}
 	t.Cleanup(func() { raw.DeleteRepo(e.owner, repoName) })
 
-	stagesYAML := `- id: post-pr-comment
+	// Task Intent Propagation design §5: every task now needs a
+	// generate-phase step ahead of any review-phase step needing PR_NUMBER
+	// (post-pr-comment here) — coreloop only opens the PR once it completes.
+	stagesYAML := `- id: implement
+  type: agent-stage
+  phase: generate
+  bot_account: coding-agent
+  task_type: new-task
+  blocking: true
+- id: post-pr-comment
   type: agent-stage
   bot_account: review-bot
-  task_type: pr-review-round
+  task_type: new-task
   blocking: false
 `
 	if _, _, err := raw.CreateFile(e.owner, repo.Name, ".harness/stages.yaml", giteasdk.CreateFileOptions{
@@ -433,11 +457,13 @@ func TestSmoke_ApprovalWebhookFlow(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed APPROVERS: %v", err)
 	}
-	if _, _, err := raw.CreateFile(e.owner, repo.Name, "feature.txt", giteasdk.CreateFileOptions{
-		FileOptions: giteasdk.FileOptions{Message: "add feature", BranchName: "main", NewBranchName: "feature-branch"},
-		Content:     base64Encode("feature"),
-	}); err != nil {
-		t.Fatalf("seed feature branch: %v", err)
+	// coding-agent needs write access to push the generate-phase step's
+	// branch/commit, the same grant cmd/seed's sample repo gives it. No
+	// feature branch is pre-seeded anymore — the generate-phase step
+	// creates the task's branch itself, fresh off main.
+	writeAccess := giteasdk.AccessModeWrite
+	if _, err := raw.AddCollaborator(e.owner, repo.Name, "coding-agent", giteasdk.AddCollaboratorOption{Permission: &writeAccess}); err != nil {
+		t.Fatalf("add coding-agent as collaborator: %v", err)
 	}
 
 	if _, _, err := raw.CreateRepoHook(e.owner, repo.Name, giteasdk.CreateHookOption{
@@ -456,12 +482,11 @@ func TestSmoke_ApprovalWebhookFlow(t *testing.T) {
 
 	taskID := postTask(t, e.controlPlaneURL, createTaskRequest{
 		TargetRepo:          e.owner + "/" + repoName,
-		Branch:              "feature-branch",
 		BaseBranch:          "main",
-		TaskType:            "pr-review-round",
 		RiskTier:            "low",
 		TriggeringPrincipal: "e2e-smoke-test-approval",
 		BotAccount:          "requesting-account",
+		Description:         "Driven by internal/control-plane/e2e/smoke_test.go (approval-webhook scenario)",
 	})
 
 	waiting := pollUntilStatus(t, e.controlPlaneURL, taskID, domain.TaskStatusWaitingApproval)

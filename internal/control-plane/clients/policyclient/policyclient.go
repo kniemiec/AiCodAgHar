@@ -12,7 +12,7 @@ type PolicyRequest struct {
 	OrchestratorInstanceID string
 	BotAccount             string
 	TargetRepo             string
-	TaskType               string // new-task | pr-review-round | review | security-triage
+	TaskType               string // new-task (only live value) | review | security-triage
 	RiskTier               string
 	RequestedScopes        []string
 	Facts                  map[string]any // round number, files touched, etc.

@@ -47,10 +47,13 @@ type Runner struct {
 	deps Dependencies
 }
 
-// NewRunner builds a Runner. deps.Coreloop.Recorder is overwritten with an
-// adapter over deps.Store — callers don't need to wire it themselves.
+// NewRunner builds a Runner. deps.Coreloop.Recorder and deps.Coreloop.
+// PRRecorder are overwritten with deps.Store (TaskStore satisfies both
+// narrow interfaces structurally) — callers don't need to wire them
+// themselves.
 func NewRunner(deps Dependencies) *Runner {
 	deps.Coreloop.Recorder = stepRunRecorder{store: deps.Store}
+	deps.Coreloop.PRRecorder = deps.Store
 	return &Runner{deps: deps}
 }
 
@@ -131,6 +134,13 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 			return
 		}
 		allRuns = append(allRuns, res.StepRuns...)
+		// Task Intent Propagation design §5: RunRound may have just opened
+		// the review PR (task.PRNumber was 0 going in) — carry the result
+		// forward into task so a subsequent round in this same loop doesn't
+		// see PRNumber==0 again and try to reopen it. RunRound itself only
+		// ever sees a copy of task, so this is the one place that mutation
+		// needs to be threaded back in.
+		task.PRNumber = res.PRNumber
 
 		switch res.Outcome {
 		case coreloop.OutcomeContinue:

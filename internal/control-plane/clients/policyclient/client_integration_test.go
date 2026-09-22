@@ -43,14 +43,14 @@ func TestClient_Evaluate(t *testing.T) {
 - id: review-round
   type: agent-stage
   bot_account: review-bot
-  task_type: pr-review-round
+  task_type: new-task
   blocking: true
   conditions:
     risk_tier: ["low", "medium"]
 - id: run-unit-tests
   type: deterministic-step
   bot_account: ci-bot
-  task_type: pr-review-round
+  task_type: new-task
   blocking: true
   command: "go test ./..."
   working_dir: "."
@@ -62,7 +62,7 @@ func TestClient_Evaluate(t *testing.T) {
 		decision, err := client.Evaluate(context.Background(), policyclient.PolicyRequest{
 			TaskID:     "task-1",
 			TargetRepo: owner + "/" + repo.Name,
-			TaskType:   "pr-review-round",
+			TaskType:   "new-task",
 			RiskTier:   "low",
 		})
 		if err != nil {
@@ -88,7 +88,7 @@ func TestClient_Evaluate(t *testing.T) {
 		decision, err := client.Evaluate(context.Background(), policyclient.PolicyRequest{
 			TaskID:     "task-2",
 			TargetRepo: owner + "/" + repo.Name,
-			TaskType:   "pr-review-round",
+			TaskType:   "new-task",
 			RiskTier:   "low",
 		})
 		if err != nil {

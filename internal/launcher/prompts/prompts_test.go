@@ -47,6 +47,66 @@ func TestRender_Implement_WithPriorFindings(t *testing.T) {
 	}
 }
 
+// TestRender_Implement_WithDescription exercises Task Intent Propagation
+// design §7: TASK_DESCRIPTION becomes a quoted, explicitly-untrusted section
+// of the implement prompt.
+func TestRender_Implement_WithDescription(t *testing.T) {
+	task, ok, err := Render("implement", map[string]string{
+		"TARGET_REPO":     "org/repo",
+		"BRANCH":          "add-feature",
+		"TASK_DESCRIPTION": "add a health check endpoint",
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if !strings.Contains(task, "add a health check endpoint") {
+		t.Errorf("task missing quoted description: %q", task)
+	}
+	if !strings.Contains(task, "untrusted content") {
+		t.Errorf("task should flag the description as untrusted: %q", task)
+	}
+}
+
+// TestRender_Implement_WithFindingsAndDescription exercises the same
+// {{if .Description}} guard on implementWithFindingsTmpl — the round-2+
+// variant also gets the description section, not just round 1's.
+func TestRender_Implement_WithFindingsAndDescription(t *testing.T) {
+	task, ok, err := Render("implement", map[string]string{
+		"TARGET_REPO":         "org/repo",
+		"BRANCH":              "add-feature",
+		"PRIOR_FINDINGS_JSON": `[{"severity":"blocking","message":"off-by-one"}]`,
+		"TASK_DESCRIPTION":    "add a health check endpoint",
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if !strings.Contains(task, "add a health check endpoint") {
+		t.Errorf("task missing quoted description: %q", task)
+	}
+}
+
+func TestRender_Implement_NoDescriptionOmitsSection(t *testing.T) {
+	task, ok, err := Render("implement", map[string]string{
+		"TARGET_REPO": "org/repo",
+		"BRANCH":      "add-feature",
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if strings.Contains(task, "original task description") {
+		t.Errorf("task should omit the description section entirely when there is none: %q", task)
+	}
+}
+
 func TestRender_ReviewWithCommit(t *testing.T) {
 	task, ok, err := Render("review-with-commit", map[string]string{
 		"TARGET_REPO": "org/repo",
@@ -60,6 +120,30 @@ func TestRender_ReviewWithCommit(t *testing.T) {
 	}
 	if !strings.Contains(task, "#7") || !strings.Contains(task, "org/repo") {
 		t.Errorf("task missing PR number/repo: %q", task)
+	}
+}
+
+// TestRender_ReviewWithCommit_WithDescription exercises design §3/§7: the
+// review-stage prompt now receives the task description too — the first
+// context ever injected into a review prompt — quoted as background intent,
+// not instructions.
+func TestRender_ReviewWithCommit_WithDescription(t *testing.T) {
+	task, ok, err := Render("review-with-commit", map[string]string{
+		"TARGET_REPO":      "org/repo",
+		"PR_NUMBER":        "7",
+		"TASK_DESCRIPTION": "add a health check endpoint",
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if !strings.Contains(task, "add a health check endpoint") {
+		t.Errorf("task missing quoted description: %q", task)
+	}
+	if !strings.Contains(task, "background information about intent") {
+		t.Errorf("task should flag the description as background, not instructions: %q", task)
 	}
 }
 

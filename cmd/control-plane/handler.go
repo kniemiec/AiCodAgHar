@@ -13,17 +13,23 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 )
 
+// createTaskRequest's branch is now optional (Task Intent Propagation
+// design §5): a task no longer arrives with a branch/PR already open, so
+// when omitted the server generates one the same way the issue-opened
+// webhook trigger does. task_type is accepted but ignored — the server
+// always sets domain.Task.Type to "new-task", the only live value now that
+// pr-review-round is retired. pr_title/pr_body are gone too: PR creation no
+// longer happens here at all (§5), so there's nothing left for them to
+// configure.
 type createTaskRequest struct {
 	TaskID              string `json:"task_id"`
 	TargetRepo          string `json:"target_repo"`
 	Branch              string `json:"branch"`
 	BaseBranch          string `json:"base_branch"`
-	TaskType            string `json:"task_type"`
 	RiskTier            string `json:"risk_tier"`
 	TriggeringPrincipal string `json:"triggering_principal"`
 	BotAccount          string `json:"bot_account"`
-	PRTitle             string `json:"pr_title"`
-	PRBody              string `json:"pr_body"`
+	Description         string `json:"description"`
 }
 
 type stepRunWire struct {
@@ -90,12 +96,19 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.TargetRepo == "" || req.Branch == "" || req.TaskType == "" {
-		http.Error(w, "target_repo, branch, and task_type are required", http.StatusBadRequest)
+	if req.TargetRepo == "" {
+		http.Error(w, "target_repo is required", http.StatusBadRequest)
+		return
+	}
+	if _, _, ok := strings.Cut(req.TargetRepo, "/"); !ok {
+		http.Error(w, "target_repo must be \"owner/name\"", http.StatusBadRequest)
 		return
 	}
 	if req.TaskID == "" {
 		req.TaskID = fmt.Sprintf("task-%d", time.Now().UnixNano())
+	}
+	if req.Branch == "" {
+		req.Branch = fmt.Sprintf("task/%s", req.TaskID)
 	}
 	if req.BaseBranch == "" {
 		req.BaseBranch = "main"
@@ -103,40 +116,26 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if req.RiskTier == "" {
 		req.RiskTier = "low"
 	}
-	if req.PRTitle == "" {
-		req.PRTitle = fmt.Sprintf("[%s] %s", req.TaskType, req.Branch)
-	}
-
-	owner, name, ok := strings.Cut(req.TargetRepo, "/")
-	if !ok {
-		http.Error(w, "target_repo must be \"owner/name\"", http.StatusBadRequest)
-		return
-	}
-	repo := gitclient.RepoRef{Owner: owner, Name: name}
-
-	ctx := r.Context()
-	pr, err := s.git.CreateOrUpdatePR(ctx, repo, req.Branch, req.BaseBranch, req.PRTitle, req.PRBody)
-	if err != nil {
-		http.Error(w, "open review PR: "+err.Error(), http.StatusBadGateway)
-		return
-	}
 
 	task := domain.Task{
 		ID:                  req.TaskID,
-		Type:                req.TaskType,
+		Type:                "new-task",
 		TargetRepo:          req.TargetRepo,
 		TriggeringPrincipal: req.TriggeringPrincipal,
 		BotAccount:          req.BotAccount,
 		RiskTier:            req.RiskTier,
 		Branch:              req.Branch,
 		BaseBranch:          req.BaseBranch,
-		PRNumber:            pr.Number,
+		Description:         req.Description,
 	}
 
 	// design docs/designs/completed/full-pipeline-async-approval-design.md §4.3:
 	// Start kicks off round 1 in the background and returns immediately —
 	// the handler replies 202 without waiting for a terminal outcome.
-	// GET /tasks/{id} is how a caller finds out what happened next.
+	// GET /tasks/{id} is how a caller finds out what happened next. PR
+	// creation no longer happens here (Task Intent Propagation design
+	// §5) — coreloop opens it itself once the generate phase completes.
+	ctx := r.Context()
 	if _, _, err := s.runner.Start(ctx, task); err != nil {
 		http.Error(w, "start task: "+err.Error(), http.StatusInternalServerError)
 		return

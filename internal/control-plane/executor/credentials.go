@@ -43,11 +43,17 @@ func launchEnv(forgejoURL string, sc StepContext, cred secretsclient.Credential)
 	if sc.Task.Branch != "" {
 		env["BRANCH"] = sc.Task.Branch
 	}
+	if sc.Task.BaseBranch != "" {
+		env["BASE_BRANCH"] = sc.Task.BaseBranch
+	}
 	if sc.Task.PRNumber != 0 {
 		env["PR_NUMBER"] = strconv.Itoa(sc.Task.PRNumber)
 	}
 	if len(sc.PriorFindings) > 0 {
 		env["PRIOR_FINDINGS_JSON"] = string(sc.PriorFindings)
+	}
+	if sc.Task.Description != "" {
+		env["TASK_DESCRIPTION"] = sc.Task.Description
 	}
 	return env
 }

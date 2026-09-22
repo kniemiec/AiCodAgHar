@@ -25,8 +25,11 @@ func newTestServer(t *testing.T) *server {
 	policy := &fakes.FakePolicyClient{
 		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
 			return policyclient.PolicyDecision{
-				Decision:      "allow",
-				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "review", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseReview, Blocking: false}},
+				Decision: "allow",
+				ResolvedSteps: []policyclient.ResolvedStep{
+					{StepID: "implement", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate, Blocking: false},
+					{StepID: "review", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseReview, Blocking: false},
+				},
 			}, nil
 		},
 	}
@@ -37,14 +40,16 @@ func newTestServer(t *testing.T) *server {
 		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter},
 	)
 	store := &fakes.FakeTaskStore{}
+	git := &fakes.FakeGitHostClient{}
 	runner := taskrunner.NewRunner(taskrunner.Dependencies{
 		Coreloop: coreloop.Dependencies{
 			Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Audit: auditWriter, Executors: registry,
+			PRCreator: git,
 		},
 		Store:    store,
 		Launcher: launcher,
 	})
-	return &server{git: &fakes.FakeGitHostClient{}, runner: runner}
+	return &server{git: git, runner: runner}
 }
 
 // pollUntilTerminal polls GET /tasks/{id} until status leaves "running", or
@@ -78,7 +83,7 @@ func TestHandleCreateTask_Returns202Immediately(t *testing.T) {
 	mux := newServeMux(s)
 
 	body, _ := json.Marshal(createTaskRequest{
-		TargetRepo: "acme/widgets", Branch: "feature", BaseBranch: "main", TaskType: "pr-review-round",
+		TargetRepo: "acme/widgets", Branch: "feature", BaseBranch: "main", Description: "implement the widget feature",
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/tasks", bytes.NewReader(body))
@@ -109,6 +114,36 @@ func TestHandleCreateTask_Returns202Immediately(t *testing.T) {
 	}
 	if len(status.StepRuns) == 0 {
 		t.Fatal("expected at least one step_run once the task is queryable")
+	}
+}
+
+// TestHandleCreateTask_BranchOptional exercises Task Intent Propagation
+// design §5: a task no longer arrives with a branch already pushed, so
+// omitting branch entirely must still succeed, with the server generating
+// one and opening the review PR against it once the generate phase runs.
+func TestHandleCreateTask_BranchOptional(t *testing.T) {
+	s := newTestServer(t)
+	mux := newServeMux(s)
+
+	body, _ := json.Marshal(createTaskRequest{TargetRepo: "acme/widgets", Description: "implement the widget feature"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tasks", bytes.NewReader(body))
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp createTaskResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	status := pollUntilTerminal(t, mux, resp.TaskID)
+	if status.Status != domain.TaskStatusStopSuccess {
+		t.Fatalf("expected the task to reach stop_success, got %q (reason: %s)", status.Status, status.Reason)
+	}
+	if status.PRNumber == 0 {
+		t.Fatal("expected a non-zero pr_number once the generate phase completes")
 	}
 }
 

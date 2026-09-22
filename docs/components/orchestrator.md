@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Living document — describes the current implementation; update it in the same change that makes it stale (see [`docs/components/README.md`](README.md)) |
 | **Component** | `cmd/control-plane` and the `internal/control-plane/*` packages it's built from |
-| **Design docs** | [`orchestrator-design.md`](../designs/completed/orchestrator-design.md) (original MVP), [`full-pipeline-async-approval-design.md`](../designs/completed/full-pipeline-async-approval-design.md) (follow-up — implementation sequence §8: all four steps landed) |
+| **Design docs** | [`orchestrator-design.md`](../designs/completed/orchestrator-design.md) (original MVP), [`full-pipeline-async-approval-design.md`](../designs/completed/full-pipeline-async-approval-design.md) (follow-up — implementation sequence §8: all four steps landed), [`task-intent-propagation-design.md`](../designs/completed/task-intent-propagation-design.md) (retires `pr-review-round`, adds the issue-opened task-creation trigger and `Description` propagation) |
 | **Related ADRs** | [ADR-7](../architecture/week1-adr-7-multi-agent-review-workflow.md) (core loop), [ADR-9](../architecture/week2-adr-9-orchestrator-foundations.md) (foundations/test-seam interfaces), [ADR-11](../architecture/week3-adr-11-orchestrator-execution-engine.md) (execution engine) |
 | **Running it locally** | [`docs/local-development.md`](../local-development.md) — this document covers the orchestrator itself, not the local dev/test stack |
 
@@ -77,19 +77,17 @@ Request body:
 ```json
 {
   "target_repo": "owner/repo",
-  "branch": "feature-branch",
+  "branch": "optional — defaults to task/<task_id>",
   "base_branch": "main",
-  "task_type": "pr-review-round",
   "risk_tier": "low",
   "triggering_principal": "manual-test",
   "bot_account": "requesting-account",
-  "pr_title": "optional",
-  "pr_body": "optional",
+  "description": "optional — the task's human-authored intent, propagated as untrusted context into the implement/review prompts (task-intent-propagation design §6-7)",
   "task_id": "optional — generated if omitted"
 }
 ```
 
-`target_repo`, `branch`, and `task_type` are required. The handler opens/reuses the review PR (`CreateOrUpdatePR`) synchronously, then calls `taskrunner.Runner.Start` — which persists the task row and kicks off round 1 in a goroutine — and replies without waiting for any round to finish.
+Only `target_repo` (`owner/name`) is required. `task_type` is no longer accepted — every task is `new-task`, the sole live type since `pr-review-round`'s retirement (task-intent-propagation design §4). `branch` defaults to `task/<task_id>` when omitted, `base_branch` to `main`, `risk_tier` to `low`. The handler **no longer opens a PR itself** (§5 of that design): it calls `taskrunner.Runner.Start` directly, which persists the task row and kicks off round 1 in a goroutine; `coreloop` opens (or reuses) the review PR once the generate phase's step completes without a blocking failure, and persists the resulting PR number back onto the task.
 
 Response (`202`):
 
@@ -97,7 +95,7 @@ Response (`202`):
 { "task_id": "task-...", "status": "running" }
 ```
 
-Errors: `400` (bad request body), `502` (couldn't open the PR), `500` (`Start` failed to persist the task row).
+Errors: `400` (bad request body, or `target_repo` missing/not `owner/name`), `500` (`Start` failed to persist the task row).
 
 ```
 GET /tasks/{id}
@@ -130,14 +128,15 @@ Response (`200`):
 POST /webhooks/forgejo
 ```
 
-Design §4.4's approval receiver — Forgejo calls this on a repo's labeling events. Never trusts the delivery's own claims:
+One endpoint, two independent triggers on Forgejo's `issues` webhook event category — dispatched by `action` right after signature verification. Never trusts the delivery's own claims:
 
 1. Verify `X-Forgejo-Signature` (raw hex HMAC-SHA256 over the raw body — confirmed empirically against a real Forgejo instance, not just the design prose) against that repo's secret (`SecretsClient.GetWebhookSecret`). Bad/unprovisioned secret → `403`.
-2. `action != "label_updated"` → `200`, no-op (Forgejo's `issues` webhook event category covers several sub-events; only label changes matter here).
-3. Look up `orchestrator.tasks WHERE target_repo = ? AND approval_issue_number = ? AND status = 'waiting_approval'` (`Runner.FindWaitingApprovalTask`). No match → `200`, no-op.
-4. Independently re-read the issue's current labels (`GitHostClient.ListIssueLabels`) — the payload's own labels are never trusted. Neither `approved` nor `rejected` present → `200`, no-op.
-5. Confirm the labeling user (`sender.login`) is listed in `.harness/APPROVERS` at the task's base branch (`GetFileContents` + `config.ParseApprovers`), **and** independently holds live `RoleWrite` (`VerifyCollaboratorRole`) — both required. Either fails → `200`, logged only; the task stays `waiting_approval` (fail-closed, not escalated — a misconfiguration must never manufacture a false approval or a false escalation).
-6. All pass: `rejected` → `Runner.RecordRejection` (terminal `stop_escalate`, no resume). `approved` → `Runner.RecordApproval`, then `Runner.Resume` in a new goroutine so the response returns fast.
+2. `action == "opened"` → task creation (task-intent-propagation design §3), handled separately from the approval flow below: `taskID := "issue-<owner>-<name>-<issue#>"` (deterministic, so a redelivery is a no-op — checked via `Runner.GetTaskStatus` first), the issue's sender must independently hold live `RoleWrite` (`VerifyCollaboratorRole` — the same check §5 below uses, but this is the *only* gate here, since creating a task isn't itself irreversible), and on success a `domain.Task` is built with `Description` set to the issue body and started via `Runner.Start`. Any check failing → `200`, no task created, fail-closed and silent either way.
+3. Any other `action` (including `"label_updated"`'s own arrival here before step 4 below) falls through to the approval-decision flow; anything not `"opened"` or `"label_updated"` → `200`, no-op.
+4. Look up `orchestrator.tasks WHERE target_repo = ? AND approval_issue_number = ? AND status = 'waiting_approval'` (`Runner.FindWaitingApprovalTask`). No match → `200`, no-op.
+5. Independently re-read the issue's current labels (`GitHostClient.ListIssueLabels`) — the payload's own labels are never trusted. Neither `approved` nor `rejected` present → `200`, no-op.
+6. Confirm the labeling user (`sender.login`) is listed in `.harness/APPROVERS` at the task's base branch (`GetFileContents` + `config.ParseApprovers`), **and** independently holds live `RoleWrite` (`VerifyCollaboratorRole`) — both required. Either fails → `200`, logged only; the task stays `waiting_approval` (fail-closed, not escalated — a misconfiguration must never manufacture a false approval or a false escalation).
+7. All pass: `rejected` → `Runner.RecordRejection` (terminal `stop_escalate`, no resume). `approved` → `Runner.RecordApproval`, then `Runner.Resume` in a new goroutine so the response returns fast.
 
 No request body/response schema beyond what Forgejo itself sends — this isn't a contract the orchestrator publishes, only one it consumes.
 

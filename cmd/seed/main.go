@@ -54,7 +54,7 @@ func main() {
 
 	fmt.Printf("\nSeed complete.\n")
 	fmt.Printf("  global-baseline repo: %s/%s\n", owner, GlobalBaselineRepoName)
-	fmt.Printf("  sample target repo:   %s/%s (branch %q ready for a task)\n", owner, targetRepo.Name, sampleFeatureBranch)
+	fmt.Printf("  sample target repo:   %s/%s (ready for a task — no branch pre-seeded)\n", owner, targetRepo.Name)
 	fmt.Printf("\nRestart secrets-mock (and control-plane's env if GLOBAL_BASELINE_REPO changed) to pick up the new bot tokens:\n")
 	fmt.Printf("  docker compose -f deploy/docker-compose.yml up -d secrets-mock\n")
 }

@@ -78,11 +78,18 @@ type Dependencies struct {
 	// resolves an approve-phase step.
 	IssueOpener IssueOpener
 
-	// PRCreator opens (or reuses) a task's review PR (Task Intent
-	// Propagation design §5), once its generate-phase step completes with
-	// no blocking failure — a task no longer arrives with a PR already
-	// open. Any GitHostClient implementation satisfies this structurally.
-	// Nil is only valid for a task whose config never resolves a
+	// PRCreator creates (or reuses) the task's branch and opens (or
+	// reuses) its review PR (Task Intent Propagation design §5, and
+	// orchestrator-owned-branch-creation design), once its generate-phase
+	// step completes with no blocking failure — a task no longer arrives
+	// with a branch or PR already open. The branch step keeps this a
+	// control-plane-owned git-structural side effect rather than one the
+	// sandboxed generate step's agent would otherwise need Forgejo
+	// credentials for; it also covers a generate phase that completed
+	// without pushing any commits, which would otherwise make
+	// CreateOrUpdatePR fail against a branch that never came to exist.
+	// Any GitHostClient implementation satisfies this structurally. Nil
+	// is only valid for a task whose config never resolves a
 	// generate-phase step, or one whose PRNumber is already set.
 	PRCreator PRCreator
 
@@ -104,6 +111,7 @@ type IssueOpener interface {
 
 // PRCreator is Dependencies.PRCreator's interface.
 type PRCreator interface {
+	CreateOrReuseBranch(ctx context.Context, repo gitclient.RepoRef, branch, base string) (gitclient.Branch, error)
 	CreateOrUpdatePR(ctx context.Context, repo gitclient.RepoRef, branch, base, title, body string) (gitclient.PullRequest, error)
 }
 
@@ -209,11 +217,18 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		runs = append(runs, phaseRuns...)
 
 		// Task Intent Propagation design §5: a task no longer arrives with
-		// a PR already open, so once the generate phase's own step
-		// completes without a blocking failure, open (or reuse) the review
-		// PR here — before the review phase dispatches, since
-		// reviewWithCommitTmpl needs task.PRNumber.
+		// a branch or PR already open, so once the generate phase's own
+		// step completes without a blocking failure, create (or reuse)
+		// the branch and open (or reuse) the review PR here — before the
+		// review phase dispatches, since reviewWithCommitTmpl needs
+		// task.PRNumber. CreateOrReuseBranch runs first (orchestrator-owned-branch-creation
+		// design) so a generate phase that completed without pushing any
+		// commits still leaves a real branch for CreateOrUpdatePR to
+		// target, instead of failing against one that never came to exist.
 		if phase == policyclient.PhaseGenerate && task.PRNumber == 0 && !aggregate(phaseRuns) {
+			if _, err := deps.PRCreator.CreateOrReuseBranch(ctx, approvalRepoRef(task), task.Branch, task.BaseBranch); err != nil {
+				return RoundResult{}, fmt.Errorf("round %d: create task branch: %w", round, err)
+			}
 			pr, err := deps.PRCreator.CreateOrUpdatePR(ctx, approvalRepoRef(task), task.Branch, task.BaseBranch, prTitle(task), task.Description)
 			if err != nil {
 				return RoundResult{}, fmt.Errorf("round %d: open review PR: %w", round, err)

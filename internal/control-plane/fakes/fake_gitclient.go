@@ -13,7 +13,8 @@ import (
 type FakeGitHostClient struct {
 	mu sync.Mutex
 
-	files             map[string][]byte // "owner/name@ref/path"
+	files             map[string][]byte           // "owner/name@ref/path"
+	branches          map[string]gitclient.Branch // "owner/name/branch-name"
 	prs               map[string]gitclient.PullRequest
 	nextPRNumber      map[string]int // "owner/name"
 	comments          map[string][]gitclient.Comment
@@ -47,6 +48,34 @@ func (f *FakeGitHostClient) GetFileContents(ctx context.Context, repo gitclient.
 		return nil, fmt.Errorf("fake git host: no file %s@%s/%s", repoKey(repo), ref, path)
 	}
 	return content, nil
+}
+
+// SetBranch preloads a branch so CreateOrReuseBranch reuses it instead of
+// creating one.
+func (f *FakeGitHostClient) SetBranch(repo gitclient.RepoRef, branch gitclient.Branch) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.branches == nil {
+		f.branches = map[string]gitclient.Branch{}
+	}
+	f.branches[repoKey(repo)+"/"+branch.Name] = branch
+}
+
+// CreateOrReuseBranch mirrors Client's real reuse-if-present-else-create
+// semantics.
+func (f *FakeGitHostClient) CreateOrReuseBranch(ctx context.Context, repo gitclient.RepoRef, branch, base string) (gitclient.Branch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := repoKey(repo) + "/" + branch
+	if existing, ok := f.branches[key]; ok {
+		return existing, nil
+	}
+	if f.branches == nil {
+		f.branches = map[string]gitclient.Branch{}
+	}
+	b := gitclient.Branch{Name: branch, SHA: "fake-sha-" + branch}
+	f.branches[key] = b
+	return b, nil
 }
 
 func (f *FakeGitHostClient) CreateOrUpdatePR(ctx context.Context, repo gitclient.RepoRef, branch, base, title, body string) (gitclient.PullRequest, error) {

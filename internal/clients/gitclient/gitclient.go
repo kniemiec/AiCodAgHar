@@ -37,6 +37,12 @@ type Comment struct {
 	Body string
 }
 
+// Branch is the subset of a Forgejo branch the orchestrator needs.
+type Branch struct {
+	Name string
+	SHA  string
+}
+
 // BranchProtection is the subset of a Forgejo branch protection rule the
 // orchestrator needs to reason about merge gating.
 type BranchProtection struct {
@@ -74,6 +80,13 @@ type Issue struct {
 // there is no gitclient-mock.
 type GitHostClient interface {
 	GetFileContents(ctx context.Context, repo RepoRef, path, ref string) ([]byte, error)
+
+	// CreateOrReuseBranch creates a branch off base if it doesn't already
+	// exist, or returns the existing branch as-is — idempotent against a
+	// crash between creating the branch and starting the task, which would
+	// otherwise error on retry instead of proceeding.
+	CreateOrReuseBranch(ctx context.Context, repo RepoRef, branch, base string) (Branch, error)
+
 	CreateOrUpdatePR(ctx context.Context, repo RepoRef, branch, base, title, body string) (PullRequest, error)
 	GetPR(ctx context.Context, repo RepoRef, number int) (PullRequest, error)
 	PostPRComment(ctx context.Context, repo RepoRef, number int, body string) (Comment, error)

@@ -11,6 +11,23 @@ import (
 	"time"
 )
 
+// shortTempDir is t.TempDir(), but rooted at /tmp instead of $TMPDIR: on
+// macOS, $TMPDIR nests under /var/folders/.../TestName<random>/001/, which
+// combined with "<name>_53" comfortably exceeds AF_UNIX's 104-byte
+// sockaddr_un.sun_path limit and fails bind(2) with EINVAL for any
+// longer-named test. /tmp itself is always short, so hardcoding it here
+// (test-only; production paths come from the jailer's own short chroot
+// dir) keeps every socket path well under the limit on every platform.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "vsock")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 // dialGuest is called from a background goroutine, so it must not call any
 // testing.T method that can invoke FailNow (Fatal/Fatalf) — those are only
 // safe from the goroutine running the test itself. Logf is safe.
@@ -30,7 +47,7 @@ func dialGuest(t *testing.T, path string) net.Conn {
 }
 
 func TestListen_Path(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	udsPath := filepath.Join(dir, "vsock.sock")
 
 	l, err := Listen(udsPath, 53, os.Getuid(), os.Getgid())
@@ -45,7 +62,7 @@ func TestListen_Path(t *testing.T) {
 }
 
 func TestWaitForResult_Success(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	udsPath := filepath.Join(dir, "vsock.sock")
 
 	l, err := Listen(udsPath, 53, os.Getuid(), os.Getgid())
@@ -85,7 +102,7 @@ func TestWaitForResult_Success(t *testing.T) {
 }
 
 func TestWaitForResult_CommandResult(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	udsPath := filepath.Join(dir, "vsock.sock")
 
 	l, err := Listen(udsPath, 53, os.Getuid(), os.Getgid())
@@ -124,7 +141,7 @@ func TestWaitForResult_CommandResult(t *testing.T) {
 }
 
 func TestWaitForResult_GuestReportedError(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	udsPath := filepath.Join(dir, "vsock.sock")
 
 	l, err := Listen(udsPath, 53, os.Getuid(), os.Getgid())
@@ -152,7 +169,7 @@ func TestWaitForResult_GuestReportedError(t *testing.T) {
 }
 
 func TestWaitForResult_ClosedWithoutResult(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	udsPath := filepath.Join(dir, "vsock.sock")
 
 	l, err := Listen(udsPath, 53, os.Getuid(), os.Getgid())
@@ -183,7 +200,7 @@ func TestWaitForResult_ClosedWithoutResult(t *testing.T) {
 }
 
 func TestWaitForResult_ContextCanceledBeforeConnect(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	udsPath := filepath.Join(dir, "vsock.sock")
 
 	l, err := Listen(udsPath, 53, os.Getuid(), os.Getgid())

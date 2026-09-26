@@ -5,15 +5,32 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/fcapi"
 )
 
+// shortTempDir is t.TempDir(), but rooted at /tmp instead of $TMPDIR: on
+// macOS, $TMPDIR nests under /var/folders/.../TestName<random>/001/, which
+// comfortably exceeds AF_UNIX's 104-byte sockaddr_un.sun_path limit and
+// fails bind(2) with EINVAL for any longer-named test. /tmp itself is
+// always short, so hardcoding it here (test-only) keeps every socket path
+// well under the limit on every platform.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "mmds")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 func newFakeServer(t *testing.T, handler http.Handler) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	socketPath := filepath.Join(dir, "fc.sock")
 	lis, err := net.Listen("unix", socketPath)
 	if err != nil {

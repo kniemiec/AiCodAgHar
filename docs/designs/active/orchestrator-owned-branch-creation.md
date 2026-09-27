@@ -130,3 +130,7 @@ Rebased this plan's commit onto `main` (`git merge-tree` confirmed the `gitclien
 - `RunRound` now calls `deps.PRCreator.CreateOrReuseBranch` immediately before `deps.PRCreator.CreateOrUpdatePR`, inside the same `phase == PhaseGenerate && task.PRNumber == 0 && !aggregate(phaseRuns)` guard — this is what actually closes this plan's original gap under the new design: without it, a generate phase that completes without pushing any commits would still make `CreateOrUpdatePR` fail against a branch that never came to exist, exactly the failure mode this plan set out to prevent, just moved to a new call site.
 - Added `TestRunRound_CreatesBranchBeforeOpeningPR` (`coreloop_test.go`) verifying the branch exists (via a reuse-check against the fake) once `RunRound` returns a non-zero `PRNumber`.
 - Full suite (`go test ./...`) and the real-Forgejo integration test both re-verified green after the relocation.
+
+### 2026-09-27 — Call site corrected: branch now created *before* generate
+
+The 2026-09-26 relocation above put `CreateOrReuseBranch` in the post-generate block, so the branch still didn't exist while the generate step ran. The agent cloned the default branch and pushed its commits to `main`, and the post-generate call then created an empty branch, which led to a zero-diff PR. `TestRunRound_CreatesBranchBeforeOpeningPR` only checked that the branch existed once `RunRound` returned, so it missed this. [`pre-generate-branch-creation.md`](pre-generate-branch-creation.md) moves the call ahead of the phase loop and replaces that test with ordering-aware ones.

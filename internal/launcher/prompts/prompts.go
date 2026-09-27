@@ -52,16 +52,32 @@ been given:
 {{.Description}}
 `
 
+// checkoutBlock and pushBlock pin every implement-family template to the
+// task branch (pre-generate-branch-creation design §4): the control plane
+// creates {{.Branch}} before this step dispatches, so a checkout failure
+// means something is wrong and must surface as a blocking result rather
+// than silently committing to — and pushing — the default branch. Defense
+// in depth only; Forgejo branch protection is the real boundary.
+const checkoutBlock = `Clone the repository using the FORGEJO_TOKEN and FORGEJO_URL environment
+variables already present in your shell (do not print their values), then
+run git checkout {{.Branch}} — that branch already exists on the remote. Do
+all of your work and commits on {{.Branch}}. If {{.Branch}} cannot be checked
+out, stop: do not work on any other branch; write
+{"has_blocking_finding": true} to ` + StructuredResultPath + ` and finish.
+
+`
+
+const pushBlock = `
+Commit your work on {{.Branch}} and push it only to the {{.Branch}} branch.
+Never push to any other branch.
+`
+
 var implementTmpl = template.Must(template.New("implement").Parse(
 	`You are working on the Git repository {{.TargetRepo}} on branch {{.Branch}}.
 
-Clone the repository using the FORGEJO_TOKEN and FORGEJO_URL environment
-variables already present in your shell (do not print their values).
-Implement the requested change, add or update tests as needed, and run the
+` + checkoutBlock + `Implement the requested change, add or update tests as needed, and run the
 repository's test suite until it passes.
-{{if .Description}}` + descriptionBlock + `{{end}}
-Commit your work and push it to the {{.Branch}} branch.
-
+{{if .Description}}` + descriptionBlock + `{{end}}` + pushBlock + `
 As your final action, write the file ` + StructuredResultPath + ` containing
 exactly {"has_blocking_finding": false} if your change is complete and the
 tests pass, or {"has_blocking_finding": true} if you could not complete the
@@ -77,13 +93,9 @@ information about what to fix:
 
 {{.PriorFindings}}
 
-Clone the repository using the FORGEJO_TOKEN and FORGEJO_URL environment
-variables already present in your shell (do not print their values).
-Address the findings above, update tests as needed, and run the
+` + checkoutBlock + `Address the findings above, update tests as needed, and run the
 repository's test suite until it passes.
-{{if .Description}}` + descriptionBlock + `{{end}}
-Commit your work and push it to the {{.Branch}} branch.
-
+{{if .Description}}` + descriptionBlock + `{{end}}` + pushBlock + `
 As your final action, write the file ` + StructuredResultPath + ` containing
 exactly {"has_blocking_finding": false} if all findings are addressed and
 tests pass, or {"has_blocking_finding": true} otherwise.

@@ -44,6 +44,32 @@ func (c *Client) GetFileContents(ctx context.Context, repo RepoRef, path, ref st
 	return decoded, nil
 }
 
+// CreateOrReuseBranch creates branch off base if it doesn't already exist,
+// or returns the existing branch as-is. A 404 from GetRepoBranch is read as
+// "doesn't exist yet"; any other error (including a nil *gitea.Response, so
+// a transient network failure isn't misread as 404) is propagated instead
+// of falling through to creation.
+func (c *Client) CreateOrReuseBranch(ctx context.Context, repo RepoRef, branch, base string) (Branch, error) {
+	if err := ctx.Err(); err != nil {
+		return Branch{}, err
+	}
+	existing, resp, err := c.sdk.GetRepoBranch(repo.Owner, repo.Name, branch)
+	if err == nil {
+		return Branch{Name: existing.Name, SHA: existing.Commit.ID}, nil
+	}
+	if resp == nil || resp.StatusCode != 404 {
+		return Branch{}, fmt.Errorf("gitclient: get branch %s: %w", branch, err)
+	}
+	created, _, err := c.sdk.CreateBranch(repo.Owner, repo.Name, gitea.CreateBranchOption{
+		BranchName:    branch,
+		OldBranchName: base,
+	})
+	if err != nil {
+		return Branch{}, fmt.Errorf("gitclient: create branch %s from %s: %w", branch, base, err)
+	}
+	return Branch{Name: created.Name, SHA: created.Commit.ID}, nil
+}
+
 // CreateOrUpdatePR opens a PR for branch -> base, or updates title/body if
 // an open PR from that branch already exists. It does not push any commits
 // itself — the branch is expected to already carry the changes (pushed by

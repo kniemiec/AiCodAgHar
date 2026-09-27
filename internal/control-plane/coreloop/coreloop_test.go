@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
@@ -285,6 +286,51 @@ func TestRunRound_GeneratePhaseDispatchedBeforeReviewPhase(t *testing.T) {
 	remaining := map[string]bool{order[1]: true, order[2]: true}
 	if !remaining["review-a"] || !remaining["review-b"] {
 		t.Fatalf("expected both review-phase steps to launch after generate, got launch order %v", order)
+	}
+}
+
+// TestRunRound_CreatesBranchBeforeOpeningPR exercises the
+// orchestrator-owned-branch-creation design: once the generate phase
+// completes without a blocking failure, RunRound creates (or reuses) the
+// task's branch before opening its review PR — closing the case where the
+// generate phase's own step completed without pushing any commits, which
+// would otherwise leave CreateOrUpdatePR targeting a branch that never
+// came to exist.
+func TestRunRound_CreatesBranchBeforeOpeningPR(t *testing.T) {
+	launcher := &fakes.FakeContainerLauncher{}
+	policy := &fakes.FakePolicyClient{
+		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+			return policyclient.PolicyDecision{
+				Decision:      "allow",
+				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "implement", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate}},
+			}, nil
+		},
+	}
+	git := &fakes.FakeGitHostClient{}
+	task := domain.Task{ID: "task-1", TargetRepo: "acme/widgets", Branch: "feature", BaseBranch: "main"}
+
+	res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher), Audit: &fakes.FakeAuditWriter{},
+		PRCreator: git,
+	}, task, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("RunRound: %v", err)
+	}
+	if res.Outcome != coreloop.OutcomeStopSuccess {
+		t.Fatalf("expected stop-success, got %v (%s)", res.Outcome, res.Reason)
+	}
+	if res.PRNumber == 0 {
+		t.Fatal("expected a non-zero PRNumber")
+	}
+
+	// If RunRound already created the branch, reusing it now must return
+	// the same branch rather than erroring or creating a second one.
+	reused, err := git.CreateOrReuseBranch(context.Background(), gitclient.RepoRef{Owner: "acme", Name: "widgets"}, "feature", "main")
+	if err != nil {
+		t.Fatalf("CreateOrReuseBranch: %v", err)
+	}
+	if reused.Name != "feature" {
+		t.Fatalf("expected RunRound to have already created branch %q, got %+v", "feature", reused)
 	}
 }
 

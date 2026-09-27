@@ -80,6 +80,38 @@ func TestClient_GitHostClientSurface(t *testing.T) {
 		prNumber = pr.Number
 	})
 
+	t.Run("CreateOrReuseBranch creates a fresh branch and opening a zero-diff PR against it succeeds", func(t *testing.T) {
+		branch, err := client.CreateOrReuseBranch(ctx, repoRef, "zero-diff-branch", "main")
+		if err != nil {
+			t.Fatalf("CreateOrReuseBranch: %v", err)
+		}
+		if branch.Name != "zero-diff-branch" || branch.SHA == "" {
+			t.Fatalf("unexpected branch: %+v", branch)
+		}
+
+		pr, err := client.CreateOrUpdatePR(ctx, repoRef, "zero-diff-branch", "main", "Zero diff", "no commits yet")
+		if err != nil {
+			t.Fatalf("CreateOrUpdatePR against a zero-diff branch: %v — Forgejo may reject a head with no commits ahead of base; if so, CreateOrReuseBranch needs an empty-commit fallback (see design doc's Named Risks)", err)
+		}
+		if pr.Head != "zero-diff-branch" {
+			t.Fatalf("unexpected PR: %+v", pr)
+		}
+	})
+
+	t.Run("CreateOrReuseBranch is idempotent against an already-existing branch", func(t *testing.T) {
+		first, err := client.CreateOrReuseBranch(ctx, repoRef, "zero-diff-branch", "main")
+		if err != nil {
+			t.Fatalf("CreateOrReuseBranch (first): %v", err)
+		}
+		second, err := client.CreateOrReuseBranch(ctx, repoRef, "zero-diff-branch", "main")
+		if err != nil {
+			t.Fatalf("CreateOrReuseBranch (second): %v", err)
+		}
+		if first.SHA != second.SHA {
+			t.Fatalf("expected the same branch to be reused, got SHAs %q and %q", first.SHA, second.SHA)
+		}
+	})
+
 	t.Run("CreateOrUpdatePR updates the existing open PR instead of duplicating it", func(t *testing.T) {
 		pr, err := client.CreateOrUpdatePR(ctx, repoRef, "feature-branch", "main", "Add feature (updated)", "updated body")
 		if err != nil {

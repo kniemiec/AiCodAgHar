@@ -5,10 +5,12 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
+	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/egress"
 )
 
@@ -71,12 +73,19 @@ func TestLaunchKVM_BareBootTrivialPayload(t *testing.T) {
 // Needs everything TestLaunchKVM_BareBootTrivialPayload needs, plus:
 //
 //   - LAUNCHER_LLM_API_KEY / LAUNCHER_LLM_MODEL — real OpenHands credentials.
-//   - FORGEJO_TOKEN, TARGET_REPO ("owner/name"), BRANCH — a real,
-//     already-existing repo/branch the token can push to.
+//   - FORGEJO_TOKEN, TARGET_REPO ("owner/name") — a real, already-existing
+//     repo the token can push to.
+//   - BRANCH — the task branch. It need not exist yet: the test creates (or
+//     reuses) it off BASE_BRANCH before launching, exactly as coreloop.RunRound
+//     does before a generate step dispatches (pre-generate-branch-creation
+//     design). Must differ from BASE_BRANCH.
+//   - BASE_BRANCH — optional, defaults to "main".
 //   - FORGEJO_URL — the address the GUEST can reach, i.e. the tap gateway
 //     (design §10), not localhost: "http://172.16.0.1:3000" for the PoC's
 //     local Forgejo, never "http://localhost:3000" (that's only reachable
-//     from the host).
+//     from the host). The tap gateway is also the host's own interface
+//     (egress.Setup, via kvmTestConfig, brings it up), so the test's own
+//     branch-creation call uses the same URL.
 //   - guest_wrapper.py actually baked into the golden image
 //     (~/firecracker-poc/rootfs/bake-guest-wrapper.sh) — without it the
 //     guest boots but never touches MMDS/vsock, and this test times out
@@ -101,6 +110,35 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
+	forgejoURL := requireTestEnv(t, "FORGEJO_URL")
+	forgejoToken := requireTestEnv(t, "FORGEJO_TOKEN")
+	targetRepo := requireTestEnv(t, "TARGET_REPO")
+	branch := requireTestEnv(t, "BRANCH")
+	baseBranch := os.Getenv("BASE_BRANCH")
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	if branch == baseBranch {
+		t.Fatalf("BRANCH == BASE_BRANCH (%q): the agent would commit straight to the base branch — pick a dedicated task branch", branch)
+	}
+
+	// Provision the task branch the way coreloop.RunRound does before a
+	// generate step dispatches, so the agent checks out and pushes to it
+	// rather than falling back to the default branch.
+	owner, name, ok := strings.Cut(targetRepo, "/")
+	if !ok {
+		t.Fatalf("TARGET_REPO = %q, want \"owner/name\"", targetRepo)
+	}
+	git, err := gitclient.NewClient(forgejoURL, forgejoToken)
+	if err != nil {
+		t.Fatalf("gitclient.NewClient: %v", err)
+	}
+	b, err := git.CreateOrReuseBranch(ctx, gitclient.RepoRef{Owner: owner, Name: name}, branch, baseBranch)
+	if err != nil {
+		t.Fatalf("CreateOrReuseBranch(%s, %s <- %s): %v", targetRepo, branch, baseBranch, err)
+	}
+	t.Logf("task branch %s at %s (base %s)", b.Name, b.SHA, baseBranch)
+
 	// TASK_DESCRIPTION is hand-authored here rather than propagated from a
 	// real domain.Task (that path is internal/control-plane/executor's
 	// credentials.go, exercised by agent_stage_test.go, not this in-process
@@ -111,13 +149,13 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 		StepType:     stepTypeAgentStage,
 		PayloadRef:   "implement",
 		Env: map[string]string{
-			"FORGEJO_URL":      requireTestEnv(t, "FORGEJO_URL"),
-			"FORGEJO_TOKEN":    requireTestEnv(t, "FORGEJO_TOKEN"),
-			"TARGET_REPO":      requireTestEnv(t, "TARGET_REPO"),
-			"BRANCH":           requireTestEnv(t, "BRANCH"),
+			"FORGEJO_URL":      forgejoURL,
+			"FORGEJO_TOKEN":    forgejoToken,
+			"TARGET_REPO":      targetRepo,
+			"BRANCH":           branch,
 			"HTTP_PROXY":       proxyURL,
 			"HTTPS_PROXY":      proxyURL,
-			"TASK_DESCRIPTION": "Add two more operations to the calculator: power(a, b) (a raised to the power b) and root(a, n) (the n-th root of a). Follow the existing style of the other operations already in the repo, including error handling and tests.",
+			"TASK_DESCRIPTION": "remove log operation from calculator as it is not needed",
 		},
 	})
 	if err != nil {

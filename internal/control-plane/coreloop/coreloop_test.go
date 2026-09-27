@@ -289,29 +289,82 @@ func TestRunRound_GeneratePhaseDispatchedBeforeReviewPhase(t *testing.T) {
 	}
 }
 
-// TestRunRound_CreatesBranchBeforeOpeningPR exercises the
-// orchestrator-owned-branch-creation design: once the generate phase
-// completes without a blocking failure, RunRound creates (or reuses) the
-// task's branch before opening its review PR — closing the case where the
-// generate phase's own step completed without pushing any commits, which
-// would otherwise leave CreateOrUpdatePR targeting a branch that never
-// came to exist.
-func TestRunRound_CreatesBranchBeforeOpeningPR(t *testing.T) {
-	launcher := &fakes.FakeContainerLauncher{}
-	policy := &fakes.FakePolicyClient{
+// eventLog is a shared, ordered record of side effects across the git
+// host and the launcher, so a test can assert on their relative order —
+// not just that each happened by the time RunRound returns.
+type eventLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (l *eventLog) add(e string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, e)
+}
+
+func (l *eventLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.events...)
+}
+
+// orderingPRCreator wraps FakeGitHostClient, logging each PRCreator call
+// into log before delegating.
+type orderingPRCreator struct {
+	*fakes.FakeGitHostClient
+	log *eventLog
+}
+
+func (c orderingPRCreator) CreateOrReuseBranch(ctx context.Context, repo gitclient.RepoRef, branch, base string) (gitclient.Branch, error) {
+	c.log.add("branch")
+	return c.FakeGitHostClient.CreateOrReuseBranch(ctx, repo, branch, base)
+}
+
+func (c orderingPRCreator) CreateOrUpdatePR(ctx context.Context, repo gitclient.RepoRef, branch, base, title, body string) (gitclient.PullRequest, error) {
+	c.log.add("pr")
+	return c.FakeGitHostClient.CreateOrUpdatePR(ctx, repo, branch, base, title, body)
+}
+
+// orderingLauncher logs each Launch as "launch:<stepID>", and reports a
+// blocking finding from every step when blocking is set.
+func orderingLauncher(log *eventLog, blocking bool) *fakes.FakeContainerLauncher {
+	return &fakes.FakeContainerLauncher{
+		LaunchFunc: func(ctx context.Context, req launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+			log.add("launch:" + req.StepID)
+			return launcherclient.RunResult{InvocationID: req.InvocationID, ExitCode: 0}, nil
+		},
+		ExtractLogsFunc: func(ctx context.Context, invocationID string) (launcherclient.LogBundle, error) {
+			if blocking {
+				return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": true}`)}, nil
+			}
+			return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": false}`)}, nil
+		},
+	}
+}
+
+func generateOnlyPolicy(blocking bool) *fakes.FakePolicyClient {
+	return &fakes.FakePolicyClient{
 		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
 			return policyclient.PolicyDecision{
 				Decision:      "allow",
-				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "implement", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate}},
+				ResolvedSteps: []policyclient.ResolvedStep{{StepID: "implement", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate, Blocking: blocking}},
 			}, nil
 		},
 	}
-	git := &fakes.FakeGitHostClient{}
+}
+
+// TestRunRound_CreatesBranchBeforeGenerateDispatch exercises the
+// pre-generate-branch-creation design: the task's branch must exist before
+// the generate step dispatches (its agent clones and pushes to it), and the
+// review PR is still only opened after that step completes.
+func TestRunRound_CreatesBranchBeforeGenerateDispatch(t *testing.T) {
+	log := &eventLog{}
 	task := domain.Task{ID: "task-1", TargetRepo: "acme/widgets", Branch: "feature", BaseBranch: "main"}
 
 	res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
-		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(launcher), Audit: &fakes.FakeAuditWriter{},
-		PRCreator: git,
+		Policy: generateOnlyPolicy(false), Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(orderingLauncher(log, false)), Audit: &fakes.FakeAuditWriter{},
+		PRCreator: orderingPRCreator{FakeGitHostClient: &fakes.FakeGitHostClient{}, log: log},
 	}, task, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("RunRound: %v", err)
@@ -323,14 +376,62 @@ func TestRunRound_CreatesBranchBeforeOpeningPR(t *testing.T) {
 		t.Fatal("expected a non-zero PRNumber")
 	}
 
-	// If RunRound already created the branch, reusing it now must return
-	// the same branch rather than erroring or creating a second one.
-	reused, err := git.CreateOrReuseBranch(context.Background(), gitclient.RepoRef{Owner: "acme", Name: "widgets"}, "feature", "main")
-	if err != nil {
-		t.Fatalf("CreateOrReuseBranch: %v", err)
+	want := []string{"branch", "launch:implement", "pr"}
+	if got := log.snapshot(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected event order %v, got %v", want, got)
 	}
-	if reused.Name != "feature" {
-		t.Fatalf("expected RunRound to have already created branch %q, got %+v", "feature", reused)
+}
+
+// TestRunRound_BlockingGenerateStillHasBranch: a generate step that returns
+// a blocking finding opens no PR, but the branch was already created before
+// it dispatched — so the next round's generate finds it.
+func TestRunRound_BlockingGenerateStillHasBranch(t *testing.T) {
+	log := &eventLog{}
+	task := domain.Task{ID: "task-1", TargetRepo: "acme/widgets", Branch: "feature", BaseBranch: "main"}
+
+	res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+		Policy: generateOnlyPolicy(true), Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(orderingLauncher(log, true)), Audit: &fakes.FakeAuditWriter{},
+		PRCreator: orderingPRCreator{FakeGitHostClient: &fakes.FakeGitHostClient{}, log: log},
+	}, task, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("RunRound: %v", err)
+	}
+	if res.Outcome != coreloop.OutcomeContinue {
+		t.Fatalf("expected continue (blocking generate finding), got %v (%s)", res.Outcome, res.Reason)
+	}
+	if res.PRNumber != 0 {
+		t.Fatalf("expected no PR after a blocking generate, got PRNumber %d", res.PRNumber)
+	}
+
+	want := []string{"branch", "launch:implement"}
+	if got := log.snapshot(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected event order %v, got %v", want, got)
+	}
+}
+
+// TestRunRound_SkipsBranchCreationWhenPROpen: an open PR implies its head
+// branch already exists, so RunRound must not touch PRCreator at all — a
+// nil PRCreator is valid here — and generate still dispatches.
+func TestRunRound_SkipsBranchCreationWhenPROpen(t *testing.T) {
+	log := &eventLog{}
+	task := domain.Task{ID: "task-1", TargetRepo: "acme/widgets", Branch: "feature", BaseBranch: "main", PRNumber: 7}
+
+	res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+		Policy: generateOnlyPolicy(false), Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(orderingLauncher(log, false)), Audit: &fakes.FakeAuditWriter{},
+	}, task, 2, nil, nil)
+	if err != nil {
+		t.Fatalf("RunRound: %v", err)
+	}
+	if res.Outcome != coreloop.OutcomeStopSuccess {
+		t.Fatalf("expected stop-success, got %v (%s)", res.Outcome, res.Reason)
+	}
+	if res.PRNumber != 7 {
+		t.Fatalf("expected PRNumber to stay 7, got %d", res.PRNumber)
+	}
+
+	want := []string{"launch:implement"}
+	if got := log.snapshot(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected event order %v, got %v", want, got)
 	}
 }
 

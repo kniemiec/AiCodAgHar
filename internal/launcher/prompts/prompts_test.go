@@ -47,6 +47,35 @@ func TestRender_Implement_WithPriorFindings(t *testing.T) {
 	}
 }
 
+// TestRender_Implement_PinsTaskBranch exercises the
+// pre-generate-branch-creation design §4: both implement-family prompts
+// tell the agent to check out the (already-existing) task branch, push only
+// to it, and report a blocking result rather than fall back to another
+// branch if it can't.
+func TestRender_Implement_PinsTaskBranch(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"fresh":          {"TARGET_REPO": "org/repo", "BRANCH": "add-feature"},
+		"prior-findings": {"TARGET_REPO": "org/repo", "BRANCH": "add-feature", "PRIOR_FINDINGS_JSON": `[{"message":"x"}]`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			task, _, err := Render("implement", env)
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			for _, want := range []string{
+				"git checkout add-feature",
+				"push it only to the add-feature branch",
+				"Never push to any other branch",
+				"do not work on any other branch",
+			} {
+				if !strings.Contains(task, want) {
+					t.Errorf("task missing %q: %q", want, task)
+				}
+			}
+		})
+	}
+}
+
 // TestRender_Implement_WithDescription exercises Task Intent Propagation
 // design §7: TASK_DESCRIPTION becomes a quoted, explicitly-untrusted section
 // of the implement prompt.

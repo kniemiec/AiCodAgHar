@@ -167,14 +167,21 @@ def run_openhands_mode(env, mmds, emit):
 
     start = time.time()
     event_count = 0
+    # OpenHands exits 0 even when the conversation died on an error (e.g.
+    # LLMServiceUnavailableError when the LLM endpoint is unreachable), and
+    # then never writes the structured result. Remember the last such error
+    # so the failure report names the real cause, not just the missing file.
+    conversation_error = None
     for line in proc.stdout:
         stripped = line.rstrip("\n")
         emit({"type": "event", "line": stripped})
         try:
-            json.loads(stripped)
+            parsed = json.loads(stripped)
             event_count += 1
         except ValueError:
-            pass
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "ConversationErrorEvent":
+            conversation_error = f"{parsed.get('code', 'unknown')}: {parsed.get('detail', '')}"
     rc = proc.wait()
     elapsed = time.time() - start
 
@@ -194,7 +201,11 @@ def run_openhands_mode(env, mmds, emit):
             result = json.load(f)
         emit({"type": "structured_result", "data": result})
     except (OSError, ValueError) as e:
-        emit({"type": "error", "message": f"openhands exited {rc}, structured result unreadable: {e}"})
+        if conversation_error:
+            message = f"openhands conversation failed ({conversation_error}); exited {rc} without a structured result"
+        else:
+            message = f"openhands exited {rc}, structured result unreadable: {e}"
+        emit({"type": "error", "message": message})
 
 
 def run_command_mode(env, mmds, emit):

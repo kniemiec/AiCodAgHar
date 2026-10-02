@@ -45,7 +45,7 @@ func main() {
 		log.Fatalf("container-launcher: egress setup: %v", err)
 	}
 	slog.Info("egress ready", "tap_device", egressCfg.TapDevice, "tap_cidr", egressCfg.TapCIDR,
-		"guest_subnet", egressCfg.GuestSubnet, "proxy_service", egressCfg.ProxyServiceName, "nft_table", egressCfg.NftTable)
+		"guest_subnet", egressCfg.GuestSubnet, "proxy_service", egressCfg.ProxyServiceName, "nft_table", egressCfg.NftTable, "proxy_url", egressCfg.ProxyURL())
 
 	creds, err := serverTLSCredentials(cfg.CACert, cfg.ServerCert, cfg.ServerKey)
 	if err != nil {

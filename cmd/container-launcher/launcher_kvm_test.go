@@ -102,11 +102,6 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 	cfg.LLMModel = requireTestEnv(t, "LAUNCHER_LLM_MODEL")
 	srv := newLauncherServer(cfg)
 
-	// egress.DefaultConfig's fixed tap-gateway proxy address (design §10) —
-	// the guest can only reach anything outside its own tap subnet,
-	// Forgejo included, by going through this.
-	const proxyURL = "http://172.16.0.1:8888"
-
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
@@ -153,8 +148,6 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 			"FORGEJO_TOKEN":    forgejoToken,
 			"TARGET_REPO":      targetRepo,
 			"BRANCH":           branch,
-			"HTTP_PROXY":       proxyURL,
-			"HTTPS_PROXY":      proxyURL,
 			"TASK_DESCRIPTION": "remove log operation from calculator as it is not needed",
 		},
 	})

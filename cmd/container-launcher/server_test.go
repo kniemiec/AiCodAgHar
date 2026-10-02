@@ -283,3 +283,10 @@ func TestExtractLogs_NotFound(t *testing.T) {
 		t.Errorf("code = %v, want NotFound", status.Code(err))
 	}
 }
+
+func TestEventLogTail_StripsANSIAndKeepsEnd(t *testing.T) {
+	got := eventLogTail([]byte("\x1b[92mstart\x1b[0m middle \x1b[1;3mend\x1b[0m"), 9)
+	if got != "iddle end" {
+		t.Errorf("eventLogTail = %q, want %q", got, "iddle end")
+	}
+}

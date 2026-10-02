@@ -267,6 +267,11 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	case command != "":
 		mmdsData = mergeCommandEnv(env, command)
 	}
+	if task != "" || command != "" {
+		// Both merge helpers above return a fresh copy, so adding to it
+		// here never mutates the caller's env map.
+		addProxyEnv(mmdsData, l.egressCfg.ProxyURL())
+	}
 	if err := mmds.Inject(ctx, fc, mmdsData); err != nil {
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: mmds inject: %w", err)
@@ -464,6 +469,17 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, log 
 		status:   status,
 		stdout:   vsock.Redact(stdout, secrets),
 	}, outErr
+}
+
+// addProxyEnv points the guest at the host's forward proxy, its only way
+// out (internal/launcher/egress). Without it the guest has no DNS and no
+// route, so every LLM, git and package-manager call fails with a name
+// resolution error. The guest wrapper exports these and their lowercase
+// forms. The launcher sets them, overriding any caller value, because the
+// proxy address is launcher-host topology the control-plane can't know.
+func addProxyEnv(env map[string]string, proxyURL string) {
+	env["HTTP_PROXY"] = proxyURL
+	env["HTTPS_PROXY"] = proxyURL
 }
 
 // mergeCommandEnv layers the resolved fixed guest command on top of the

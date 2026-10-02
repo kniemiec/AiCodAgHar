@@ -158,3 +158,9 @@ func TestEnsureProxyAllowsSubnet_RestartFailurePropagates(t *testing.T) {
 		t.Fatal("expected an error when the restart command fails")
 	}
 }
+
+func TestProxyURL(t *testing.T) {
+	if got, want := DefaultConfig(123).ProxyURL(), "http://172.16.0.1:8888"; got != want {
+		t.Errorf("DefaultConfig.ProxyURL() = %q, want %q", got, want)
+	}
+}

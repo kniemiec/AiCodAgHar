@@ -183,11 +183,33 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 		"stdout_bytes", len(outcome.stdout), "structured_result_bytes", len(outcome.structuredResultJSON)}
 	if bootErr != nil {
 		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
+		if len(outcome.stdout) > 0 {
+			log.WarnContext(ctx, "guest event log tail", "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
+		}
 		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
 	}
 	log.InfoContext(ctx, "launch finished", attrs...)
 	log.DebugContext(ctx, "structured result", "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
+}
+
+// eventLogTailBytes is how much of a failed invocation's event log
+// Launch logs. ExtractLogs still returns the whole thing, but only while
+// this process runs, and the control-plane doesn't fetch logs for a launch
+// that returned an error, so the log line is often the only copy.
+const eventLogTailBytes = 4096
+
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// eventLogTail returns the last n bytes of an (already redacted) event log
+// with ANSI color codes stripped. OpenHands' rich console output is full
+// of them, and they make the log line unreadable.
+func eventLogTail(stdout []byte, n int) string {
+	clean := ansiEscape.ReplaceAll(stdout, nil)
+	if len(clean) > n {
+		clean = clean[len(clean)-n:]
+	}
+	return string(clean)
 }
 
 func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) (*launcherv1.KillResponse, error) {

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Completed |
 | **Date** | 2026-08-21 |
 | **Owner** | Krzysztof Niemiec |
 | **Purpose** | Stand up a local, self-hosted git + CI/CD platform to replace GitHub as the primary source control for personal projects, and to serve as the experimental substrate for agentic software development scenarios. |

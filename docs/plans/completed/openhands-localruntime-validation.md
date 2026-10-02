@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Completed |
 | **Date** | 2026-08-27 |
 | **Owner** | Krzysztof Niemiec |
 | **Purpose** | Validate, hands-on rather than from documentation alone, whether OpenHands' `LocalRuntime` actually holds up as the sandboxing boundary [ADR-8](../architecture/week1-adr-8-coding-agent-runtime-selection.md) relies on — before that ADR's status moves past Proposed. |

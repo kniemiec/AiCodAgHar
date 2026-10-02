@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 )
@@ -119,6 +120,7 @@ func (l *Listener) WaitForResult(ctx context.Context) (Result, error) {
 	var conn net.Conn
 	select {
 	case conn = <-connCh:
+		slog.DebugContext(ctx, "vsock: guest connected")
 	case err := <-errCh:
 		return Result{}, fmt.Errorf("vsock: accept: %w", err)
 	case <-ctx.Done():
@@ -184,6 +186,7 @@ func readEnvelopes(conn net.Conn) (Result, error) {
 			events = append(events, append([]byte(nil), line...))
 			continue
 		}
+		slog.Debug("vsock: envelope received", "type", env.Type, "bytes", len(line))
 		switch env.Type {
 		case "event":
 			events = append(events, []byte(env.Line))
@@ -196,6 +199,7 @@ func readEnvelopes(conn net.Conn) (Result, error) {
 			}
 		case "error":
 			guestErrMsg = env.Message
+			slog.Warn("vsock: guest wrapper reported an error", "message", env.Message)
 		}
 	}
 

@@ -5,10 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
 )
@@ -35,11 +39,32 @@ func NewClient(addr string, tlsCfg TLSConfig) (*Client, error) {
 		return nil, fmt.Errorf("launcherclient: TLS setup: %w", err)
 	}
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds), grpc.WithUnaryInterceptor(logUnaryCall))
 	if err != nil {
 		return nil, fmt.Errorf("launcherclient: dial %s: %w", addr, err)
 	}
 	return &Client{conn: conn, rpc: launcherv1.NewContainerLauncherServiceClient(conn)}, nil
+}
+
+// logUnaryCall logs every launcher RPC with its gRPC status code. A
+// non-OK code logs at warn with the server's message, so a rejection like
+// InvalidArgument is visible here even when no caller logs the error.
+func logUnaryCall(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	start := time.Now()
+	var invocationID string
+	if r, ok := req.(interface{ GetInvocationId() string }); ok {
+		invocationID = r.GetInvocationId()
+	}
+	slog.DebugContext(ctx, "launcher rpc start", "method", method, "invocation_id", invocationID)
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	st := status.Convert(err)
+	attrs := []any{"method", method, "invocation_id", invocationID, "code", st.Code().String(), "duration", time.Since(start)}
+	if st.Code() != codes.OK {
+		slog.WarnContext(ctx, "launcher rpc failed", append(attrs, "message", st.Message())...)
+	} else {
+		slog.DebugContext(ctx, "launcher rpc done", attrs...)
+	}
+	return err
 }
 
 // Close releases the underlying gRPC connection.

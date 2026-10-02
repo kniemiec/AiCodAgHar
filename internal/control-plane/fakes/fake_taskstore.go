@@ -74,6 +74,19 @@ func (f *FakeTaskStore) UpdateTaskState(ctx context.Context, state domain.TaskSt
 	return nil
 }
 
+func (f *FakeTaskStore) SetTaskReason(ctx context.Context, taskID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	rec, ok := f.tasks[taskID]
+	if !ok {
+		return fmt.Errorf("fakes: set reason: no such task %s", taskID)
+	}
+	rec.State.Reason = reason
+	f.tasks[taskID] = rec
+	return nil
+}
+
 func (f *FakeTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

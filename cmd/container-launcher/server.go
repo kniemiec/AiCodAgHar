@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"regexp"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/prompts"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 // errInvocationKilled is the context.Cause set on an in-flight invocation's
@@ -110,7 +112,10 @@ func newLauncherServer(cfg config) *launcherServer {
 var validInvocationID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchRequest) (*launcherv1.LaunchResponse, error) {
+	log := slog.With("invocation_id", req.InvocationId, "task_id", req.TaskId, "step_id", req.StepId,
+		"step_type", req.StepType, "payload_ref", req.PayloadRef)
 	if !validInvocationID.MatchString(req.InvocationId) {
+		log.WarnContext(ctx, "launch rejected: invalid invocation_id", "allowed_pattern", validInvocationID.String())
 		return nil, status.Errorf(codes.InvalidArgument, "container-launcher: invalid invocation_id %q", req.InvocationId)
 	}
 
@@ -119,18 +124,25 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	case stepTypeAgentStage:
 		rendered, ok, err := prompts.Render(req.PayloadRef, req.Env)
 		if err != nil {
+			log.ErrorContext(ctx, "launch rejected: prompt render failed", "error", err)
 			return nil, status.Errorf(codes.Internal, "container-launcher: render prompt for %s: %v", req.PayloadRef, err)
 		}
 		if !ok {
+			log.WarnContext(ctx, "launch rejected: unknown agent-stage payload_ref")
 			return nil, status.Errorf(codes.InvalidArgument, "container-launcher: unknown payload_ref %q", req.PayloadRef)
 		}
 		task = rendered
+		log.DebugContext(ctx, "prompt rendered", "prompt_bytes", len(task), "prompt_prefix", logging.Truncate(task, 500))
 	case stepTypeDeterministicStep:
 		rendered, ok := prompts.RenderCommand(req.PayloadRef)
 		if !ok {
+			log.WarnContext(ctx, "launch rejected: unknown deterministic-step payload_ref")
 			return nil, status.Errorf(codes.InvalidArgument, "container-launcher: unknown payload_ref %q", req.PayloadRef)
 		}
 		command = rendered
+		log.DebugContext(ctx, "command resolved", "command", command)
+	default:
+		log.WarnContext(ctx, "unrecognized step_type; falling back to bare boot")
 	}
 
 	killCtx, cancel := context.WithCancelCause(ctx)
@@ -144,6 +156,7 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 		cancel(nil) // release killCtx's resources; no-op on the cause if Kill already set one
 	}()
 
+	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds)
 	startedAt := time.Now()
 	outcome, bootErr := s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
 	finishedAt := time.Now()
@@ -166,9 +179,14 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	}
 	s.mu.Unlock()
 
+	attrs := []any{"status", outcome.status, "exit_code", outcome.exitCode, "duration", finishedAt.Sub(startedAt),
+		"stdout_bytes", len(outcome.stdout), "structured_result_bytes", len(outcome.structuredResultJSON)}
 	if bootErr != nil {
+		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
 		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
 	}
+	log.InfoContext(ctx, "launch finished", attrs...)
+	log.DebugContext(ctx, "structured result", "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
 }
 
@@ -185,9 +203,11 @@ func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) 
 		// Known, but already finished by the time Kill arrived — nothing
 		// left to pre-empt. Not an error: this is a legitimate race, not a
 		// caller mistake.
+		slog.InfoContext(ctx, "kill requested for already-finished invocation", "invocation_id", req.InvocationId)
 		return &launcherv1.KillResponse{Killed: false}, nil
 	}
 
+	slog.InfoContext(ctx, "killing in-flight invocation", "invocation_id", req.InvocationId)
 	cancel(errInvocationKilled)
 	return &launcherv1.KillResponse{Killed: true}, nil
 }

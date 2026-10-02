@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -176,6 +177,8 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 	// constraint on the second evaluation. Two real "pdp-decision" rows for
 	// the same round is correct, not noise: PDP really was asked twice.
 	pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval:%d", task.ID, round, time.Now().UnixNano())
+	log := slog.With("task_id", task.ID, "round", round)
+	log.DebugContext(ctx, "policy evaluate", "invocation_id", pdpInvocationID, "task_type", task.Type, "risk_tier", task.RiskTier, "target_repo", task.TargetRepo)
 	decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round, pdpInvocationID))
 	if err != nil {
 		return RoundResult{}, fmt.Errorf("round %d: policy evaluate: %w", round, err)
@@ -185,8 +188,13 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		return RoundResult{}, fmt.Errorf("round %d: audit PDP decision: %w", round, err)
 	}
 
+	log.InfoContext(ctx, "policy decision", "decision", decision.Decision, "reason", decision.Reason,
+		"policy_bundle_version", decision.PolicyBundleVersion, "granted_scopes", decision.GrantedScopes,
+		"resolved_steps", describeSteps(decision.ResolvedSteps))
+
 	switch decision.Decision {
 	case "deny":
+		log.WarnContext(ctx, "policy denied task", "reason", decision.Reason)
 		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "policy denied: " + decision.Reason}, nil
 	case "allow":
 		// proceed to fan-out below
@@ -196,6 +204,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 
 	groups, err := groupStepsByPhase(decision.ResolvedSteps)
 	if err != nil {
+		log.WarnContext(ctx, "invalid phase configuration", "error", err)
 		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "invalid phase configuration: " + err.Error()}, nil
 	}
 
@@ -209,6 +218,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if _, err := deps.PRCreator.CreateOrReuseBranch(ctx, approvalRepoRef(task), task.Branch, task.BaseBranch); err != nil {
 			return RoundResult{}, fmt.Errorf("round %d: create task branch: %w", round, err)
 		}
+		log.InfoContext(ctx, "task branch ready", "branch", task.Branch, "base_branch", task.BaseBranch)
 	}
 
 	var runs []domain.StepRun
@@ -221,11 +231,13 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if phase == policyclient.PhaseGenerate {
 			pf = priorFindings
 		}
+		log.InfoContext(ctx, "phase started", "phase", phase, "steps", len(steps), "has_prior_findings", len(pf) > 0)
 		phaseRuns, err := fanOut(ctx, deps, task, round, steps, decision.GrantedScopes, pf, alreadyCompleted)
 		if err != nil {
 			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, phase, err)
 		}
 		runs = append(runs, phaseRuns...)
+		log.InfoContext(ctx, "phase finished", "phase", phase, "blocking_findings", aggregate(phaseRuns))
 
 		// Task Intent Propagation design §5: a task no longer arrives with
 		// a PR already open, so once the generate phase's own step
@@ -239,6 +251,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 				return RoundResult{}, fmt.Errorf("round %d: open review PR: %w", round, err)
 			}
 			task.PRNumber = pr.Number
+			log.InfoContext(ctx, "review PR ready", "pr_number", pr.Number, "branch", task.Branch)
 			if deps.PRRecorder != nil {
 				if err := deps.PRRecorder.SetTaskPRNumber(ctx, task.ID, pr.Number); err != nil {
 					return RoundResult{}, fmt.Errorf("round %d: persist PR number: %w", round, err)
@@ -252,6 +265,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if err != nil {
 			return RoundResult{}, fmt.Errorf("round %d: marshal prior findings: %w", round, err)
 		}
+		log.InfoContext(ctx, "blocking findings outstanding; another round needed")
 		return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings, PRNumber: task.PRNumber}, nil
 	}
 
@@ -270,11 +284,13 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 			if err != nil {
 				return RoundResult{}, fmt.Errorf("round %d: open approval issue: %w", round, err)
 			}
+			log.InfoContext(ctx, "waiting for approval", "approval_issue", issue.Number)
 			return RoundResult{Outcome: OutcomeWaitingApproval, StepRuns: runs, ApprovalIssueNumber: issue.Number, PRNumber: task.PRNumber}, nil
 		}
 	}
 
 	if publishSteps := groups[policyclient.PhasePublish]; len(publishSteps) > 0 {
+		log.InfoContext(ctx, "phase started", "phase", policyclient.PhasePublish, "steps", len(publishSteps))
 		phaseRuns, err := fanOut(ctx, deps, task, round, publishSteps, decision.GrantedScopes, nil, alreadyCompleted)
 		if err != nil {
 			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, policyclient.PhasePublish, err)
@@ -289,6 +305,16 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 // gitclient.RepoRef — coreloop only ever sees TargetRepo as a plain string
 // (it's also PDP's resource ID and the audit trail's own field), so this
 // stays a local, throwaway parse rather than changing domain.Task's shape.
+// describeSteps renders resolved steps compactly for logs, e.g.
+// "implement(generate,agent-stage,blocking=false)".
+func describeSteps(steps []policyclient.ResolvedStep) []string {
+	out := make([]string, len(steps))
+	for i, s := range steps {
+		out[i] = fmt.Sprintf("%s(%s,%s,blocking=%t)", s.StepID, s.Phase, s.Type, s.Blocking)
+	}
+	return out
+}
+
 func approvalRepoRef(task domain.Task) gitclient.RepoRef {
 	owner, name, _ := strings.Cut(task.TargetRepo, "/")
 	return gitclient.RepoRef{Owner: owner, Name: name}
@@ -397,6 +423,7 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 	var wg sync.WaitGroup
 	for i, step := range steps {
 		if cached, ok := alreadyCompleted[step.StepID]; ok {
+			slog.InfoContext(ctx, "step already completed; not redispatching", "task_id", task.ID, "round", round, "step_id", step.StepID)
 			runs[i] = cached
 			continue
 		}
@@ -406,11 +433,13 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 			defer wg.Done()
 			exec, ok := deps.Executors.Lookup(step.Type)
 			if !ok {
+				slog.ErrorContext(ctx, "no executor registered for step type", "task_id", task.ID, "step_id", step.StepID, "step_type", step.Type)
 				errs[i] = fmt.Errorf("no executor registered for step type %q", step.Type)
 				return
 			}
 
 			invocationID := executor.InvocationID(executor.StepContext{Task: task, Round: round, Step: step})
+			log := slog.With("task_id", task.ID, "round", round, "step_id", step.StepID, "invocation_id", invocationID)
 			if deps.Recorder != nil {
 				if err := deps.Recorder.RecordLaunched(ctx, task.ID, round, step, invocationID); err != nil {
 					errs[i] = fmt.Errorf("record launched step_run for %s: %w", step.StepID, err)
@@ -418,12 +447,20 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 				}
 			}
 
+			log.InfoContext(ctx, "step dispatched", "step_type", step.Type, "phase", step.Phase, "blocking", step.Blocking)
+			started := time.Now()
 			run, err := exec.Execute(ctx, executor.StepContext{
 				Task: task, Round: round, Step: step, GrantedScopes: grantedScopes, PriorFindings: priorFindings,
 			})
+			if err != nil {
+				log.ErrorContext(ctx, "step failed", "duration", time.Since(started), "error", err)
+			} else {
+				log.InfoContext(ctx, "step finished", "duration", time.Since(started), "exit_code", run.ExitCode, "has_finding", run.HasFinding)
+			}
 
 			if deps.Recorder != nil {
 				if rerr := deps.Recorder.RecordCompleted(ctx, task.ID, invocationID, run, err); rerr != nil && err == nil {
+					log.WarnContext(ctx, "record completed step_run failed", "error", rerr)
 					err = fmt.Errorf("record completed step_run for %s: %w", step.StepID, rerr)
 				}
 			}

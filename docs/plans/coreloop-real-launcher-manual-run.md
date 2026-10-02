@@ -37,6 +37,7 @@ docker compose -f deploy/docker-compose.yml stop launcher-mock control-plane
 
 ```
 sudo -E env \
+  LOG_LEVEL=debug \
   ADDR=:9443 \
   TLS_CA_CERT=deploy/certs/ca.crt \
   TLS_SERVER_CERT=deploy/certs/server.crt \
@@ -52,10 +53,13 @@ sudo -E env \
 
 Leave running in its own terminal — this is a long-lived gRPC server, not a one-shot test process.
 
+`LOG_LEVEL` (`debug|info|warn|error`, default `info`) and `LOG_FORMAT` (`text|json`, default `text`) apply to both binaries (`internal/logging`). At `debug` the launcher logs every boot stage (`boot stage done stage=...`), each vsock envelope as it arrives, and the rendered prompt's prefix. At `info` you get one line per RPC, `launch accepted`/`microVM started`/`launch finished`, and which completion branch fired.
+
 **3. Run `control-plane` on the host**, pointed at that launcher, using the host-side URLs `deploy/.env` already documents (`FORGEJO_URL`, `PDP_MOCK_URL`, `SECRETS_MOCK_URL`, `AUDIT_DB_DSN`, `ORCHESTRATOR_DB_DSN`):
 
 ```
 set -a; . deploy/.env; set +a
+LOG_LEVEL=debug \
 LAUNCHER_ADDR=localhost:9443 \
 FORGEJO_TOKEN="$FORGEJO_ADMIN_TOKEN" \
 TLS_CA_CERT="$(pwd)/deploy/certs/ca.crt" \
@@ -100,6 +104,30 @@ docker compose -f deploy/docker-compose.yml start launcher-mock control-plane
 ```
 
 to restore the normal mocked stack.
+
+## Diagnosing a stuck or failed task
+
+Logs first: every line carries `task_id`/`round`/`step_id`/`invocation_id`, so `grep <task_id>` on the control-plane output gives the round → phase → step → launch sequence. A round that errors logs `task failed; left status=running for reconciliation` with the error, and also writes that error into the task's `reason`, which `GET /tasks/<task_id>` returns. The task stays `running` on purpose, so a control-plane restart retries it. On the launcher side, grep for the `invocation_id`. The jailer/firecracker console output goes to `/tmp/container-launcher-<invocation_id>.log`, logged as `jailer_log=`.
+
+Then Postgres, which records which stages finished, though not why:
+
+```
+docker compose -f deploy/docker-compose.yml exec postgres psql -U postgres -d orchestrator
+```
+
+```sql
+SELECT id, status, current_round, pr_number, branch, reason, updated_at
+FROM orchestrator.tasks WHERE id = '<task_id>';
+
+-- launched -> completed | failed. exit_code/has_finding are NULL for failed rows,
+-- and GET /tasks shows them as 0/false
+SELECT step_id, invocation_id, status, exit_code, has_finding, structured_result, updated_at
+FROM orchestrator.step_runs WHERE task_id = '<task_id>' ORDER BY id;
+
+-- 'pdp-decision' per round (policy_decision, resolved_steps), one row per launch (status), 'task-outcome' at the end
+SELECT id, step_type, step_id, invocation_id, policy_decision, resolved_steps, status, exit_code, created_at
+FROM audit.invocation_audit WHERE task_id = '<task_id>' ORDER BY id;
+```
 
 ## Cost/time note
 

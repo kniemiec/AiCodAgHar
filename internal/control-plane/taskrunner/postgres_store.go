@@ -104,6 +104,17 @@ func (s *PostgresTaskStore) UpdateTaskState(ctx context.Context, state domain.Ta
 	return nil
 }
 
+func (s *PostgresTaskStore) SetTaskReason(ctx context.Context, taskID, reason string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE orchestrator.tasks SET reason = $2, updated_at = now() WHERE id = $1`, taskID, nullableString(reason))
+	if err != nil {
+		return fmt.Errorf("taskrunner: set reason for %s: %w", taskID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("taskrunner: set reason for %s: no such task", taskID)
+	}
+	return nil
+}
+
 func (s *PostgresTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE orchestrator.tasks SET pr_number = $2 WHERE id = $1`, taskID, prNumber)
 	if err != nil {

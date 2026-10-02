@@ -217,7 +217,7 @@ func TestRunner_AuditsTaskOutcomeAfterMultipleRounds(t *testing.T) {
 func TestRunner_ReconcileTask_SkipsCompletedResolvesLaunchedDispatchesMissing(t *testing.T) {
 	launcher := &fakes.FakeContainerLauncher{
 		ExtractLogsFunc: func(ctx context.Context, invocationID string) (launcherclient.LogBundle, error) {
-			if invocationID == "task-1:1:step-launched" {
+			if invocationID == "task-1-r1-step-launched" {
 				return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": false}`)}, nil
 			}
 			return launcherclient.LogBundle{}, nil
@@ -250,13 +250,13 @@ func TestRunner_ReconcileTask_SkipsCompletedResolvesLaunchedDispatchesMissing(t 
 	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
 		t.Fatalf("EnsureRound: %v", err)
 	}
-	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-completed", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:1:step-completed"); err != nil {
+	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-completed", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-completed"); err != nil {
 		t.Fatalf("RecordStepLaunched(step-completed): %v", err)
 	}
-	if err := store.CompleteStepRun(ctx, task.ID, "task-1:1:step-completed", domain.StepRun{HasFinding: false}, nil); err != nil {
+	if err := store.CompleteStepRun(ctx, task.ID, "task-1-r1-step-completed", domain.StepRun{HasFinding: false}, nil); err != nil {
 		t.Fatalf("CompleteStepRun(step-completed): %v", err)
 	}
-	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-launched", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:1:step-launched"); err != nil {
+	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-launched", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-launched"); err != nil {
 		t.Fatalf("RecordStepLaunched(step-launched): %v", err)
 	}
 	// step-new: deliberately no row at all yet.
@@ -303,7 +303,7 @@ func TestRunner_ReconcileTask_SkipsCompletedResolvesLaunchedDispatchesMissing(t 
 func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
 	launcher := &fakes.FakeContainerLauncher{
 		ExtractLogsFunc: func(ctx context.Context, invocationID string) (launcherclient.LogBundle, error) {
-			if invocationID == "task-1:2:step-1" {
+			if invocationID == "task-1-r2-step-1" {
 				return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": false}`)}, nil
 			}
 			return launcherclient.LogBundle{}, nil
@@ -331,10 +331,10 @@ func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
 	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
 		t.Fatalf("EnsureRound(1): %v", err)
 	}
-	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:1:step-1"); err != nil {
+	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-1"); err != nil {
 		t.Fatalf("RecordStepLaunched(round 1): %v", err)
 	}
-	if err := store.CompleteStepRun(ctx, task.ID, "task-1:1:step-1", domain.StepRun{HasFinding: true}, nil); err != nil {
+	if err := store.CompleteStepRun(ctx, task.ID, "task-1-r1-step-1", domain.StepRun{HasFinding: true}, nil); err != nil {
 		t.Fatalf("CompleteStepRun(round 1): %v", err)
 	}
 	if err := store.UpdateTaskState(ctx, domain.TaskState{TaskID: task.ID, Status: domain.TaskStatusRunning, CurrentRound: 1}); err != nil {
@@ -345,7 +345,7 @@ func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
 	if err := store.EnsureRound(ctx, task.ID, 2); err != nil {
 		t.Fatalf("EnsureRound(2): %v", err)
 	}
-	if err := store.RecordStepLaunched(ctx, task.ID, 2, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:2:step-1"); err != nil {
+	if err := store.RecordStepLaunched(ctx, task.ID, 2, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r2-step-1"); err != nil {
 		t.Fatalf("RecordStepLaunched(round 2): %v", err)
 	}
 
@@ -397,7 +397,7 @@ func TestRunner_ReconcileTask_UnresolvableLaunchedStepEscalates(t *testing.T) {
 	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
 		t.Fatalf("EnsureRound: %v", err)
 	}
-	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-launched", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1:1:step-launched"); err != nil {
+	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-launched", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-launched"); err != nil {
 		t.Fatalf("RecordStepLaunched: %v", err)
 	}
 

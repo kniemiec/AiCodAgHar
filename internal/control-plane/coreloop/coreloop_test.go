@@ -523,7 +523,7 @@ func TestRunRound_PriorFindingsPlumbedAcrossManualRounds(t *testing.T) {
 			return launcherclient.RunResult{InvocationID: req.InvocationID, ExitCode: 0}, nil
 		},
 		ExtractLogsFunc: func(ctx context.Context, invocationID string) (launcherclient.LogBundle, error) {
-			if strings.Contains(invocationID, ":1:review") {
+			if strings.Contains(invocationID, "-r1-review") {
 				return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": true}`)}, nil
 			}
 			return launcherclient.LogBundle{StructuredResultJSON: []byte(`{"has_blocking_finding": false}`)}, nil
@@ -566,7 +566,7 @@ func TestRunRound_PriorFindingsPlumbedAcrossManualRounds(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	round1Env, ok := envByInvocation["task-1:1:implement"]
+	round1Env, ok := envByInvocation["task-1-r1-implement"]
 	if !ok {
 		t.Fatal("expected a round-1 implement launch")
 	}
@@ -574,7 +574,7 @@ func TestRunRound_PriorFindingsPlumbedAcrossManualRounds(t *testing.T) {
 		t.Fatalf("expected no PRIOR_FINDINGS_JSON on round 1 (nothing prior), got %q", round1Env["PRIOR_FINDINGS_JSON"])
 	}
 
-	round2Env, ok := envByInvocation["task-1:2:implement"]
+	round2Env, ok := envByInvocation["task-1-r2-implement"]
 	if !ok {
 		t.Fatal("expected a round-2 implement launch")
 	}
@@ -586,7 +586,7 @@ func TestRunRound_PriorFindingsPlumbedAcrossManualRounds(t *testing.T) {
 		t.Fatalf("expected PRIOR_FINDINGS_JSON to reference the review step, got %s", pf)
 	}
 
-	round2ReviewEnv := envByInvocation["task-1:2:review"]
+	round2ReviewEnv := envByInvocation["task-1-r2-review"]
 	if _, ok := round2ReviewEnv["PRIOR_FINDINGS_JSON"]; ok {
 		t.Fatal("expected PRIOR_FINDINGS_JSON to be scoped to the generate-phase step only, not review")
 	}
@@ -611,7 +611,7 @@ func TestRunRound_AlreadyCompletedStepsAreSkipped(t *testing.T) {
 		},
 	}
 	cached := domain.StepRun{
-		StepID: "review-a", StepType: executor.StepTypeAgentStage, InvocationID: "task-1:1:review-a",
+		StepID: "review-a", StepType: executor.StepTypeAgentStage, InvocationID: "task-1-r1-review-a",
 		Blocking: true, HasFinding: false, Status: domain.StepRunStatusCompleted,
 	}
 

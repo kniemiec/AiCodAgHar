@@ -9,8 +9,11 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/approval"
@@ -21,9 +24,12 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 func main() {
+	logging.Setup("control-plane")
+
 	addr := os.Getenv("ADDR")
 	if addr == "" {
 		addr = ":8080"
@@ -37,6 +43,11 @@ func main() {
 	if orchestratorInstanceID == "" {
 		orchestratorInstanceID = "control-plane-dev"
 	}
+
+	slog.Info("control-plane starting",
+		"addr", addr, "forgejo_url", forgejoURL, "pdp_url", pdpURL, "secrets_url", secretsURL,
+		"launcher_addr", launcherAddr, "orchestrator_instance_id", orchestratorInstanceID,
+		"webhook_approval_enabled", os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true")
 
 	git, err := gitclient.NewClient(forgejoURL, forgejoToken)
 	if err != nil {
@@ -106,17 +117,43 @@ func main() {
 
 	srv := &server{git: git, secrets: secrets, runner: runner}
 
-	log.Printf("control-plane listening on %s", addr)
+	slog.Info("control-plane listening", "addr", addr)
 	if err := http.ListenAndServe(addr, logRequests(newServeMux(srv))); err != nil {
 		log.Fatalf("control-plane: %v", err)
 	}
 }
 
+// logRequests logs each request with its response status and duration.
+// GET /tasks/{id} logs at debug, since polling it would otherwise drown
+// everything else at info.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		level := slog.LevelInfo
+		switch {
+		case rec.status >= 500:
+			level = slog.LevelError
+		case rec.status >= 400:
+			level = slog.LevelWarn
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/tasks/"):
+			level = slog.LevelDebug
+		}
+		slog.Log(r.Context(), level, "http request", "method", r.Method, "path", r.URL.Path,
+			"status", rec.status, "duration", time.Since(start))
 	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
 }
 
 func requireEnv(name string) string {

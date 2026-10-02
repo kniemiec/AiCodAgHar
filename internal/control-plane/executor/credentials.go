@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -28,7 +29,30 @@ func mintCredential(ctx context.Context, secrets secretsclient.SecretsClient, sc
 	if err != nil {
 		return secretsclient.Credential{}, fmt.Errorf("mint credential for %s as %s: %w", sc.Step.StepID, sc.Step.BotAccount, err)
 	}
+	stepLogger(sc).DebugContext(ctx, "credential minted", "credential_id", cred.ID, "bot_account", sc.Step.BotAccount, "scopes", sc.GrantedScopes, "ttl", credentialTTL)
 	return cred, nil
+}
+
+// revokeCredential revokes cred on a fresh context (the step's own ctx may
+// already be done), logging rather than returning a failure: revocation is
+// best-effort cleanup that must not mask the step's own outcome.
+func revokeCredential(secrets secretsclient.SecretsClient, sc StepContext, cred secretsclient.Credential) {
+	if err := secrets.RevokeCredential(context.Background(), cred.ID); err != nil {
+		stepLogger(sc).Warn("credential revoke failed", "credential_id", cred.ID, "error", err)
+	}
+}
+
+// stepLogger carries the correlation attributes every executor log line needs.
+func stepLogger(sc StepContext) *slog.Logger {
+	return slog.With("task_id", sc.Task.ID, "round", sc.Round, "step_id", sc.Step.StepID, "invocation_id", InvocationID(sc))
+}
+
+// auditLaunchFailure writes the failed-launch audit row, logging rather than
+// returning its own error so the launch error stays the one reported.
+func auditLaunchFailure(w audit.AuditWriter, sc StepContext, invocationID string) {
+	if err := auditStepRun(context.Background(), w, sc, invocationID, launcherclient.RunResult{InvocationID: invocationID, Status: "error"}); err != nil {
+		stepLogger(sc).Warn("audit of failed launch failed", "error", err)
+	}
 }
 
 // launchEnv builds the LaunchRequest.env every step needs to reach Forgejo

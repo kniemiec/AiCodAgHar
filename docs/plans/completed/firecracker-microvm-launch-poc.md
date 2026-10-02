@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Completed |
 | **Date** | 2026-09-02 |
 | **Owner** | Krzysztof Niemiec |
 | **Purpose** | Generate hands-on evidence for the microVM launch/lifecycle mechanics [ADR-4](../architecture/week1-adr-4-blast-radius-and-sandboxing.md) assumed but never specified — before drafting ADR-10 (MicroVM Launch & Lifecycle Mechanics), not yet written. Unlike the [OpenHands LocalRuntime PoC](openhands-localruntime-validation.md), this doesn't validate an already-decided approach; it's exploratory, feeding the options ADR-10 will choose between. |

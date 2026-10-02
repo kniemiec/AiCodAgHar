@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft — not started |
+| **Status** | Completed |
 | **Date** | 2026-09-20 |
 | **Owner** | kniemiec |
 | **Purpose** | Give the platform an actual entry point for a human to say "implement X," persist that intent, and thread it through to the `implement` agent-stage prompt (and, separately, into review-phase context) — none of which exists today. |

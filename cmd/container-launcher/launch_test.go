@@ -85,3 +85,11 @@ func TestTeardown_NonexistentDirIsNotAnError(t *testing.T) {
 	// before anything was staged) — must not panic or block.
 	teardown(filepath.Join(t.TempDir(), "never-created"))
 }
+
+func TestAddProxyEnv_OverridesCallerValues(t *testing.T) {
+	env := mergeAgentEnv(map[string]string{"HTTP_PROXY": "http://caller:1"}, "task", "", "")
+	addProxyEnv(env, "http://172.16.0.1:8888")
+	if env["HTTP_PROXY"] != "http://172.16.0.1:8888" || env["HTTPS_PROXY"] != "http://172.16.0.1:8888" {
+		t.Errorf("proxy env = %q / %q, want both set to the launcher's proxy", env["HTTP_PROXY"], env["HTTPS_PROXY"])
+	}
+}

@@ -38,6 +38,12 @@ type TaskStore interface {
 	// arrives with pr_number already set.
 	SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error
 
+	// SetTaskReason overwrites only the task's reason column — used to
+	// surface a runLoop error through GET /tasks/{id} without touching
+	// status (left running, so startup reconciliation still retries it) or
+	// any approval/prior-findings state UpdateTaskState would overwrite.
+	SetTaskReason(ctx context.Context, taskID, reason string) error
+
 	// EnsureRound inserts orchestrator.rounds' (task_id, round_number) row
 	// if it doesn't already exist — step_runs' foreign key requires it to
 	// exist before any step_runs row for that round can be inserted.

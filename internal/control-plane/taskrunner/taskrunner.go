@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
@@ -70,6 +70,8 @@ func (r *Runner) Start(ctx context.Context, task domain.Task) (taskID string, do
 	if err := r.deps.Store.CreateTask(ctx, task); err != nil {
 		return "", nil, fmt.Errorf("taskrunner: start %s: %w", task.ID, err)
 	}
+	slog.InfoContext(ctx, "task accepted", "task_id", task.ID, "target_repo", task.TargetRepo, "base_branch", task.BaseBranch,
+		"branch", task.Branch, "risk_tier", task.RiskTier, "bot_account", task.BotAccount, "triggering_principal", task.TriggeringPrincipal)
 	ch := make(chan Result, 1)
 	// Deliberately context.Background(), not ctx: a task's execution must
 	// outlive the HTTP request that started it (the whole point of this
@@ -122,18 +124,21 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 
 	var allRuns []domain.StepRun
 	for round := startRound; round <= coreloop.MaxRounds; round++ {
+		slog.InfoContext(ctx, "round started", "task_id", task.ID, "round", round, "pr_number", task.PRNumber, "reconciled_steps", len(alreadyCompleted))
 		if err := r.deps.Store.EnsureRound(ctx, task.ID, round); err != nil {
-			done <- Result{TaskID: task.ID, Err: fmt.Errorf("taskrunner: ensure round %d: %w", round, err)}
+			r.fail(ctx, task, round, fmt.Errorf("taskrunner: ensure round %d: %w", round, err), done)
 			return
 		}
 
 		res, err := coreloop.RunRound(ctx, r.deps.Coreloop, task, round, priorFindings, alreadyCompleted)
 		alreadyCompleted = nil // only ever applies to the round it was built for
 		if err != nil {
-			done <- Result{TaskID: task.ID, Err: fmt.Errorf("taskrunner: round %d: %w", round, err)}
+			r.fail(ctx, task, round, fmt.Errorf("taskrunner: round %d: %w", round, err), done)
 			return
 		}
 		allRuns = append(allRuns, res.StepRuns...)
+		slog.InfoContext(ctx, "round finished", "task_id", task.ID, "round", round,
+			"outcome", res.Outcome, "reason", res.Reason, "pr_number", res.PRNumber, "step_runs", len(res.StepRuns))
 		// Task Intent Propagation design §5: RunRound may have just opened
 		// the review PR (task.PRNumber was 0 going in) — carry the result
 		// forward into task so a subsequent round in this same loop doesn't
@@ -150,7 +155,7 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 				PriorFindings: priorFindings, UpdatedAt: time.Now(),
 			}
 			if err := r.deps.Store.UpdateTaskState(ctx, state); err != nil {
-				done <- Result{TaskID: task.ID, Err: fmt.Errorf("taskrunner: persist round %d state: %w", round, err)}
+				r.fail(ctx, task, round, fmt.Errorf("taskrunner: persist round %d state: %w", round, err), done)
 				return
 			}
 			continue
@@ -167,7 +172,7 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 				ApprovalIssueNumber: &issueNum, PriorFindings: priorFindings, UpdatedAt: time.Now(),
 			}
 			if err := r.deps.Store.UpdateTaskState(ctx, state); err != nil {
-				done <- Result{TaskID: task.ID, Err: fmt.Errorf("taskrunner: persist waiting_approval state for round %d: %w", round, err)}
+				r.fail(ctx, task, round, fmt.Errorf("taskrunner: persist waiting_approval state for round %d: %w", round, err), done)
 				return
 			}
 			done <- Result{TaskID: task.ID, Outcome: res.Outcome, RoundsRun: round, StepRuns: allRuns}
@@ -176,18 +181,19 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 		case coreloop.OutcomeStopSuccess, coreloop.OutcomeStopEscalate:
 			result := Result{TaskID: task.ID, Outcome: res.Outcome, RoundsRun: round, Reason: res.Reason, StepRuns: allRuns}
 			if err := r.finish(ctx, task, round, result, nil); err != nil {
-				done <- Result{TaskID: task.ID, Err: err}
+				r.fail(ctx, task, round, err, done)
 				return
 			}
 			done <- result
 			return
 
 		default:
-			done <- Result{TaskID: task.ID, Err: fmt.Errorf("taskrunner: round %d: unexpected round outcome %q", round, res.Outcome)}
+			r.fail(ctx, task, round, fmt.Errorf("taskrunner: round %d: unexpected round outcome %q", round, res.Outcome), done)
 			return
 		}
 	}
 
+	slog.WarnContext(ctx, "round cap reached with blocking findings outstanding; escalating", "task_id", task.ID, "max_rounds", coreloop.MaxRounds)
 	// Round cap exceeded with blocking findings still outstanding — not a
 	// RunRound call, so it must persist/audit its own terminal outcome.
 	result := Result{
@@ -195,10 +201,23 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 		Reason: "round cap reached with blocking findings outstanding", StepRuns: allRuns,
 	}
 	if err := r.finish(ctx, task, coreloop.MaxRounds, result, nil); err != nil {
-		done <- Result{TaskID: task.ID, Err: err}
+		r.fail(ctx, task, coreloop.MaxRounds, err, done)
 		return
 	}
 	done <- result
+}
+
+// fail ends runLoop on an error. Before this, the error only reached the
+// done channel, which the HTTP handlers discard, so a failed task stayed
+// status=running with no trace anywhere. It now logs at error and records
+// the error in the task's reason column for GET /tasks/{id}. Status stays
+// running on purpose, so startup reconciliation still retries the task.
+func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err error, done chan<- Result) {
+	slog.ErrorContext(ctx, "task failed; left status=running for reconciliation", "task_id", task.ID, "round", round, "error", err)
+	if serr := r.deps.Store.SetTaskReason(ctx, task.ID, "error: "+err.Error()); serr != nil {
+		slog.WarnContext(ctx, "could not persist task failure reason", "task_id", task.ID, "error", serr)
+	}
+	done <- Result{TaskID: task.ID, Err: err}
 }
 
 // approvalEvidence carries an approve-phase gate's real verification outcome
@@ -371,10 +390,11 @@ func (r *Runner) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("taskrunner: reconcile: list running tasks: %w", err)
 	}
+	slog.InfoContext(ctx, "startup reconciliation", "running_tasks", len(ids))
 	for _, id := range ids {
 		go func(id string) {
 			if _, err := r.ReconcileTask(context.Background(), id); err != nil {
-				log.Printf("taskrunner: reconcile %s: %v", id, err)
+				slog.Error("reconcile task failed", "task_id", id, "error", err)
 			}
 		}(id)
 	}
@@ -449,6 +469,8 @@ func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, rou
 		case domain.StepRunStatusLaunched:
 			resolved, resolvedOK := r.resolveLaunchedStep(ctx, task.ID, sr)
 			if !resolvedOK {
+				slog.WarnContext(ctx, "launched step could not be reconciled with the launcher; escalating",
+					"task_id", task.ID, "round", round, "step_id", sr.StepID, "invocation_id", sr.InvocationID)
 				reason := fmt.Sprintf(
 					"round %d: step %s (invocation %s) was still 'launched' at startup and could not be reconciled with the launcher",
 					round, sr.StepID, sr.InvocationID,
@@ -483,6 +505,7 @@ func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, rou
 func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr domain.StepRun) (domain.StepRun, bool) {
 	logs, err := r.deps.Launcher.ExtractLogs(ctx, sr.InvocationID)
 	if err != nil {
+		slog.WarnContext(ctx, "reconcile: extract logs failed", "task_id", taskID, "step_id", sr.StepID, "invocation_id", sr.InvocationID, "error", err)
 		return domain.StepRun{}, false
 	}
 
@@ -499,7 +522,7 @@ func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr doma
 		Status: domain.StepRunStatusCompleted,
 	}
 	if err := r.deps.Store.CompleteStepRun(ctx, taskID, sr.InvocationID, resolved, nil); err != nil {
-		log.Printf("taskrunner: reconcile %s: persist resolved step %s: %v", taskID, sr.StepID, err)
+		slog.WarnContext(ctx, "reconcile: persist resolved step failed", "task_id", taskID, "step_id", sr.StepID, "error", err)
 	}
 	return resolved, true
 }

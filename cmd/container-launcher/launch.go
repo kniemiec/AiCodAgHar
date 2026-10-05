@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/jailer"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/mmds"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/vsock"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 // The boot itself is still a single hardcoded payload — the exact
@@ -100,6 +102,14 @@ func newFirecrackerLauncher(cfg config) *firecrackerLauncher {
 }
 
 func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, env map[string]string, task, command string, timeoutSeconds int32) (bootOutcome, error) {
+	log := slog.With("invocation_id", invocationID)
+	bootStart := time.Now()
+	// stage logs one completed boot step at debug. Failures aren't logged
+	// here: they're returned and logged once by server.go's Launch.
+	stage := func(name string, attrs ...any) {
+		log.DebugContext(ctx, "boot stage done", append([]any{"stage", name, "elapsed", time.Since(bootStart)}, attrs...)...)
+	}
+
 	jailCfg := jailer.Config{
 		JailerBinary:      l.cfg.JailerBinary,
 		FirecrackerBinary: l.cfg.FirecrackerBinary,
@@ -136,9 +146,14 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 
 	jailDir := filepath.Join(l.cfg.ChrootBaseDir, jailCfg.ExecBasename(), invocationID)
 	defer teardown(jailDir)
+	stage("jail-config", "jail_dir", jailDir, "api_socket", socketPath)
 
 	cmd := jailCfg.Command(ctx)
-	logFile, err := os.Create(filepath.Join(os.TempDir(), "container-launcher-"+invocationID+".log"))
+	jailerLogPath := filepath.Join(os.TempDir(), "container-launcher-"+invocationID+".log")
+	logFile, err := os.Create(jailerLogPath)
+	if err != nil {
+		log.WarnContext(ctx, "could not create jailer log file; jailer output discarded", "path", jailerLogPath, "error", err)
+	}
 	if err == nil {
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
@@ -151,11 +166,13 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	if err := cmd.Start(); err != nil {
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: start jailer: %w", err)
 	}
+	stage("jailer-started", "pid", cmd.Process.Pid, "jailer_log", jailerLogPath)
 
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
 	killAndReap := func() {
+		log.DebugContext(ctx, "killing jailed firecracker process", "elapsed", time.Since(bootStart))
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGKILL)
 		}
@@ -167,13 +184,15 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	cancel()
 	if err != nil {
 		killAndReap()
-		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: waiting for API socket: %w", err)
+		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: waiting for API socket: %w (see %s)", err, jailerLogPath)
 	}
+	stage("api-socket-ready")
 
 	if err := stageImages(jailCfg.JailRoot(), l.cfg.ImageRoot, l.cfg.JailerUID, l.cfg.JailerGID); err != nil {
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: staging images: %w", err)
 	}
+	stage("images-staged", "image_root", l.cfg.ImageRoot)
 
 	fc := fcapi.NewClient(socketPath)
 	if err := fc.PutBootSource(ctx, fcapi.BootSourceConfig{
@@ -199,6 +218,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: machine-config: %w", err)
 	}
+	stage("boot-source-drive-machine-config", "vcpus", vcpuCount, "mem_mib", memSizeMib)
 
 	// Every invocation gets the one static tap device egress.Setup already
 	// provisioned at launcher startup (design §10) — attached
@@ -212,6 +232,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: network-interfaces: %w", err)
 	}
+	stage("network-interface", "tap_device", l.egressCfg.TapDevice)
 
 	var vsockListener *vsock.Listener
 	if task != "" || command != "" {
@@ -226,6 +247,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 			killAndReap()
 			return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: vsock config: %w", err)
 		}
+		stage("vsock-listening", "uds", vsockHostPath, "guest_cid", guestCID, "port", vsockPort)
 	}
 
 	// MMDS must carry the guest's credentials/task before InstanceStart —
@@ -245,15 +267,23 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	case command != "":
 		mmdsData = mergeCommandEnv(env, command)
 	}
+	if task != "" || command != "" {
+		// Both merge helpers above return a fresh copy, so adding to it
+		// here never mutates the caller's env map.
+		addProxyEnv(mmdsData, l.egressCfg.ProxyURL())
+	}
 	if err := mmds.Inject(ctx, fc, mmdsData); err != nil {
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: mmds inject: %w", err)
 	}
+	stage("mmds-injected", "keys", logging.Keys(mmdsData))
 
 	if err := fc.InstanceStart(ctx); err != nil {
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: instance-start: %w", err)
 	}
+	log.InfoContext(ctx, "microVM started", "boot_elapsed", time.Since(bootStart), "jailer_log", jailerLogPath,
+		"mode", launchMode(task, command))
 
 	if task == "" && command == "" {
 		select {
@@ -273,10 +303,22 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	}
 
 	timeout := resolveTimeout(timeoutSeconds, l.cfg.DefaultTimeoutSeconds)
+	log.InfoContext(ctx, "waiting for guest completion", "timeout", timeout)
 	if task != "" {
-		return l.waitForAgentCompletion(ctx, env, vsockListener, exited, killAndReap, timeout)
+		return l.waitForAgentCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
 	}
-	return l.waitForCommandCompletion(ctx, env, vsockListener, exited, killAndReap, timeout)
+	return l.waitForCommandCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+}
+
+func launchMode(task, command string) string {
+	switch {
+	case task != "":
+		return "agent"
+	case command != "":
+		return "command"
+	default:
+		return "bare-boot"
+	}
 }
 
 // waitForAgentCompletion waits for the guest wrapper's structured-result
@@ -287,7 +329,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 // vsock.Redact's literal-secret scrub (design §7) before the result leaves
 // this function — nothing captured here reaches ExtractLogsResponse
 // un-redacted.
-func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, env map[string]string, vsockListener *vsock.Listener, exited <-chan error, killAndReap func(), timeout time.Duration) (bootOutcome, error) {
+func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, log *slog.Logger, env map[string]string, vsockListener *vsock.Listener, exited <-chan error, killAndReap func(), timeout time.Duration) (bootOutcome, error) {
 	waitCtx, waitCancel := context.WithCancel(ctx)
 	defer waitCancel()
 
@@ -309,6 +351,7 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, env ma
 
 	select {
 	case r := <-resultCh:
+		log.InfoContext(ctx, "guest completion record received", "vsock_error", r.err, "event_log_bytes", len(r.result.EventLog))
 		killAndReap()
 		stdout = r.result.EventLog
 		status, exitCode, structuredResultJSON = deriveVsockOutcome(r.result, r.err)
@@ -321,12 +364,14 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, env ma
 		}
 
 	case err := <-exited:
+		log.WarnContext(ctx, "guest process exited before completion", "error", err)
 		waitCancel()
 		<-resultCh
 		status, exitCode, structuredResultJSON = "error", 1, []byte(failClosedStructuredResult)
 		outErr = fmt.Errorf("container-launcher: guest process exited before completion: %v", err)
 
 	case <-time.After(timeout):
+		log.WarnContext(ctx, "timed out waiting for guest completion", "timeout", timeout)
 		waitCancel()
 		<-resultCh
 		killAndReap()
@@ -334,6 +379,7 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, env ma
 		outErr = fmt.Errorf("container-launcher: timed out waiting for guest completion after %s", timeout)
 
 	case <-ctx.Done():
+		log.WarnContext(ctx, "invocation cancelled while waiting for guest", "cause", context.Cause(ctx))
 		waitCancel()
 		<-resultCh
 		killAndReap()
@@ -360,7 +406,7 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, env ma
 // (design §6), not agent-stage's has_blocking_finding fail-closed default.
 // There is no structured result in command mode, so
 // bootOutcome.structuredResultJSON is left unset on every path.
-func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, env map[string]string, vsockListener *vsock.Listener, exited <-chan error, killAndReap func(), timeout time.Duration) (bootOutcome, error) {
+func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, log *slog.Logger, env map[string]string, vsockListener *vsock.Listener, exited <-chan error, killAndReap func(), timeout time.Duration) (bootOutcome, error) {
 	waitCtx, waitCancel := context.WithCancel(ctx)
 	defer waitCancel()
 
@@ -381,6 +427,7 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, env 
 
 	select {
 	case r := <-resultCh:
+		log.InfoContext(ctx, "guest completion record received", "vsock_error", r.err, "event_log_bytes", len(r.result.EventLog))
 		killAndReap()
 		stdout = r.result.EventLog
 		status, exitCode = deriveCommandOutcome(r.result, r.err)
@@ -393,12 +440,14 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, env 
 		}
 
 	case err := <-exited:
+		log.WarnContext(ctx, "guest process exited before completion", "error", err)
 		waitCancel()
 		<-resultCh
 		status, exitCode = "error", 1
 		outErr = fmt.Errorf("container-launcher: guest process exited before completion: %v", err)
 
 	case <-time.After(timeout):
+		log.WarnContext(ctx, "timed out waiting for guest completion", "timeout", timeout)
 		waitCancel()
 		<-resultCh
 		killAndReap()
@@ -406,6 +455,7 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, env 
 		outErr = fmt.Errorf("container-launcher: timed out waiting for guest completion after %s", timeout)
 
 	case <-ctx.Done():
+		log.WarnContext(ctx, "invocation cancelled while waiting for guest", "cause", context.Cause(ctx))
 		waitCancel()
 		<-resultCh
 		killAndReap()
@@ -419,6 +469,17 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, env 
 		status:   status,
 		stdout:   vsock.Redact(stdout, secrets),
 	}, outErr
+}
+
+// addProxyEnv points the guest at the host's forward proxy, its only way
+// out (internal/launcher/egress). Without it the guest has no DNS and no
+// route, so every LLM, git and package-manager call fails with a name
+// resolution error. The guest wrapper exports these and their lowercase
+// forms. The launcher sets them, overriding any caller value, because the
+// proxy address is launcher-host topology the control-plane can't know.
+func addProxyEnv(env map[string]string, proxyURL string) {
+	env["HTTP_PROXY"] = proxyURL
+	env["HTTPS_PROXY"] = proxyURL
 }
 
 // mergeCommandEnv layers the resolved fixed guest command on top of the
@@ -512,5 +573,9 @@ func copyAndChown(src, dst string, uid, gid int) error {
 // <chroot-base-dir>/<exec-basename>/<invocation-id>, one level above the
 // "root" subdirectory jailer itself creates.
 func teardown(jailDir string) {
-	_ = os.RemoveAll(jailDir)
+	if err := os.RemoveAll(jailDir); err != nil {
+		slog.Warn("teardown: remove jail dir failed", "jail_dir", jailDir, "error", err)
+		return
+	}
+	slog.Debug("teardown: jail dir removed", "jail_dir", jailDir)
 }

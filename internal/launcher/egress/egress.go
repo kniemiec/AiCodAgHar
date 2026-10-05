@@ -47,6 +47,7 @@ type Config struct {
 
 	GuestSubnet string // what the proxy allows, e.g. "172.16.0.0/24" — deliberately broader than TapCIDR, matching the PoC exactly
 
+	ProxyPort        int    // the proxy's listen port on the tap gateway, e.g. 8888 (tinyproxy's default)
 	ProxyConfigPath  string // e.g. "/etc/tinyproxy/tinyproxy.conf"
 	ProxyServiceName string // e.g. "tinyproxy", restarted via systemctl after an Allow line is added
 
@@ -75,10 +76,22 @@ func DefaultConfig(tapOwnerUID int) Config {
 		TapCIDR:          "172.16.0.1/30",
 		TapOwnerUID:      tapOwnerUID,
 		GuestSubnet:      "172.16.0.0/24",
+		ProxyPort:        8888,
 		ProxyConfigPath:  "/etc/tinyproxy/tinyproxy.conf",
 		ProxyServiceName: "tinyproxy",
 		NftTable:         "fc_launcher",
 	}
+}
+
+// ProxyURL is the forward proxy's address as seen from inside the guest:
+// the tap gateway IP (TapCIDR without its mask) plus ProxyPort. It is the
+// guest's only way out (see the package doc comment), so the launcher
+// injects it as HTTP_PROXY/HTTPS_PROXY into every invocation's MMDS
+// payload. The control-plane can't supply it, because the address is
+// host-local launcher topology.
+func (c Config) ProxyURL() string {
+	gateway, _, _ := strings.Cut(c.TapCIDR, "/")
+	return "http://" + gateway + ":" + strconv.Itoa(c.ProxyPort)
 }
 
 // Setup performs the tap device, nftables, and proxy-config steps, in

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"regexp"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/prompts"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 // errInvocationKilled is the context.Cause set on an in-flight invocation's
@@ -91,6 +93,13 @@ type launcherServer struct {
 
 	booter vmLauncher
 
+	// vmSlot serializes VM boots: every microVM shares the one tap device,
+	// guest CID and MAC (egress.DefaultConfig, launch.go), so a second
+	// concurrent boot fails with EBUSY on tap0. Launch holds the slot for
+	// the whole invocation; callers that fan out (coreloop.fanOut) queue
+	// here instead. Waiting is cancellable by Kill.
+	vmSlot chan struct{}
+
 	mu          sync.Mutex
 	invocations map[string]invocationRecord
 	inFlight    map[string]context.CancelCauseFunc
@@ -99,6 +108,7 @@ type launcherServer struct {
 func newLauncherServer(cfg config) *launcherServer {
 	return &launcherServer{
 		booter:      newFirecrackerLauncher(cfg),
+		vmSlot:      make(chan struct{}, 1),
 		invocations: map[string]invocationRecord{},
 		inFlight:    map[string]context.CancelCauseFunc{},
 	}
@@ -110,7 +120,10 @@ func newLauncherServer(cfg config) *launcherServer {
 var validInvocationID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchRequest) (*launcherv1.LaunchResponse, error) {
+	log := slog.With("invocation_id", req.InvocationId, "task_id", req.TaskId, "step_id", req.StepId,
+		"step_type", req.StepType, "payload_ref", req.PayloadRef)
 	if !validInvocationID.MatchString(req.InvocationId) {
+		log.WarnContext(ctx, "launch rejected: invalid invocation_id", "allowed_pattern", validInvocationID.String())
 		return nil, status.Errorf(codes.InvalidArgument, "container-launcher: invalid invocation_id %q", req.InvocationId)
 	}
 
@@ -119,18 +132,25 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	case stepTypeAgentStage:
 		rendered, ok, err := prompts.Render(req.PayloadRef, req.Env)
 		if err != nil {
+			log.ErrorContext(ctx, "launch rejected: prompt render failed", "error", err)
 			return nil, status.Errorf(codes.Internal, "container-launcher: render prompt for %s: %v", req.PayloadRef, err)
 		}
 		if !ok {
+			log.WarnContext(ctx, "launch rejected: unknown agent-stage payload_ref")
 			return nil, status.Errorf(codes.InvalidArgument, "container-launcher: unknown payload_ref %q", req.PayloadRef)
 		}
 		task = rendered
+		log.DebugContext(ctx, "prompt rendered", "prompt_bytes", len(task), "prompt_prefix", logging.Truncate(task, 500))
 	case stepTypeDeterministicStep:
 		rendered, ok := prompts.RenderCommand(req.PayloadRef)
 		if !ok {
+			log.WarnContext(ctx, "launch rejected: unknown deterministic-step payload_ref")
 			return nil, status.Errorf(codes.InvalidArgument, "container-launcher: unknown payload_ref %q", req.PayloadRef)
 		}
 		command = rendered
+		log.DebugContext(ctx, "command resolved", "command", command)
+	default:
+		log.WarnContext(ctx, "unrecognized step_type; falling back to bare boot")
 	}
 
 	killCtx, cancel := context.WithCancelCause(ctx)
@@ -144,8 +164,20 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 		cancel(nil) // release killCtx's resources; no-op on the cause if Kill already set one
 	}()
 
+	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds)
 	startedAt := time.Now()
-	outcome, bootErr := s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
+	var outcome bootOutcome
+	var bootErr error
+	select {
+	case s.vmSlot <- struct{}{}:
+		if waited := time.Since(startedAt); waited > time.Second {
+			log.InfoContext(ctx, "vm slot acquired", "waited", waited)
+		}
+		outcome, bootErr = s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
+		<-s.vmSlot
+	case <-killCtx.Done():
+		outcome, bootErr = bootOutcome{status: statusForCancellation(killCtx)}, context.Cause(killCtx)
+	}
 	finishedAt := time.Now()
 
 	resp := &launcherv1.LaunchResponse{
@@ -166,10 +198,37 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	}
 	s.mu.Unlock()
 
+	attrs := []any{"status", outcome.status, "exit_code", outcome.exitCode, "duration", finishedAt.Sub(startedAt),
+		"stdout_bytes", len(outcome.stdout), "structured_result_bytes", len(outcome.structuredResultJSON)}
 	if bootErr != nil {
+		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
+		if len(outcome.stdout) > 0 {
+			log.WarnContext(ctx, "guest event log tail", "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
+		}
 		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
 	}
+	log.InfoContext(ctx, "launch finished", attrs...)
+	log.DebugContext(ctx, "structured result", "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
+}
+
+// eventLogTailBytes is how much of a failed invocation's event log
+// Launch logs. ExtractLogs still returns the whole thing, but only while
+// this process runs, and the control-plane doesn't fetch logs for a launch
+// that returned an error, so the log line is often the only copy.
+const eventLogTailBytes = 4096
+
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// eventLogTail returns the last n bytes of an (already redacted) event log
+// with ANSI color codes stripped. OpenHands' rich console output is full
+// of them, and they make the log line unreadable.
+func eventLogTail(stdout []byte, n int) string {
+	clean := ansiEscape.ReplaceAll(stdout, nil)
+	if len(clean) > n {
+		clean = clean[len(clean)-n:]
+	}
+	return string(clean)
 }
 
 func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) (*launcherv1.KillResponse, error) {
@@ -185,9 +244,11 @@ func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) 
 		// Known, but already finished by the time Kill arrived — nothing
 		// left to pre-empt. Not an error: this is a legitimate race, not a
 		// caller mistake.
+		slog.InfoContext(ctx, "kill requested for already-finished invocation", "invocation_id", req.InvocationId)
 		return &launcherv1.KillResponse{Killed: false}, nil
 	}
 
+	slog.InfoContext(ctx, "killing in-flight invocation", "invocation_id", req.InvocationId)
 	cancel(errInvocationKilled)
 	return &launcherv1.KillResponse{Killed: true}, nil
 }

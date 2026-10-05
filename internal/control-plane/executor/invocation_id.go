@@ -13,6 +13,12 @@ import "fmt"
 // resolves (design docs/designs/completed/full-pipeline-async-approval-design.md
 // §4.2), and the ID is this package's single source of truth for the
 // format.
+//
+// Only [A-Za-z0-9_-] is allowed: the real container-launcher embeds the ID
+// in jail paths and jailer's --id, and rejects anything else
+// (cmd/container-launcher/server.go's validInvocationID). launcher-mock
+// doesn't check, so a colon-separated format passed every mocked test but
+// failed every real Launch with InvalidArgument.
 func InvocationID(sc StepContext) string {
-	return fmt.Sprintf("%s:%d:%s", sc.Task.ID, sc.Round, sc.Step.StepID)
+	return fmt.Sprintf("%s-r%d-%s", sc.Task.ID, sc.Round, sc.Step.StepID)
 }

@@ -10,3 +10,4 @@
 # Local secrets / generated bootstrap credentials
 deploy/.env
 deploy/certs/
+./test-forgejo.sh

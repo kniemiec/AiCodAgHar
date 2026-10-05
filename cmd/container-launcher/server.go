@@ -93,6 +93,13 @@ type launcherServer struct {
 
 	booter vmLauncher
 
+	// vmSlot serializes VM boots: every microVM shares the one tap device,
+	// guest CID and MAC (egress.DefaultConfig, launch.go), so a second
+	// concurrent boot fails with EBUSY on tap0. Launch holds the slot for
+	// the whole invocation; callers that fan out (coreloop.fanOut) queue
+	// here instead. Waiting is cancellable by Kill.
+	vmSlot chan struct{}
+
 	mu          sync.Mutex
 	invocations map[string]invocationRecord
 	inFlight    map[string]context.CancelCauseFunc
@@ -101,6 +108,7 @@ type launcherServer struct {
 func newLauncherServer(cfg config) *launcherServer {
 	return &launcherServer{
 		booter:      newFirecrackerLauncher(cfg),
+		vmSlot:      make(chan struct{}, 1),
 		invocations: map[string]invocationRecord{},
 		inFlight:    map[string]context.CancelCauseFunc{},
 	}
@@ -158,7 +166,18 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 
 	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds)
 	startedAt := time.Now()
-	outcome, bootErr := s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
+	var outcome bootOutcome
+	var bootErr error
+	select {
+	case s.vmSlot <- struct{}{}:
+		if waited := time.Since(startedAt); waited > time.Second {
+			log.InfoContext(ctx, "vm slot acquired", "waited", waited)
+		}
+		outcome, bootErr = s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
+		<-s.vmSlot
+	case <-killCtx.Done():
+		outcome, bootErr = bootOutcome{status: statusForCancellation(killCtx)}, context.Cause(killCtx)
+	}
 	finishedAt := time.Now()
 
 	resp := &launcherv1.LaunchResponse{

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func (f *fakeBooter) Launch(ctx context.Context, invocationID string, env map[st
 }
 
 func newTestServer(booter vmLauncher) *launcherServer {
-	return &launcherServer{booter: booter, invocations: map[string]invocationRecord{}, inFlight: map[string]context.CancelCauseFunc{}}
+	return &launcherServer{booter: booter, vmSlot: make(chan struct{}, 1), invocations: map[string]invocationRecord{}, inFlight: map[string]context.CancelCauseFunc{}}
 }
 
 func TestLaunch_Success(t *testing.T) {
@@ -248,6 +249,110 @@ func TestKill_PreemptsInFlightInvocation(t *testing.T) {
 	if err := <-errCh; err == nil {
 		t.Error("expected a non-nil error from a killed Launch")
 	}
+}
+
+// serialBooter records how many Launch calls overlap, for the vmSlot
+// tests: each call signals entered, then waits on release (or ctx).
+type serialBooter struct {
+	mu      sync.Mutex
+	active  int
+	peak    int
+	entered chan string
+	release chan struct{}
+}
+
+func (b *serialBooter) Launch(ctx context.Context, invocationID string, _ map[string]string, _, _ string, _ int32) (bootOutcome, error) {
+	b.mu.Lock()
+	b.active++
+	b.peak = max(b.peak, b.active)
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.active--
+		b.mu.Unlock()
+	}()
+
+	b.entered <- invocationID
+	select {
+	case <-b.release:
+		return bootOutcome{status: "completed"}, nil
+	case <-ctx.Done():
+		return bootOutcome{status: statusForCancellation(ctx)}, context.Cause(ctx)
+	}
+}
+
+func TestLaunch_SerializesConcurrentInvocations(t *testing.T) {
+	booter := &serialBooter{entered: make(chan string, 2), release: make(chan struct{})}
+	srv := newTestServer(booter)
+
+	errCh := make(chan error, 2)
+	for _, id := range []string{"inv-a", "inv-b"} {
+		go func() {
+			_, err := srv.Launch(context.Background(), &launcherv1.LaunchRequest{InvocationId: id})
+			errCh <- err
+		}()
+	}
+
+	first := <-booter.entered
+	select {
+	case second := <-booter.entered:
+		t.Fatalf("%s reached the booter while %s still held the VM slot", second, first)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	booter.release <- struct{}{}
+	<-booter.entered
+	booter.release <- struct{}{}
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Errorf("Launch: %v", err)
+		}
+	}
+	if booter.peak != 1 {
+		t.Errorf("peak concurrent boots = %d, want 1", booter.peak)
+	}
+}
+
+func TestKill_PreemptsQueuedInvocation(t *testing.T) {
+	booter := &serialBooter{entered: make(chan string, 1), release: make(chan struct{})}
+	srv := newTestServer(booter)
+
+	go srv.Launch(context.Background(), &launcherv1.LaunchRequest{InvocationId: "inv-running"})
+	<-booter.entered
+
+	respCh := make(chan *launcherv1.LaunchResponse, 1)
+	go func() {
+		resp, _ := srv.Launch(context.Background(), &launcherv1.LaunchRequest{InvocationId: "inv-queued"})
+		respCh <- resp
+	}()
+
+	// Wait for the queued Launch to register as in-flight before killing it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		srv.mu.Lock()
+		_, queued := srv.inFlight["inv-queued"]
+		srv.mu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("queued Launch never registered as in-flight")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, err := srv.Kill(context.Background(), &launcherv1.KillRequest{InvocationId: "inv-queued"}); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	select {
+	case resp := <-respCh:
+		if resp.Status != "killed" {
+			t.Errorf("resp.Status = %q, want killed", resp.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued Launch never returned after Kill")
+	}
+	booter.release <- struct{}{}
 }
 
 func TestExtractLogs_AfterLaunch(t *testing.T) {

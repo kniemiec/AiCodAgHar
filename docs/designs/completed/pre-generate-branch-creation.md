@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Completed. `CreateOrReuseBranch` runs in `coreloop.RunRound` before the generate phase. See [`docs/components/orchestrator.md`](../../components/orchestrator.md) §3 for the current-state description; this document is the historical design record. |
 | **Date** | 2026-09-27 |
 | **Owner** | kniemiec |
 | **Purpose** | Fix the orchestrator-owned-branch-creation call site so the task's branch exists *before* the generate phase dispatches, not after it completes — so the coding agent works on (and pushes to) the task branch instead of falling back to `main`. |

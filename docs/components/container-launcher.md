@@ -13,13 +13,13 @@
 
 `ContainerLauncherService`'s production implementation: a gRPC+mTLS server, wire-compatible with `mocks/launcher-mock`, that runs each step invocation inside its own jailer-wrapped Firecracker microVM — real hardware-enforced isolation, not a container and not a mock. Per invocation it boots a real guest kernel/rootfs copied from a golden image, injects credentials and task data via Firecracker's MMDS device (never on the boot-time/image surface — ADR-1/ADR-2's requirement), captures the guest's structured result and event log over `vsock` (decoupled from the guest's own network path, so a network-level failure doesn't also blind the host), enforces a single-invocation egress allowlist via a host tap device + forward proxy + nftables rule, and tears the microVM down on completion, timeout, or an explicit `Kill`.
 
-v1 runs **one invocation at a time** — [§8](#8-known-gaps) covers what that trades away.
+v1 runs **one invocation at a time**, and `launcherServer` enforces that itself: concurrent `Launch` calls queue for a single VM slot instead of colliding ([§4](#4-api--contracts)). [§8](#8-known-gaps) covers what that trades away.
 
 ## 2. Modularity
 
 | Package | Responsibility |
 |---|---|
-| `cmd/container-launcher` | gRPC+mTLS entrypoint (`main.go`, runs `egress.Setup` once at startup); `launcherServer` (`server.go`) implements the RPC surface, resolves `PayloadRef` to a rendered prompt/command, and tracks in-flight invocations for `Kill`; `firecrackerLauncher` (`launch.go`) is the real `vmLauncher` — boots the jailed microVM and drives it through to a result; `status.go` derives `RunResult.Status` and the fail-closed defaults from a `vsock` result |
+| `cmd/container-launcher` | gRPC+mTLS entrypoint (`main.go`, runs `logging.Setup` and `egress.Setup` once at startup); `launcherServer` (`server.go`) implements the RPC surface, validates the invocation ID, resolves `PayloadRef` to a rendered prompt/command, serializes boots through its `vmSlot`, and tracks in-flight (running or queued) invocations for `Kill`; `firecrackerLauncher` (`launch.go`) is the real `vmLauncher` — boots the jailed microVM and drives it through to a result; `status.go` derives `RunResult.Status` and the fail-closed defaults from a `vsock` result |
 | `internal/launcher/jailer` | `jailer` argv/path construction — `--chroot-base-dir`, `--cgroup-version 2` explicit (required on cgroup-v2-only hosts, PoC Step 5 finding) |
 | `internal/launcher/fcapi` | Firecracker's own HTTP-over-unix-socket API client: `/boot-source`, `/drives`, `/machine-config`, `/network-interfaces`, `/mmds/config`, `/mmds`, `/vsock`, `/actions` |
 | `internal/launcher/mmds` | V2 session-token-required MMDS config/injection on top of `fcapi` — the only mode exposed, since V1 has no guest-side authentication at all |
@@ -33,12 +33,13 @@ v1 runs **one invocation at a time** — [§8](#8-known-gaps) covers what that t
 ```mermaid
 flowchart TB
     Launch["Launch RPC"] --> Render["PayloadRef -> prompt or command\n(prompts.Render / RenderCommand)\nunmapped -> InvalidArgument"]
-    Render --> Jailer["jailer starts: chroot + cgroup v2 + uid drop"]
+    Render --> Slot["wait for vmSlot\n(one boot at a time;\nKill while queued -> killed)"]
+    Slot --> Jailer["jailer starts: chroot + cgroup v2 + uid drop"]
     Jailer --> Stage["stage golden kernel/rootfs\n(plain copy, never hardlink+chown\n- PoC Step 5 ownership-mutation finding)"]
     Stage --> BootCfg["boot-source / drives / machine-config"]
     BootCfg --> Net["network-interfaces\n(the one static tap device egress.Setup owns)"]
     Net --> VsockCfg["vsock\n(only when a task or command was rendered)"]
-    VsockCfg --> MmdsCfg["mmds/config + mmds\n(TASK/LLM_* or COMMAND; never boot args)"]
+    VsockCfg --> MmdsCfg["mmds/config + mmds\n(TASK/LLM_* or COMMAND, + HTTP(S)_PROXY;\nnever boot args)"]
     MmdsCfg --> Start["InstanceStart"]
     Start --> Wait{"task or command\nrendered?"}
     Wait -->|no| Grace["grace-period alive-check\n(the bare-boot trivial payload)"]
@@ -48,9 +49,13 @@ flowchart TB
     Result --> Teardown
 ```
 
+The guest's only route out is the host forward proxy on the tap gateway, so `launch.go` adds `HTTP_PROXY`/`HTTPS_PROXY` (`egress.Config.ProxyURL()`, i.e. `http://172.16.0.1:8888`) to every agent-stage and command MMDS payload. Callers don't supply it. Without it OpenHands fails every LLM call on name resolution and exits 0 with no structured result.
+
 Every stage before `InstanceStart` fails closed — any error tears the microVM down and `Launch` returns `status: "error"`. Once running, an invocation ends one of four ways (`RunResult.Status`): `completed` (the guest reported a real result), `timed_out` (the launcher's own ceiling fired first), `killed` (an explicit `Kill` RPC pre-empted it — `context.WithCancelCause` distinguishes this from any other cancellation), or `error` (guest crash, or a missing/malformed result). The last three all fail closed — `has_blocking_finding: true` for agent-stage, a synthetic non-zero exit code for deterministic-step — never a false-clean default.
 
 `vsock.Listen` `chown`s the host-side `<uds_path>_<port>` socket file to the jailed process's own uid/gid (`LAUNCHER_JAILER_UID`/`GID`) — the same treatment jailer itself gives `/dev/kvm`/`/dev/net/tun`. Without it the socket file is owned by whoever the launcher process runs as (typically root), and Firecracker's own `connect(2)` to it on the guest's behalf — issued as the unprivileged jailed uid — fails with `EACCES` (`AF_UNIX` connect requires write permission on the target for the connecting process). This doesn't surface as a visible error: the guest's own `vsock_connect()` retries just keep failing and it gives up, which looks host-side like `WaitForResult`'s `Accept()` never firing at all — confirmed against a real KVM boot, not theoretical.
+
+When an invocation doesn't complete cleanly, the launcher logs the last 4 KiB of the guest's event log (redacted, ANSI escapes stripped) at `warn`. The control-plane doesn't call `ExtractLogs` for failed launches, so this log line is often the only place the failure cause shows up. The guest wrapper reports OpenHands' `ConversationErrorEvent` (code + detail) as the failure reason, instead of only "structured result unreadable".
 
 Teardown removes the invocation's jail directory tree (which covers the API socket, the `vsock` UDS, and the staged image copies — all nested under it) and kills the guest process if it isn't already dead. The tap device is **not** part of per-invocation teardown: [§10](../designs/completed/container-launcher-design.md#10-egress-v1-single-static-setup-not-pooled-automation) of the design treats egress as a static, process-lifetime setup, matching what the PoC itself observed (killing a guest doesn't tear its tap device down).
 
@@ -69,7 +74,11 @@ Implements `api/proto/launcher/v1/launcher.proto`'s `ContainerLauncherService` �
 
 `ExitCode` semantics differ by `StepType`: **agent-stage**'s is the guest wrapper's own exit code (`0` even when `has_blocking_finding: true` — a finding is information, not a launcher failure, matching the mock's existing behavior); **deterministic-step**'s is the guest command's real exit code, propagated directly (`DeterministicStepExecutor` derives `HasFinding` straight from `ExitCode != 0`).
 
-`Kill` cancels a still-running `Launch` call via a per-invocation `context.CancelCauseFunc` tracked while it's in flight; called after the invocation already finished, it returns `Killed: false` (not an error — a legitimate race, not a caller mistake).
+`InvocationId` must match `[A-Za-z0-9_-]`, since it's embedded in jail paths and jailer's `--id`. Anything else gets `codes.InvalidArgument`. The orchestrator's `executor.InvocationID` produces `<task_id>-r<round>-<step_id>`, which satisfies this. `launcher-mock` doesn't validate the ID, so only the real launcher catches a bad format.
+
+**Serialized execution.** Every microVM shares the one tap device, guest CID and MAC (`egress.DefaultConfig`, `launch.go`'s `guestCID`/`guestMAC`), so a second concurrent boot would fail with `EBUSY` on `tap0`. `launcherServer.Launch` therefore holds a single-slot `vmSlot` channel for the whole boot-to-teardown of an invocation. The orchestrator's `coreloop.fanOut` still dispatches a phase's steps concurrently (e.g. `review-with-commit` + `unit-tests`), and the extra `Launch` calls just block in the launcher until the slot frees up. If a wait lasts more than a second, `vm slot acquired` is logged with the wait time. The invocation timeout (`resolveTimeout`) starts only once the slot is acquired, so queue time doesn't count against it. Callers do see a longer RPC, though.
+
+`Kill` cancels a `Launch` call via a per-invocation `context.CancelCauseFunc`, registered as soon as the request is accepted. That covers an invocation that's running and one that's still queued for the slot. A queued one returns `status: "killed"` without ever booting. Called after the invocation already finished, `Kill` returns `Killed: false`. That's not an error: it's a legitimate race, not a caller mistake.
 
 ## 5. Configuration
 
@@ -84,11 +93,12 @@ Environment variables `cmd/container-launcher/config.go` reads:
 | `ADDR` | No (default `:9443`) | gRPC listen address, matching the mock |
 | `LAUNCHER_JAILER_UID` / `LAUNCHER_JAILER_GID` | No (default `123150`/`123150`) | The dedicated non-root uid/gid jailer drops privileges to, and the uid the static tap device is created for ([`internal/launcher/egress`](#2-modularity)) |
 | `LAUNCHER_DEFAULT_TIMEOUT_SECONDS` | No (default `1800`) | Hard ceiling applied whenever `LaunchRequest.TimeoutSeconds <= 0` — true of both executors today; a positive caller-supplied value overrides it |
+| `LOG_LEVEL` / `LOG_FORMAT` | No (default `info`/`text`) | `internal/logging`, shared with `cmd/control-plane`. `debug` adds every boot stage, each vsock envelope and the rendered prompt's prefix. `info` logs one line per RPC plus `launch accepted`/`microVM started`/`launch finished`. `LOG_FORMAT=json` switches to JSON output. Env values are never logged, only their keys |
 | `LAUNCHER_LLM_API_KEY` / `LAUNCHER_LLM_MODEL` | No | The coding agent's own LLM credentials — platform-level, not per-invocation (unlike `FORGEJO_TOKEN`, which arrives per-invocation in `LaunchRequest.Env`); only merged into MMDS for agent-stage invocations, so a deployment that only ever runs deterministic-step invocations doesn't need them |
 
 A missing required var makes the process `log.Fatalf` immediately, same fail-fast convention as `cmd/control-plane`.
 
-`internal/launcher/egress.DefaultConfig` fixes the tap device name/addressing (`tap0` at `172.16.0.1/30`, guest at `172.16.0.2/30`), the guest subnet the proxy allows (`172.16.0.0/24`), and the nftables table name — all hardcoded, matching the PoC's own validated values exactly rather than exposed as new configuration (design §10 frames this as a fixed, reused-as-is setup).
+`internal/launcher/egress.DefaultConfig` fixes the tap device name/addressing (`tap0` at `172.16.0.1/30`, guest at `172.16.0.2/30`), the guest subnet the proxy allows (`172.16.0.0/24`), the proxy (tinyproxy on port `8888`), and the nftables table name — all hardcoded, matching the PoC's own validated values exactly rather than exposed as new configuration (design §10 frames this as a fixed, reused-as-is setup).
 
 ## 6. Running it
 
@@ -96,7 +106,7 @@ Needs `/dev/kvm`, root (jailer requires it to set up the chroot/cgroup/uid-drop 
 
 Two things this repo does not automate:
 
-- **Golden image baking.** `internal/launcher/guest/guest_wrapper.py` and `guest-wrapper.service` must be manually copied into the golden rootfs image and the systemd unit enabled (patch the PoC's `customize-rootfs.sh` to `cp` them in before `mkfs.ext4 -d`, then `chroot ... systemctl enable guest-wrapper.service`) — the golden-image build/update pipeline itself is out of scope for the design.
+- **Golden image baking.** `internal/launcher/guest/guest_wrapper.py` and `guest-wrapper.service` run from the golden rootfs, not from this repo, so a change to either does nothing until it's baked in. They must be copied into the image and the systemd unit enabled. Locally that's done by `~/firecracker-poc/rootfs/bake-guest-wrapper.sh`, a host-side script outside this repo; see step 2 of the [manual-run runbook](../plans/coreloop-real-launcher-manual-run.md). The golden-image build/update pipeline itself is out of scope for the design.
 - **The guest's own static network config.** `guest_wrapper.py` assumes `eth0` already has `172.16.0.2/30` configured by the image's own boot-time network setup, matching the PoC's image exactly (there's no DHCP server on the tap side to assign one dynamically).
 
 Once those exist and the env vars in [§5](#5-configuration) point at them:
@@ -110,9 +120,9 @@ sudo ./container-launcher   # jailer needs root
 
 | Layer | Needs live deps? | Command | What it proves |
 |---|---|---|---|
-| Unit | No | `go test ./...` | `fcapi` against a fake HTTP-over-UDS server; `PayloadRef`→prompt/command mapping; `RunResult.Status` derivation and fail-closed defaults; instant-exit-0 detection; redaction; `resolveTimeout`/`statusForCancellation`; `egress`'s command-building and proxy-config idempotency logic; basic teardown |
-| Integration (real KVM) | Yes — `/dev/kvm` + root | `make test-launcher-kvm` | A real jailed Firecracker microVM boots end-to-end through this package's own code (jailer/fcapi/mmds/vsock/egress) with a trivial bare-boot payload, called in-process against the real `*launcherServer` — proves the mechanics work together for real, not just against fakes |
-| E2E (real KVM + real OpenHands + real Forgejo) | Yes | *(not built — [§8](#8-known-gaps))* | One real OpenHands agent-stage invocation producing a real PR, driven through the real gRPC server |
+| Unit | No | `go test ./...` | `fcapi` against a fake HTTP-over-UDS server; `PayloadRef`→prompt/command mapping; `RunResult.Status` derivation and fail-closed defaults; instant-exit-0 detection; redaction; `resolveTimeout`/`statusForCancellation`; `egress`'s command-building, proxy-config idempotency and `ProxyURL`; invocation-ID validation; VM-slot serialization (`TestLaunch_SerializesConcurrentInvocations`) and killing a queued invocation (`TestKill_PreemptsQueuedInvocation`); basic teardown |
+| Integration (real KVM) | Yes — `/dev/kvm` + root | `make test-launcher-kvm` | `TestLaunchKVM_BareBootTrivialPayload`: a real jailed Firecracker microVM boots end-to-end through this package's own code (jailer/fcapi/mmds/vsock/egress) with a trivial payload, called in-process against the real `*launcherServer`. `TestLaunchKVM_AgentStageRealForgejo`: one real OpenHands agent-stage invocation against a real Forgejo repo and branch. It runs only when `LAUNCHER_LLM_*`, `FORGEJO_URL`/`FORGEJO_TOKEN`, `TARGET_REPO` and `BRANCH` are set, and skips otherwise |
+| E2E (real KVM + control-plane + real Forgejo) | Yes | Manual: [`coreloop-real-launcher-manual-run.md`](../plans/coreloop-real-launcher-manual-run.md) | A real task driven through `control-plane` → real gRPC server → microVMs: branch creation, generate, PR, then review + unit-tests. Not automated ([§8](#8-known-gaps)) |
 
 `make test-launcher-kvm` fails fast with a clear message if `/dev/kvm` isn't present and readable/writable, before ever invoking `go test` — it's gated to a self-hosted or nested-virtualization-enabled runner, never standard hosted CI or the macOS dev loop. The Go test itself (`cmd/container-launcher/launcher_kvm_test.go`, build-tagged `launcherkvm` so `go test ./...` never picks it up) skips — rather than fails — if `/dev/kvm` or any of the real-binary/golden-image env vars from [§5](#5-configuration) aren't set, so it degrades gracefully when run directly outside `make`.
 
@@ -120,10 +130,9 @@ sudo ./container-launcher   # jailer needs root
 
 Real, needed work the design names as deliberately out of scope for this lean v1 — see [`container-launcher-design.md`](../designs/completed/container-launcher-design.md) §15 for the full list and rationale. The concrete, currently-missing pieces:
 
-- **No concurrency.** v1 runs one invocation at a time: a single fixed `guestCID`, tap device, and jail-relative image copy (per-invocation *full copy*, not the reflink/COW mechanism named as the follow-up design's primary subject). Running two invocations simultaneously today would collide.
+- **No concurrency.** v1 runs one invocation at a time: a single fixed `guestCID`, MAC and tap device, and a per-invocation *full copy* of the image (not the reflink/COW mechanism named as the follow-up design's primary subject). Concurrent `Launch` calls no longer collide, because they queue on `vmSlot` ([§4](#4-api--contracts)). The cost is wall-clock time: a review phase's steps run back to back, not in parallel, and one long invocation holds up every other task's steps on the same launcher.
 - **No orphan-sweep-on-restart, no retry-with-backoff on teardown failure.** Teardown is happy-path-and-explicit-kill only; a launcher crash mid-invocation can leak a jail directory.
 - **`GrantedScopes` is accepted but not enforced.** The proxy currently allows a fixed CIDR, not a policy-driven per-invocation allowlist.
-- **`make test-launcher-e2e` doesn't exist yet.** Needs a golden image with OpenHands actually installed, real LLM credentials, and a real Forgejo instance — the "one real OpenHands invocation producing a real PR" milestone the design's implementation sequence names, not yet exercised through the real gRPC server end to end in this repo (only proven by hand via the PoC's own console logs).
+- **No automated end-to-end test through the control-plane.** A real OpenHands invocation is covered in-process by `TestLaunchKVM_AgentStageRealForgejo`, and the full control-plane → launcher → PR path only by the manual runbook ([§7](#7-testing)). There's no `make test-launcher-e2e`.
 - **No `deploy/docker-compose.real-launcher.yml` or host-level systemd unit yet** — design §13's recommended deployment shape for running this binary isn't built.
 - **Privilege confinement and the gVisor fallback** (ADR-4) are both out of scope — this is a single privileged process, and there is no documented, explicit fallback path.
-- **No live KVM validation has been run against this exact Go implementation** — every mechanic (jailer args, MMDS handshake, `vsock` framing, egress rule) is reused directly from the PoC's own hand-driven validation, not re-proven against this code with a real boot.

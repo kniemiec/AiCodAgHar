@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Superseded by [`pre-generate-branch-creation.md`](pre-generate-branch-creation.md). It created the branch in `handleCreateTask`; branch creation now lives in `coreloop.RunRound`, before the generate step dispatches. Historical record only. |
 | **Date** | 2026-09-24 |
 | **Owner** | kniemiec |
 | **Purpose** | Close the gap where `GitHostClient.CreateOrUpdatePR` assumes the task's branch already exists in Forgejo, by having `handleCreateTask` create (or reuse) it itself, before opening the PR — keeping both git-structural side effects on the trusted control-plane side of the sandbox boundary. |

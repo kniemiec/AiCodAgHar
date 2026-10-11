@@ -38,6 +38,8 @@ make seed                  # provisions bot accounts + the global-baseline and s
 
 **Upgrading an existing stack across migration `006`** (failed status, `task_events`): stop the control-plane first — `docker compose -f deploy/docker-compose.yml stop control-plane` — then `make migrate`, rebuild (`docker compose -f deploy/docker-compose.yml build control-plane`) and `up -d`. `006` converts tasks the old code left `running` with an `error:` reason into retryable `failed` tasks, and a live `runLoop` could otherwise be flipped mid-flight. Afterwards, `GET /tasks/{id}/events` shows a task's timeline and, for a retryable failure, `curl -X POST localhost:8090/admin/tasks/<id>/retry -d '{"operator":"you"}'` resumes it.
 
+**Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). Set `LOG_FORMAT=json` to get `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` as fields. The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
+
 After that: Forgejo at `http://localhost:3001` (admin login `forgejo-admin` / `changeme-local-only` — **not** `:3000`, and **not** the reserved `admin` username), `control-plane` at `http://localhost:8080`.
 
 **If you change code** in `cmd/control-plane`, `mocks/pdp-mock`, `mocks/launcher-mock`, `mocks/secrets-mock`, or anything they import, rebuild the relevant image(s) — `docker compose up -d` alone does not rebuild:

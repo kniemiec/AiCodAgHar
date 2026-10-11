@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
@@ -40,7 +41,7 @@ type AgentStageExecutor struct {
 
 func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domain.StepRun, error) {
 	invocationID := InvocationID(sc)
-	log := stepLogger(sc)
+	ctx = stepContext(ctx, sc)
 
 	cred, err := mintCredential(ctx, e.Secrets, sc)
 	if err != nil {
@@ -49,7 +50,7 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 	defer revokeCredential(e.Secrets, sc, cred)
 
 	env := launchEnv(e.ForgejoURL, sc, cred)
-	log.DebugContext(ctx, "launch request", "payload_ref", sc.Step.StepID, "env_keys", logging.Keys(env), "granted_scopes", sc.GrantedScopes)
+	slog.DebugContext(ctx, "launch request", "payload_ref", sc.Step.StepID, "env_keys", logging.Keys(env), "granted_scopes", sc.GrantedScopes)
 	launchStarted := time.Now()
 	result, err := e.Launcher.Launch(ctx, launcherclient.LaunchRequest{
 		InvocationID:   invocationID,
@@ -62,20 +63,20 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 		TimeoutSeconds: 0,
 	})
 	if err != nil {
-		log.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
+		slog.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
 		auditLaunchFailure(e.Audit, sc, invocationID)
 		return domain.StepRun{}, classifyLaunchError(fmt.Errorf("launch agent-stage step %s: %w", sc.Step.StepID, err))
 	}
 
-	log.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
+	slog.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
 		"started_at", result.StartedAt, "finished_at", result.FinishedAt, "duration", time.Since(launchStarted))
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
 		return domain.StepRun{}, failure.Dependency(failure.DepLauncher, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err))
 	}
-	log.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
-		"structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))
+	slog.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
+		logging.Sensitive(), "structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))
 
 	var parsed agentStageResult
 	if len(logs.StructuredResultJSON) > 0 {

@@ -9,7 +9,9 @@ import (
 // config holds cmd/container-launcher's env-var contract
 // (docs/designs/completed/container-launcher-design.md §17).
 type config struct {
-	Addr       string
+	Addr string
+	// HealthAddr is the plain-HTTP /healthz,/readyz listener (LAUNCHER_HEALTH_ADDR).
+	HealthAddr string
 	CACert     string
 	ServerCert string
 	ServerKey  string
@@ -40,6 +42,7 @@ type config struct {
 func loadConfig() config {
 	cfg := config{
 		Addr:                  os.Getenv("ADDR"),
+		HealthAddr:            os.Getenv("LAUNCHER_HEALTH_ADDR"),
 		CACert:                requireEnv("TLS_CA_CERT"),
 		ServerCert:            requireEnv("TLS_SERVER_CERT"),
 		ServerKey:             requireEnv("TLS_SERVER_KEY"),
@@ -55,6 +58,9 @@ func loadConfig() config {
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = ":9443"
+	}
+	if cfg.HealthAddr == "" {
+		cfg.HealthAddr = "127.0.0.1:9444"
 	}
 	return cfg
 }

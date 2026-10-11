@@ -374,6 +374,16 @@ func RedactCounted(in string, secrets []string) (out string, n int)  // Redact u
 
 HTTP surface: `GET /tasks/{id}` (+ additive fields, status `failed`), `GET /tasks/{id}/events`, `GET /healthz`, `GET /readyz`; admin listener: `GET /admin/tasks`, `POST /admin/tasks/{id}/retry`. Launcher: plain-HTTP `/healthz`, `/readyz` on `LAUNCHER_HEALTH_ADDR`.
 
+**As built in PR B** (differences from §5/§8, narrowing or additive):
+
+- `internal/logging.Setup(component, extra ...slog.Handler)`: the fan-out is built but only stderr is wired; PR C passes the OTLP bridge as `extra`. `trace_id`/`span_id` enrichment is deferred to PR C/E with the OTel dependency, so LG-2's trace half is not yet met. `logging.NewHandler(w, …)` is exported so tests capture exactly what the process emits.
+- `WithStep` ignores empty arguments (keeps what ctx has), so the launcher client interceptor and `Kill` can add only an invocation id. The launcher has no round in its request, so its lines carry `task_id`/`step_id`/`invocation_id` but not `round`.
+- `callsites_test.go` exempts `main.go` and `config.go` (startup, `log.Fatalf`) for both `log.*` and non-context `slog.*`. It sees `slog.X(` / `log.X(` selector calls only, not methods on a `*slog.Logger` variable.
+- Sensitive records: launcher `prompt prefix`, `guest event log tail`, `structured result`, vsock guest-wrapper error; control-plane executor `logs extracted` (structured result). The webhook sender/repo names are logged, never payload bodies.
+- Health lives in a shared `internal/health` package (`Register`, `Prober`) used by both binaries. `/readyz` returns failing check *names* only (details at `warn`).
+- Control-plane readiness has no `harness_dependency_up` yet (metrics are PR C). `harness_build_info` likewise moves to PR C; PR B logs `version`/`commit` at startup and on every record.
+- The launcher's `/readyz` pings nothing external; its listener starts before `egress.Setup` so probes are answered (not refused) during setup. Launcher graceful shutdown is not part of PR B (design §8 scopes it to the control-plane).
+
 ### 16. Configuration reference
 
 | Variable | Binary | Default | Section |

@@ -13,6 +13,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 // Dependencies are what a Runner needs: coreloop's own dependencies, the
@@ -94,7 +95,7 @@ func (r *Runner) Start(ctx context.Context, task domain.Task) (taskID string, do
 	if err := r.deps.Store.CreateTask(ctx, task); err != nil {
 		return "", nil, fmt.Errorf("taskrunner: start %s: %w", task.ID, err)
 	}
-	slog.InfoContext(ctx, "task accepted", "task_id", task.ID, "target_repo", task.TargetRepo, "base_branch", task.BaseBranch,
+	slog.InfoContext(logging.WithTask(ctx, task.ID), "task accepted", "target_repo", task.TargetRepo, "base_branch", task.BaseBranch,
 		"branch", task.Branch, "risk_tier", task.RiskTier, "bot_account", task.BotAccount, "triggering_principal", task.TriggeringPrincipal)
 	ch := make(chan Result, 1)
 	// Deliberately context.Background(), not ctx: a task's execution must
@@ -115,6 +116,7 @@ func (r *Runner) Start(ctx context.Context, task domain.Task) (taskID string, do
 // task reaches a terminal outcome (or errors), rather than spawning another
 // background goroutine of its own.
 func (r *Runner) Resume(ctx context.Context, taskID string) (Result, error) {
+	ctx = logging.WithTask(ctx, taskID)
 	rec, ok, err := r.deps.Store.GetTask(ctx, taskID)
 	if err != nil {
 		return Result{}, fmt.Errorf("taskrunner: resume %s: load task: %w", taskID, err)
@@ -144,10 +146,12 @@ func (r *Runner) Resume(ctx context.Context, taskID string) (Result, error) {
 // every subsequent round starts fresh.
 func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, priorFindings []byte, alreadyCompleted map[string]domain.StepRun, resumeReason string, done chan<- Result) {
 	defer close(done)
+	ctx = logging.WithTask(ctx, task.ID)
 
 	var allRuns []domain.StepRun
 	for round := startRound; round <= coreloop.MaxRounds; round++ {
-		slog.InfoContext(ctx, "round started", "task_id", task.ID, "round", round, "pr_number", task.PRNumber, "reconciled_steps", len(alreadyCompleted))
+		ctx = logging.WithRound(ctx, round)
+		slog.InfoContext(ctx, "round started", "pr_number", task.PRNumber, "reconciled_steps", len(alreadyCompleted))
 		created, err := r.deps.Store.EnsureRound(ctx, task.ID, round)
 		if err != nil {
 			r.fail(ctx, task, round, fmt.Errorf("taskrunner: ensure round %d: %w", round, err), done)
@@ -169,7 +173,7 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 			return
 		}
 		allRuns = append(allRuns, res.StepRuns...)
-		slog.InfoContext(ctx, "round finished", "task_id", task.ID, "round", round,
+		slog.InfoContext(ctx, "round finished",
 			"outcome", res.Outcome, "reason", res.Reason, "pr_number", res.PRNumber, "step_runs", len(res.StepRuns))
 		// Task Intent Propagation design §5: RunRound may have just opened
 		// the review PR (task.PRNumber was 0 going in) — carry the result
@@ -226,7 +230,7 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 		}
 	}
 
-	slog.WarnContext(ctx, "round cap reached with blocking findings outstanding; escalating", "task_id", task.ID, "max_rounds", coreloop.MaxRounds)
+	slog.WarnContext(ctx, "round cap reached with blocking findings outstanding; escalating", "max_rounds", coreloop.MaxRounds)
 	// Round cap exceeded with blocking findings still outstanding — not a
 	// RunRound call, so it must persist/audit its own terminal outcome.
 	result := Result{
@@ -248,7 +252,8 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 // restart reconciliation recovers it — and the write failure is logged.
 func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err error, done chan<- Result) {
 	class, retryable, dep := failure.Classify(err)
-	slog.ErrorContext(ctx, "task failed", "task_id", task.ID, "round", round,
+	ctx = logging.WithRound(ctx, round)
+	slog.ErrorContext(ctx, "task failed",
 		"error_class", class, "retryable", retryable, "dependency", dep, "error", err)
 
 	reason := failure.Bound(err.Error())
@@ -264,7 +269,7 @@ func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err erro
 	ev := domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventTaskFailed, Payload: payload}
 	rec := domain.FailureRecord{TaskID: task.ID, Round: round, Class: string(class), Retryable: retryable, Reason: reason}
 	if serr := r.deps.Store.FailTask(ctx, rec, ev); serr != nil {
-		slog.ErrorContext(ctx, "could not persist task failure; task left running for reconciliation", "task_id", task.ID, "error", serr)
+		slog.ErrorContext(ctx, "could not persist task failure; task left running for reconciliation", "error", serr)
 	}
 	if done != nil {
 		done <- Result{TaskID: task.ID, Err: err}
@@ -515,8 +520,9 @@ func (r *Runner) Reconcile(ctx context.Context) error {
 	slog.InfoContext(ctx, "startup reconciliation", "running_tasks", len(ids))
 	for _, id := range ids {
 		go func(id string) {
-			if _, err := r.ReconcileTask(context.Background(), id); err != nil {
-				slog.Error("reconcile task failed", "task_id", id, "error", err)
+			ctx := logging.WithTask(context.Background(), id)
+			if _, err := r.ReconcileTask(ctx, id); err != nil {
+				slog.ErrorContext(ctx, "reconcile task failed", "error", err)
 			}
 		}(id)
 	}
@@ -537,6 +543,7 @@ func (r *Runner) Reconcile(ctx context.Context) error {
 // list of IDs, and reconciling twice, or after a task has already reached a
 // terminal state some other way, must be safe.
 func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, error) {
+	ctx = logging.WithTask(ctx, taskID)
 	rec, ok, err := r.deps.Store.GetTask(ctx, taskID)
 	if err != nil {
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: load task: %w", taskID, err)
@@ -597,7 +604,7 @@ func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, rou
 			resolved, resolvedOK := r.resolveLaunchedStep(ctx, task.ID, sr)
 			if !resolvedOK {
 				slog.WarnContext(ctx, "launched step could not be reconciled with the launcher; failing task",
-					"task_id", task.ID, "round", round, "step_id", sr.StepID, "invocation_id", sr.InvocationID)
+					"round", round, "step_id", sr.StepID, "invocation_id", sr.InvocationID)
 				return nil, failure.Dependency(failure.DepLauncher, fmt.Errorf(
 					"round %d: step %s (invocation %s) was still 'launched' at startup: %w",
 					round, sr.StepID, sr.InvocationID, errUnreconcilable))
@@ -624,9 +631,10 @@ func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, rou
 // existing "Phase N stub" stubs), not a claim that's exact for a real,
 // non-mocked launcher.
 func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr domain.StepRun) (domain.StepRun, bool) {
+	ctx = logging.WithStep(logging.WithRound(ctx, sr.Round), sr.StepID, sr.InvocationID)
 	logs, err := r.deps.Launcher.ExtractLogs(ctx, sr.InvocationID)
 	if err != nil {
-		slog.WarnContext(ctx, "reconcile: extract logs failed", "task_id", taskID, "step_id", sr.StepID, "invocation_id", sr.InvocationID, "error", err)
+		slog.WarnContext(ctx, "reconcile: extract logs failed", "error", err)
 		r.recordStepReconciled(ctx, taskID, sr, false)
 		return domain.StepRun{}, false
 	}
@@ -644,7 +652,7 @@ func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr doma
 		Status: domain.StepRunStatusCompleted,
 	}
 	if err := r.deps.Store.CompleteStepRun(ctx, taskID, sr.InvocationID, resolved, nil); err != nil {
-		slog.WarnContext(ctx, "reconcile: persist resolved step failed", "task_id", taskID, "step_id", sr.StepID, "error", err)
+		slog.WarnContext(ctx, "reconcile: persist resolved step failed", "error", err)
 	}
 	r.recordStepReconciled(ctx, taskID, sr, true)
 	return resolved, true
@@ -655,7 +663,7 @@ func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr doma
 func (r *Runner) recordStepReconciled(ctx context.Context, taskID string, sr domain.StepRun, resolved bool) {
 	if err := r.deps.Store.AppendEvents(ctx, domain.TaskEvent{TaskID: taskID, Round: sr.Round, StepID: sr.StepID, InvocationID: sr.InvocationID,
 		Type: domain.EventStepReconciled, Payload: map[string]any{"resolved": resolved}}); err != nil {
-		slog.WarnContext(ctx, "reconcile: record step.reconciled failed", "task_id", taskID, "step_id", sr.StepID, "error", err)
+		slog.WarnContext(ctx, "reconcile: record step.reconciled failed", "error", err)
 	}
 }
 
@@ -668,6 +676,7 @@ func (r *Runner) recordStepReconciled(ctx context.Context, taskID string, sr dom
 // operator is self-declared (there is no authn yet, N4) and recorded beside
 // remoteAddr.
 func (r *Runner) StartRetry(ctx context.Context, taskID, operator, remoteAddr string) (<-chan Result, error) {
+	ctx = logging.WithTask(ctx, taskID)
 	rec, ok, err := r.deps.Store.GetTask(ctx, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("taskrunner: retry %s: load task: %w", taskID, err)
@@ -685,7 +694,7 @@ func (r *Runner) StartRetry(ctx context.Context, taskID, operator, remoteAddr st
 		}
 		return nil, fmt.Errorf("taskrunner: retry %s: %w", taskID, err)
 	}
-	slog.InfoContext(ctx, "task retried by operator", "task_id", taskID, "operator", operator, "remote_addr", remoteAddr, "retry_count", state.RetryCount)
+	slog.InfoContext(ctx, "task retried by operator", "operator", operator, "remote_addr", remoteAddr, "retry_count", state.RetryCount)
 
 	done := make(chan Result, 1)
 	go func() {

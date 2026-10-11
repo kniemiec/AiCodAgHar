@@ -37,6 +37,11 @@ func (s *PostgresTaskStore) Close() error {
 	return s.db.Close()
 }
 
+// Ping checks the pool can reach Postgres (readiness, HL-1).
+func (s *PostgresTaskStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 // execer is the part of *sql.DB / *sql.Tx the helpers below need.
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)

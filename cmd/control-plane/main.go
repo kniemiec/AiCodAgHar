@@ -8,14 +8,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/kniemiec/AiCodAgHar/internal/buildinfo"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
@@ -25,6 +29,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/health"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
@@ -46,9 +51,12 @@ func main() {
 	}
 
 	slog.Info("control-plane starting",
+		"version", buildinfo.Version, "commit", buildinfo.Commit,
 		"addr", addr, "forgejo_url", forgejoURL, "pdp_url", pdpURL, "secrets_url", secretsURL,
 		"launcher_addr", launcherAddr, "orchestrator_instance_id", orchestratorInstanceID,
-		"webhook_approval_enabled", os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true")
+		"webhook_approval_enabled", os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true",
+		"task_max_retries", envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
+		"heartbeat_interval", envDuration("HEARTBEAT_INTERVAL", 5*time.Minute))
 
 	git, err := gitclient.NewClient(forgejoURL, forgejoToken)
 	if err != nil {
@@ -120,28 +128,69 @@ func main() {
 
 	srv := &server{git: git, secrets: secrets, runner: runner}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Readiness (design §8): both Postgres pools, plus the latest result of a
+	// background prober for the two fail-closed dependencies.
+	pdpProbe := health.NewProber("pdp", pdpURL)
+	secretsProbe := health.NewProber("secrets_issuer", secretsURL)
+	go pdpProbe.Run(ctx, probeInterval)
+	go secretsProbe.Run(ctx, probeInterval)
+
+	mux := newServeMux(srv)
+	health.Register(mux,
+		health.Check{Name: "orchestrator_db", Fn: taskStore.Ping},
+		health.Check{Name: "audit_db", Fn: auditWriter.Ping},
+		pdpProbe.Check(), secretsProbe.Check(),
+	)
+
 	// Admin listener: operator retry and the waiting/failed listing. Loopback
 	// by default because there is no authentication yet (N4).
 	adminAddr := os.Getenv("ADMIN_ADDR")
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:8090"
 	}
-	go func() {
-		slog.Info("control-plane admin listening", "addr", adminAddr)
-		if err := http.ListenAndServe(adminAddr, logRequests(newAdminMux(srv))); err != nil {
-			log.Fatalf("control-plane: admin listener: %v", err)
-		}
-	}()
+	servers := []*http.Server{
+		{Addr: addr, Handler: logRequests(mux)},
+		{Addr: adminAddr, Handler: logRequests(newAdminMux(srv))},
+	}
+	errCh := make(chan error, len(servers))
+	for _, hs := range servers {
+		go func() {
+			slog.Info("control-plane listening", "addr", hs.Addr)
+			errCh <- hs.ListenAndServe()
+		}()
+	}
 
-	slog.Info("control-plane listening", "addr", addr)
-	if err := http.ListenAndServe(addr, logRequests(newServeMux(srv))); err != nil {
-		log.Fatalf("control-plane: %v", err)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("control-plane: listener: %v", err)
+		}
+	case <-ctx.Done():
+		slog.Info("control-plane shutting down")
+	}
+
+	// In-flight task goroutines are not awaited: restart reconciliation
+	// resumes whatever they were doing (design §8).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	for _, hs := range servers {
+		if err := hs.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("control-plane: shutdown", "addr", hs.Addr, "error", err)
+		}
 	}
 }
 
+const (
+	probeInterval   = 10 * time.Second
+	shutdownTimeout = 5 * time.Second
+)
+
 // logRequests logs each request with its response status and duration.
-// GET /tasks/{id} logs at debug, since polling it would otherwise drown
-// everything else at info.
+// GET /tasks/{id} and the health endpoints log at debug, since polling them
+// would otherwise drown everything else at info.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -154,7 +203,7 @@ func logRequests(next http.Handler) http.Handler {
 			level = slog.LevelError
 		case rec.status >= 400:
 			level = slog.LevelWarn
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/tasks/"):
+		case r.Method == http.MethodGet && (strings.HasPrefix(r.URL.Path, "/tasks/") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz"):
 			level = slog.LevelDebug
 		}
 		slog.Log(r.Context(), level, "http request", "method", r.Method, "path", r.URL.Path,

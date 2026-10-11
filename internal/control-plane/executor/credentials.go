@@ -11,6 +11,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -32,7 +33,7 @@ func mintCredential(ctx context.Context, secrets secretsclient.SecretsClient, sc
 	if err != nil {
 		return secretsclient.Credential{}, failure.Dependency(failure.DepSecretsIssuer, fmt.Errorf("mint credential for %s as %s: %w", sc.Step.StepID, sc.Step.BotAccount, err))
 	}
-	stepLogger(sc).DebugContext(ctx, "credential minted", "credential_id", cred.ID, "bot_account", sc.Step.BotAccount, "scopes", sc.GrantedScopes, "ttl", credentialTTL)
+	slog.DebugContext(ctx, "credential minted", "credential_id", cred.ID, "bot_account", sc.Step.BotAccount, "scopes", sc.GrantedScopes, "ttl", credentialTTL)
 	return cred, nil
 }
 
@@ -41,7 +42,7 @@ func mintCredential(ctx context.Context, secrets secretsclient.SecretsClient, sc
 // best-effort cleanup that must not mask the step's own outcome.
 func revokeCredential(secrets secretsclient.SecretsClient, sc StepContext, cred secretsclient.Credential) {
 	if err := secrets.RevokeCredential(context.Background(), cred.ID); err != nil {
-		stepLogger(sc).Warn("credential revoke failed", "credential_id", cred.ID, "error", err)
+		slog.WarnContext(stepContext(context.Background(), sc), "credential revoke failed", "credential_id", cred.ID, "error", err)
 	}
 }
 
@@ -62,16 +63,19 @@ func classifyLaunchError(err error) error {
 	return failure.Infrastructure(err)
 }
 
-// stepLogger carries the correlation attributes every executor log line needs.
-func stepLogger(sc StepContext) *slog.Logger {
-	return slog.With("task_id", sc.Task.ID, "round", sc.Round, "step_id", sc.Step.StepID, "invocation_id", InvocationID(sc))
+// stepContext attaches the step's correlation attributes to ctx so every
+// executor log line carries them (idempotent when coreloop already did).
+func stepContext(ctx context.Context, sc StepContext) context.Context {
+	ctx = logging.WithTask(ctx, sc.Task.ID)
+	ctx = logging.WithRound(ctx, sc.Round)
+	return logging.WithStep(ctx, sc.Step.StepID, InvocationID(sc))
 }
 
 // auditLaunchFailure writes the failed-launch audit row, logging rather than
 // returning its own error so the launch error stays the one reported.
 func auditLaunchFailure(w audit.AuditWriter, sc StepContext, invocationID string) {
 	if err := auditStepRun(context.Background(), w, sc, invocationID, launcherclient.RunResult{InvocationID: invocationID, Status: "error"}); err != nil {
-		stepLogger(sc).Warn("audit of failed launch failed", "error", err)
+		slog.WarnContext(stepContext(context.Background(), sc), "audit of failed launch failed", "error", err)
 	}
 }
 

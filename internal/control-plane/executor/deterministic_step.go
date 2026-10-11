@@ -9,6 +9,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
@@ -62,7 +63,7 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
-		return domain.StepRun{}, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err)
+		return domain.StepRun{}, failure.Dependency(failure.DepLauncher, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err))
 	}
 	log.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
 		"structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -103,9 +104,11 @@ func main() {
 			OrchestratorInstanceID: orchestratorInstanceID,
 			IssueOpener:            git,
 			PRCreator:              git,
+			HeartbeatInterval:      envDuration("HEARTBEAT_INTERVAL", 5*time.Minute),
 		},
-		Store:    taskStore,
-		Launcher: launcher,
+		Store:      taskStore,
+		Launcher:   launcher,
+		MaxRetries: envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
 	})
 
 	// Startup reconciliation (design §4.2): resume any task left
@@ -116,6 +119,19 @@ func main() {
 	}
 
 	srv := &server{git: git, secrets: secrets, runner: runner}
+
+	// Admin listener: operator retry and the waiting/failed listing. Loopback
+	// by default because there is no authentication yet (N4).
+	adminAddr := os.Getenv("ADMIN_ADDR")
+	if adminAddr == "" {
+		adminAddr = "127.0.0.1:8090"
+	}
+	go func() {
+		slog.Info("control-plane admin listening", "addr", adminAddr)
+		if err := http.ListenAndServe(adminAddr, logRequests(newAdminMux(srv))); err != nil {
+			log.Fatalf("control-plane: admin listener: %v", err)
+		}
+	}()
 
 	slog.Info("control-plane listening", "addr", addr)
 	if err := http.ListenAndServe(addr, logRequests(newServeMux(srv))); err != nil {
@@ -154,6 +170,33 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// envInt reads a positive integer env var, falling back to def when unset;
+// a malformed value is a startup error rather than a silent default.
+func envInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Fatalf("control-plane: %s must be a non-negative integer, got %q", name, v)
+	}
+	return n
+}
+
+// envDuration reads a Go duration env var ("5m"), falling back to def when unset.
+func envDuration(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		log.Fatalf("control-plane: %s must be a non-negative duration like 5m, got %q", name, v)
+	}
+	return d
 }
 
 func requireEnv(name string) string {

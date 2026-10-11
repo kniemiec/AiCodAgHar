@@ -363,6 +363,15 @@ type LaunchError struct { Result RunResult; Outcome string; Err error }
 func RedactCounted(in string, secrets []string) (out string, n int)  // Redact unchanged
 ```
 
+**As built in PR A** (differences from the signatures above, all narrowing or additive):
+
+- `EnsureRound(ctx, taskID, round) (created bool, err error)` takes no `events`: the store derives `round.started` itself when it inserted the row; the runner appends `round.resumed` through `AppendEvents` when `created` is false.
+- `Runner.StartRetry(ctx, taskID, operator, remoteAddr) (<-chan Result, error)` does the compare-and-set synchronously and continues in a goroutine (so the admin handler can answer 202/409/404); `Runner.Retry` is `StartRetry` plus waiting. `ErrNotRetryable` aliases `domain.ErrNotRetryable` (the stores return it and can't import `taskrunner`); `ErrNoSuchTask` is new.
+- `domain.TaskEvent` also carries `ID` and `At` (store-assigned, read side); `domain.EventFilter`, `domain.TaskAge`, `domain.WaitActive(events, end)` and the event builders (`TaskAcceptedEvent`, `StepLaunchedEvent`, `StepResolvedEvent`, …) live in `domain/events.go` so the Postgres store and the fake derive identical events. `TaskState` also carries `AcceptedAt` (= `tasks.created_at`).
+- `coreloop.Dependencies` gains `HeartbeatInterval` beside `Events`; `taskrunner.Dependencies` gains `MaxRetries`.
+- `FleetSnapshot` and `LatestTraceContext` are not in PR A (they belong to PRs C and E). `step.resolved` carries no launcher timing fields until PR C.
+- Until the launcher outcome contract lands (PR C), launch errors are classed from the gRPC code alone (`Unavailable`/`DeadlineExceeded`/`Canceled` → dependency/launcher; `InvalidArgument` → platform; anything else → infrastructure). The `BOOT_FAILURE`/`KILLED`/`TIMEOUT`/`GUEST_ERROR` rows of the §2 table are therefore not yet distinguishable.
+
 HTTP surface: `GET /tasks/{id}` (+ additive fields, status `failed`), `GET /tasks/{id}/events`, `GET /healthz`, `GET /readyz`; admin listener: `GET /admin/tasks`, `POST /admin/tasks/{id}/retry`. Launcher: plain-HTTP `/healthz`, `/readyz` on `LAUNCHER_HEALTH_ADDR`.
 
 ### 16. Configuration reference

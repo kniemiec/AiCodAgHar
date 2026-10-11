@@ -3,6 +3,7 @@ package taskrunner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
 )
 
 // Dependencies are what a Runner needs: coreloop's own dependencies, the
@@ -23,7 +25,22 @@ type Dependencies struct {
 	Coreloop coreloop.Dependencies
 	Store    TaskStore
 	Launcher launcherclient.ContainerLauncher
+
+	// MaxRetries bounds operator retries per task (TASK_MAX_RETRIES). Zero
+	// means DefaultMaxRetries.
+	MaxRetries int
 }
+
+// DefaultMaxRetries is the operator-retry bound when Dependencies.MaxRetries
+// is unset.
+const DefaultMaxRetries = 3
+
+// ErrNotRetryable is returned by Retry/StartRetry for a task that is not a
+// retryable failed task with retries left.
+var ErrNotRetryable = domain.ErrNotRetryable
+
+// ErrNoSuchTask is returned by Retry/StartRetry for an unknown task ID.
+var ErrNoSuchTask = errors.New("no such task")
 
 // Result is a task's outcome across every round it ran, in the same shape
 // coreloop.Result used to be before this package took over looping. Err is
@@ -36,8 +53,11 @@ type Result struct {
 	Outcome   coreloop.Outcome
 	RoundsRun int
 	Reason    string
-	StepRuns  []domain.StepRun
-	Err       error
+	// ReasonKind classifies a stop-escalate Reason (domain.Reason*); empty
+	// for success and for failures.
+	ReasonKind string
+	StepRuns   []domain.StepRun
+	Err        error
 }
 
 // Runner drives one or more tasks through internal/control-plane/coreloop.RunRound,
@@ -54,6 +74,10 @@ type Runner struct {
 func NewRunner(deps Dependencies) *Runner {
 	deps.Coreloop.Recorder = stepRunRecorder{store: deps.Store}
 	deps.Coreloop.PRRecorder = deps.Store
+	deps.Coreloop.Events = deps.Store
+	if deps.MaxRetries <= 0 {
+		deps.MaxRetries = DefaultMaxRetries
+	}
 	return &Runner{deps: deps}
 }
 
@@ -77,7 +101,7 @@ func (r *Runner) Start(ctx context.Context, task domain.Task) (taskID string, do
 	// outlive the HTTP request that started it (the whole point of this
 	// design) — its lifetime is governed by taskrunner's own loop, not the
 	// caller's request context.
-	go r.runLoop(context.Background(), task, 1, nil, nil, ch)
+	go r.runLoop(context.Background(), task, 1, nil, nil, "", ch)
 	return task.ID, ch, nil
 }
 
@@ -100,16 +124,15 @@ func (r *Runner) Resume(ctx context.Context, taskID string) (Result, error) {
 	}
 
 	round := rec.State.CurrentRound + 1
-	alreadyCompleted, escalated, ok, err := r.loadAlreadyCompleted(ctx, rec.Task, round)
+	done := make(chan Result, 1)
+	alreadyCompleted, err := r.loadAlreadyCompleted(ctx, rec.Task, round)
 	if err != nil {
+		if r.failUnreconcilable(ctx, rec.Task, round, err, done) {
+			return <-done, nil
+		}
 		return Result{}, fmt.Errorf("taskrunner: resume %s: %w", taskID, err)
 	}
-	if !ok {
-		return escalated, nil
-	}
-
-	done := make(chan Result, 1)
-	r.runLoop(ctx, rec.Task, round, rec.State.PriorFindings, alreadyCompleted, done)
+	r.runLoop(ctx, rec.Task, round, rec.State.PriorFindings, alreadyCompleted, domain.RoundResumeApproval, done)
 	return <-done, nil
 }
 
@@ -119,16 +142,25 @@ func (r *Runner) Resume(ctx context.Context, taskID string) (Result, error) {
 // non-nil from Reconcile) is consumed on the first round only — a
 // reconciled round's remaining steps, if any, are dispatched normally, and
 // every subsequent round starts fresh.
-func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, priorFindings []byte, alreadyCompleted map[string]domain.StepRun, done chan<- Result) {
+func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, priorFindings []byte, alreadyCompleted map[string]domain.StepRun, resumeReason string, done chan<- Result) {
 	defer close(done)
 
 	var allRuns []domain.StepRun
 	for round := startRound; round <= coreloop.MaxRounds; round++ {
 		slog.InfoContext(ctx, "round started", "task_id", task.ID, "round", round, "pr_number", task.PRNumber, "reconciled_steps", len(alreadyCompleted))
-		if err := r.deps.Store.EnsureRound(ctx, task.ID, round); err != nil {
+		created, err := r.deps.Store.EnsureRound(ctx, task.ID, round)
+		if err != nil {
 			r.fail(ctx, task, round, fmt.Errorf("taskrunner: ensure round %d: %w", round, err), done)
 			return
 		}
+		if !created && resumeReason != "" {
+			if err := r.deps.Store.AppendEvents(ctx, domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventRoundResumed,
+				Payload: map[string]any{"reason": resumeReason}}); err != nil {
+				r.fail(ctx, task, round, fmt.Errorf("taskrunner: record round %d resumed: %w", round, err), done)
+				return
+			}
+		}
+		resumeReason = "" // only the first round of a loop is a resumption
 
 		res, err := coreloop.RunRound(ctx, r.deps.Coreloop, task, round, priorFindings, alreadyCompleted)
 		alreadyCompleted = nil // only ever applies to the round it was built for
@@ -154,7 +186,7 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 				TaskID: task.ID, Status: domain.TaskStatusRunning, CurrentRound: round,
 				PriorFindings: priorFindings, UpdatedAt: time.Now(),
 			}
-			if err := r.deps.Store.UpdateTaskState(ctx, state); err != nil {
+			if err := r.deps.Store.UpdateTaskState(ctx, state, roundFinishedEvent(task.ID, round, res)); err != nil {
 				r.fail(ctx, task, round, fmt.Errorf("taskrunner: persist round %d state: %w", round, err), done)
 				return
 			}
@@ -171,7 +203,8 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 				TaskID: task.ID, Status: domain.TaskStatusWaitingApproval, CurrentRound: round - 1,
 				ApprovalIssueNumber: &issueNum, PriorFindings: priorFindings, UpdatedAt: time.Now(),
 			}
-			if err := r.deps.Store.UpdateTaskState(ctx, state); err != nil {
+			requested := domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventApprovalRequested, Payload: map[string]any{"issue_number": issueNum}}
+			if err := r.deps.Store.UpdateTaskState(ctx, state, requested); err != nil {
 				r.fail(ctx, task, round, fmt.Errorf("taskrunner: persist waiting_approval state for round %d: %w", round, err), done)
 				return
 			}
@@ -179,8 +212,8 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 			return
 
 		case coreloop.OutcomeStopSuccess, coreloop.OutcomeStopEscalate:
-			result := Result{TaskID: task.ID, Outcome: res.Outcome, RoundsRun: round, Reason: res.Reason, StepRuns: allRuns}
-			if err := r.finish(ctx, task, round, result, nil); err != nil {
+			result := Result{TaskID: task.ID, Outcome: res.Outcome, RoundsRun: round, Reason: res.Reason, ReasonKind: res.ReasonKind, StepRuns: allRuns}
+			if err := r.finish(ctx, task, round, result, nil, roundFinishedEvent(task.ID, round, res)); err != nil {
 				r.fail(ctx, task, round, err, done)
 				return
 			}
@@ -198,7 +231,7 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 	// RunRound call, so it must persist/audit its own terminal outcome.
 	result := Result{
 		TaskID: task.ID, Outcome: coreloop.OutcomeStopEscalate, RoundsRun: coreloop.MaxRounds,
-		Reason: "round cap reached with blocking findings outstanding", StepRuns: allRuns,
+		Reason: "round cap reached with blocking findings outstanding", ReasonKind: domain.ReasonRoundCap, StepRuns: allRuns,
 	}
 	if err := r.finish(ctx, task, coreloop.MaxRounds, result, nil); err != nil {
 		r.fail(ctx, task, coreloop.MaxRounds, err, done)
@@ -207,17 +240,65 @@ func (r *Runner) runLoop(ctx context.Context, task domain.Task, startRound int, 
 	done <- result
 }
 
-// fail ends runLoop on an error. Before this, the error only reached the
-// done channel, which the HTTP handlers discard, so a failed task stayed
-// status=running with no trace anywhere. It now logs at error and records
-// the error in the task's reason column for GET /tasks/{id}. Status stays
-// running on purpose, so startup reconciliation still retries the task.
+// fail ends runLoop on an error: the task moves to status=failed with the
+// error's class and retryability (design §2), one task.failed event in the
+// same transaction, and an error-level log line. A retryable failure waits
+// for an operator retry; a restart never resumes a failed task. If the
+// failure itself cannot be persisted (Postgres down) the task stays running —
+// restart reconciliation recovers it — and the write failure is logged.
 func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err error, done chan<- Result) {
-	slog.ErrorContext(ctx, "task failed; left status=running for reconciliation", "task_id", task.ID, "round", round, "error", err)
-	if serr := r.deps.Store.SetTaskReason(ctx, task.ID, "error: "+err.Error()); serr != nil {
-		slog.WarnContext(ctx, "could not persist task failure reason", "task_id", task.ID, "error", serr)
+	class, retryable, dep := failure.Classify(err)
+	slog.ErrorContext(ctx, "task failed", "task_id", task.ID, "round", round,
+		"error_class", class, "retryable", retryable, "dependency", dep, "error", err)
+
+	reason := failure.Bound(err.Error())
+	payload := map[string]any{"error_class": string(class), "retryable": retryable, "error": reason}
+	if dep != "" {
+		payload["dependency"] = dep
 	}
-	done <- Result{TaskID: task.ID, Err: err}
+	if !retryable {
+		if rec, ok, gerr := r.deps.Store.GetTask(ctx, task.ID); gerr == nil && ok && !rec.State.AcceptedAt.IsZero() {
+			payload["wall_ms"] = time.Since(rec.State.AcceptedAt).Milliseconds()
+		}
+	}
+	ev := domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventTaskFailed, Payload: payload}
+	rec := domain.FailureRecord{TaskID: task.ID, Round: round, Class: string(class), Retryable: retryable, Reason: reason}
+	if serr := r.deps.Store.FailTask(ctx, rec, ev); serr != nil {
+		slog.ErrorContext(ctx, "could not persist task failure; task left running for reconciliation", "task_id", task.ID, "error", serr)
+	}
+	if done != nil {
+		done <- Result{TaskID: task.ID, Err: err}
+	}
+}
+
+// failUnreconcilable fails the task when err says a launched step could not be
+// reconciled with the launcher (a retryable dependency failure — not an
+// audited escalation any more, design §2). It reports whether err was that
+// case; any other load error is left to the caller, with no state change.
+func (r *Runner) failUnreconcilable(ctx context.Context, task domain.Task, round int, err error, done chan<- Result) bool {
+	if !errors.Is(err, errUnreconcilable) {
+		return false
+	}
+	r.fail(ctx, task, round, err, done)
+	return true
+}
+
+// errUnreconcilable marks loadAlreadyCompleted's "launched step could not be
+// resolved against the launcher" error.
+var errUnreconcilable = errors.New("launched step could not be reconciled with the launcher")
+
+// roundFinishedEvent describes a round that ran to completion (continue or
+// stop-*); a waiting-approval round hasn't finished and never gets one.
+func roundFinishedEvent(taskID string, round int, res coreloop.RoundResult) domain.TaskEvent {
+	blockingSteps := 0
+	for _, sr := range res.StepRuns {
+		if sr.Blocking && sr.HasFinding {
+			blockingSteps++
+		}
+	}
+	return domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventRoundFinished, Payload: map[string]any{
+		"outcome": string(res.Outcome), "blocking_findings": blockingSteps > 0, "blocking_steps": blockingSteps,
+	}}
 }
 
 // approvalEvidence carries an approve-phase gate's real verification outcome
@@ -235,13 +316,33 @@ type approvalEvidence struct {
 // to do internally before this package took over looping. approvalOutcome is
 // non-nil only when a rejection is what produced this terminal result
 // (RecordRejection); every other caller passes nil.
-func (r *Runner) finish(ctx context.Context, task domain.Task, round int, result Result, approvalOutcome *approvalEvidence) error {
+func (r *Runner) finish(ctx context.Context, task domain.Task, round int, result Result, approvalOutcome *approvalEvidence, preceding ...domain.TaskEvent) error {
 	status := domain.TaskStatusStopSuccess
+	outcome := "success"
 	if result.Outcome == coreloop.OutcomeStopEscalate {
 		status = domain.TaskStatusStopEscalate
+		outcome = "escalated"
 	}
-	state := domain.TaskState{TaskID: task.ID, Status: status, CurrentRound: round, Reason: result.Reason, UpdatedAt: time.Now()}
-	if err := r.deps.Store.UpdateTaskState(ctx, state); err != nil {
+
+	// wall/wait/active (design §4) come from the committed events plus the
+	// ones this very write adds, which aren't visible yet.
+	now := time.Now()
+	history, err := r.deps.Store.ListEvents(ctx, task.ID, domain.EventFilter{})
+	if err != nil {
+		return fmt.Errorf("taskrunner: load events for %s: %w", task.ID, err)
+	}
+	for _, e := range preceding {
+		e.At = now
+		history = append(history, e)
+	}
+	wall, wait, _ := domain.WaitActive(history, now)
+	finished := domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventTaskFinished, Payload: map[string]any{
+		"outcome": outcome, "reason_kind": result.ReasonKind, "rounds": round,
+		"wall_ms": wall.Milliseconds(), "wait_ms": wait.Milliseconds(),
+	}}
+
+	state := domain.TaskState{TaskID: task.ID, Status: status, CurrentRound: round, Reason: result.Reason, UpdatedAt: now}
+	if err := r.deps.Store.UpdateTaskState(ctx, state, append(preceding, finished)...); err != nil {
 		return fmt.Errorf("taskrunner: persist terminal state for %s: %w", task.ID, err)
 	}
 	if r.deps.Coreloop.Audit == nil {
@@ -318,7 +419,8 @@ func (r *Runner) RecordApproval(ctx context.Context, taskID, approvedBy, evidenc
 		ApprovalIssueNumber: rec.State.ApprovalIssueNumber, ApprovedBy: approvedBy,
 		PriorFindings: rec.State.PriorFindings, UpdatedAt: time.Now(),
 	}
-	if err := r.deps.Store.UpdateTaskState(ctx, state); err != nil {
+	granted := domain.TaskEvent{TaskID: taskID, Round: rec.State.CurrentRound + 1, Type: domain.EventApprovalGranted, Payload: map[string]any{"by": approvedBy}}
+	if err := r.deps.Store.UpdateTaskState(ctx, state, granted); err != nil {
 		return fmt.Errorf("taskrunner: record approval for %s: %w", taskID, err)
 	}
 	return r.auditApprovalGranted(ctx, rec.Task, rec.State.CurrentRound+1, approvedBy, evidence)
@@ -339,9 +441,10 @@ func (r *Runner) RecordRejection(ctx context.Context, taskID, rejectedBy, eviden
 	round := rec.State.CurrentRound + 1
 	result := Result{
 		TaskID: taskID, Outcome: coreloop.OutcomeStopEscalate, RoundsRun: round,
-		Reason: fmt.Sprintf("approval rejected by %s", rejectedBy),
+		Reason: fmt.Sprintf("approval rejected by %s", rejectedBy), ReasonKind: domain.ReasonApprovalRejected,
 	}
-	return r.finish(ctx, rec.Task, round, result, &approvalEvidence{Approved: false, ApprovedBy: rejectedBy, Evidence: evidence})
+	rejected := domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventApprovalRejected, Payload: map[string]any{"by": rejectedBy}}
+	return r.finish(ctx, rec.Task, round, result, &approvalEvidence{Approved: false, ApprovedBy: rejectedBy, Evidence: evidence}, rejected)
 }
 
 // TaskStatus is a task's current, queryable state — GET /tasks/{id}'s
@@ -369,6 +472,25 @@ func (r *Runner) GetTaskStatus(ctx context.Context, taskID string) (TaskStatus, 
 		return TaskStatus{}, false, fmt.Errorf("taskrunner: get status %s: %w", taskID, err)
 	}
 	return TaskStatus{Task: rec.Task, State: rec.State, StepRuns: stepRuns}, true, nil
+}
+
+// TaskEvents returns a task's recorded events (GET /tasks/{id}/events). ok is
+// false if no such task exists.
+func (r *Runner) TaskEvents(ctx context.Context, taskID string, f domain.EventFilter) (events []domain.TaskEvent, ok bool, err error) {
+	if _, ok, err := r.deps.Store.GetTask(ctx, taskID); err != nil || !ok {
+		return nil, false, err
+	}
+	events, err = r.deps.Store.ListEvents(ctx, taskID, f)
+	if err != nil {
+		return nil, false, fmt.Errorf("taskrunner: events for %s: %w", taskID, err)
+	}
+	return events, true, nil
+}
+
+// TasksByStatus lists tasks currently in status with how long each has been
+// there (the admin listing).
+func (r *Runner) TasksByStatus(ctx context.Context, status string) ([]domain.TaskAge, error) {
+	return r.deps.Store.ListTasksByStatus(ctx, status)
 }
 
 // FindWaitingApprovalTask looks up the task currently waiting on
@@ -431,16 +553,20 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 	// a duplicate "task-outcome" audit write or a fresh, blind re-dispatch
 	// of that in-flight round's agent work.
 	round := rec.State.CurrentRound + 1
-	alreadyCompleted, escalated, ok, err := r.loadAlreadyCompleted(ctx, rec.Task, round)
+	done := make(chan Result, 1)
+	alreadyCompleted, err := r.loadAlreadyCompleted(ctx, rec.Task, round)
 	if err != nil {
+		if r.failUnreconcilable(ctx, rec.Task, round, err, done) {
+			result := <-done
+			return result, result.Err
+		}
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: %w", taskID, err)
 	}
-	if !ok {
-		return escalated, nil
+	if err := r.deps.Store.AppendEvents(ctx, domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventTaskReconciled,
+		Payload: map[string]any{"from_status": rec.State.Status, "resume_round": round, "completed_steps": len(alreadyCompleted)}}); err != nil {
+		return Result{}, fmt.Errorf("taskrunner: reconcile %s: %w", taskID, err)
 	}
-
-	done := make(chan Result, 1)
-	r.runLoop(ctx, rec.Task, round, rec.State.PriorFindings, alreadyCompleted, done)
+	r.runLoop(ctx, rec.Task, round, rec.State.PriorFindings, alreadyCompleted, domain.RoundResumeReconcile, done)
 	result := <-done
 	return result, result.Err
 }
@@ -450,17 +576,18 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 // pausing (for an approve-phase gate, design §4.4) or crashing mid-round
 // (design §4.2): completed rows are reused as-is, a still-"launched" row is
 // resolved against the launcher, and a failed row is left out so RunRound
-// retries it. ok is false only when a still-"launched" row couldn't be
-// resolved — escalated is then the terminal Result already persisted/
-// audited for that case, and the caller must return it as-is rather than
-// proceeding to runLoop.
-func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, round int) (alreadyCompleted map[string]domain.StepRun, escalated Result, ok bool, err error) {
+// retries it. A still-"launched" row that can't be resolved yields an error
+// wrapping errUnreconcilable and classed as a retryable launcher-dependency
+// failure — the caller fails the task rather than guessing (it used to
+// escalate with an audit row; an infrastructure fault is not an outcome of
+// authority).
+func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, round int) (map[string]domain.StepRun, error) {
 	stepRuns, err := r.deps.Store.ListStepRuns(ctx, task.ID, round)
 	if err != nil {
-		return nil, Result{}, false, fmt.Errorf("round %d: list step_runs: %w", round, err)
+		return nil, fmt.Errorf("round %d: list step_runs: %w", round, err)
 	}
 
-	alreadyCompleted = map[string]domain.StepRun{}
+	alreadyCompleted := map[string]domain.StepRun{}
 	for _, sr := range stepRuns {
 		switch sr.Status {
 		case domain.StepRunStatusCompleted:
@@ -469,17 +596,11 @@ func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, rou
 		case domain.StepRunStatusLaunched:
 			resolved, resolvedOK := r.resolveLaunchedStep(ctx, task.ID, sr)
 			if !resolvedOK {
-				slog.WarnContext(ctx, "launched step could not be reconciled with the launcher; escalating",
+				slog.WarnContext(ctx, "launched step could not be reconciled with the launcher; failing task",
 					"task_id", task.ID, "round", round, "step_id", sr.StepID, "invocation_id", sr.InvocationID)
-				reason := fmt.Sprintf(
-					"round %d: step %s (invocation %s) was still 'launched' at startup and could not be reconciled with the launcher",
-					round, sr.StepID, sr.InvocationID,
-				)
-				result := Result{TaskID: task.ID, Outcome: coreloop.OutcomeStopEscalate, RoundsRun: round, Reason: reason}
-				if err := r.finish(ctx, task, round, result, nil); err != nil {
-					return nil, Result{}, false, err
-				}
-				return nil, result, false, nil
+				return nil, failure.Dependency(failure.DepLauncher, fmt.Errorf(
+					"round %d: step %s (invocation %s) was still 'launched' at startup: %w",
+					round, sr.StepID, sr.InvocationID, errUnreconcilable))
 			}
 			alreadyCompleted[sr.StepID] = resolved
 
@@ -488,7 +609,7 @@ func (r *Runner) loadAlreadyCompleted(ctx context.Context, task domain.Task, rou
 			// redispatches it.
 		}
 	}
-	return alreadyCompleted, Result{}, true, nil
+	return alreadyCompleted, nil
 }
 
 // resolveLaunchedStep re-queries a still-"launched" step's real outcome.
@@ -506,6 +627,7 @@ func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr doma
 	logs, err := r.deps.Launcher.ExtractLogs(ctx, sr.InvocationID)
 	if err != nil {
 		slog.WarnContext(ctx, "reconcile: extract logs failed", "task_id", taskID, "step_id", sr.StepID, "invocation_id", sr.InvocationID, "error", err)
+		r.recordStepReconciled(ctx, taskID, sr, false)
 		return domain.StepRun{}, false
 	}
 
@@ -524,5 +646,70 @@ func (r *Runner) resolveLaunchedStep(ctx context.Context, taskID string, sr doma
 	if err := r.deps.Store.CompleteStepRun(ctx, taskID, sr.InvocationID, resolved, nil); err != nil {
 		slog.WarnContext(ctx, "reconcile: persist resolved step failed", "task_id", taskID, "step_id", sr.StepID, "error", err)
 	}
+	r.recordStepReconciled(ctx, taskID, sr, true)
 	return resolved, true
+}
+
+// recordStepReconciled appends step.reconciled. Best effort: reconciliation
+// already decides the task's fate on its own, and the event is only history.
+func (r *Runner) recordStepReconciled(ctx context.Context, taskID string, sr domain.StepRun, resolved bool) {
+	if err := r.deps.Store.AppendEvents(ctx, domain.TaskEvent{TaskID: taskID, Round: sr.Round, StepID: sr.StepID, InvocationID: sr.InvocationID,
+		Type: domain.EventStepReconciled, Payload: map[string]any{"resolved": resolved}}); err != nil {
+		slog.WarnContext(ctx, "reconcile: record step.reconciled failed", "task_id", taskID, "step_id", sr.StepID, "error", err)
+	}
+}
+
+// StartRetry is the operator-retry entry point (design §2): a compare-and-set
+// that moves a retryable failed task with retries left back to running and
+// records task.retried, then continues it exactly as startup reconciliation
+// would — in a goroutine, so the caller (the admin handler) answers 202
+// immediately. The Result arrives on the returned channel. ErrNoSuchTask and
+// ErrNotRetryable are returned synchronously, before anything changes.
+// operator is self-declared (there is no authn yet, N4) and recorded beside
+// remoteAddr.
+func (r *Runner) StartRetry(ctx context.Context, taskID, operator, remoteAddr string) (<-chan Result, error) {
+	rec, ok, err := r.deps.Store.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("taskrunner: retry %s: load task: %w", taskID, err)
+	}
+	if !ok {
+		return nil, ErrNoSuchTask
+	}
+	ev := domain.TaskEvent{TaskID: taskID, Round: rec.State.CurrentRound + 1, Type: domain.EventTaskRetried, Payload: map[string]any{
+		"triggered_by": operator, "remote_addr": remoteAddr, "retry_count": rec.State.RetryCount + 1,
+	}}
+	state, err := r.deps.Store.RetryTask(ctx, taskID, r.deps.MaxRetries, ev)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotRetryable) {
+			return nil, ErrNotRetryable
+		}
+		return nil, fmt.Errorf("taskrunner: retry %s: %w", taskID, err)
+	}
+	slog.InfoContext(ctx, "task retried by operator", "task_id", taskID, "operator", operator, "remote_addr", remoteAddr, "retry_count", state.RetryCount)
+
+	done := make(chan Result, 1)
+	go func() {
+		// Deliberately not ctx: the continuation outlives the admin request.
+		bg := context.Background()
+		round := state.CurrentRound + 1
+		alreadyCompleted, err := r.loadAlreadyCompleted(bg, rec.Task, round)
+		if err != nil {
+			if !r.failUnreconcilable(bg, rec.Task, round, err, done) {
+				r.fail(bg, rec.Task, round, err, done)
+			}
+			close(done)
+			return
+		}
+		r.runLoop(bg, rec.Task, round, state.PriorFindings, alreadyCompleted, domain.RoundResumeRetry, done)
+	}()
+	return done, nil
+}
+
+// Retry is StartRetry that waits for the continuation's terminal Result.
+func (r *Runner) Retry(ctx context.Context, taskID, operator, remoteAddr string) (Result, error) {
+	done, err := r.StartRetry(ctx, taskID, operator, remoteAddr)
+	if err != nil {
+		return Result{}, err
+	}
+	return <-done, nil
 }

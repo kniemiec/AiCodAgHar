@@ -10,6 +10,9 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // credentialTTL is a Phase 4 stub constant: real per-step TTL sizing (e.g.
@@ -27,7 +30,7 @@ func mintCredential(ctx context.Context, secrets secretsclient.SecretsClient, sc
 		TTL:          credentialTTL,
 	})
 	if err != nil {
-		return secretsclient.Credential{}, fmt.Errorf("mint credential for %s as %s: %w", sc.Step.StepID, sc.Step.BotAccount, err)
+		return secretsclient.Credential{}, failure.Dependency(failure.DepSecretsIssuer, fmt.Errorf("mint credential for %s as %s: %w", sc.Step.StepID, sc.Step.BotAccount, err))
 	}
 	stepLogger(sc).DebugContext(ctx, "credential minted", "credential_id", cred.ID, "bot_account", sc.Step.BotAccount, "scopes", sc.GrantedScopes, "ttl", credentialTTL)
 	return cred, nil
@@ -40,6 +43,23 @@ func revokeCredential(secrets secretsclient.SecretsClient, sc StepContext, cred 
 	if err := secrets.RevokeCredential(context.Background(), cred.ID); err != nil {
 		stepLogger(sc).Warn("credential revoke failed", "credential_id", cred.ID, "error", err)
 	}
+}
+
+// classifyLaunchError classes a ContainerLauncher.Launch error by gRPC code
+// alone: the launcher's per-outcome detail (BOOT_FAILURE vs GUEST_ERROR vs
+// TIMEOUT) arrives with the launcher outcome contract (design §7) and will
+// refine this. Until then Unavailable/DeadlineExceeded/Canceled mean the
+// launcher itself was unreachable (dependency), InvalidArgument is our own
+// bad request (platform), and anything else the launcher reports — in
+// practice a failed boot — is an infrastructure fault.
+func classifyLaunchError(err error) error {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return failure.Dependency(failure.DepLauncher, err)
+	case codes.InvalidArgument:
+		return failure.Platform(err)
+	}
+	return failure.Infrastructure(err)
 }
 
 // stepLogger carries the correlation attributes every executor log line needs.

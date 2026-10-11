@@ -80,13 +80,22 @@ const (
 // (eventually, §4.4) pauses it for approval.
 type TaskState struct {
 	TaskID              string
-	Status              string // running | waiting_approval | stop_success | stop_escalate
+	Status              string // running | waiting_approval | stop_success | stop_escalate | failed
 	CurrentRound        int
 	ApprovalIssueNumber *int
 	ApprovedBy          string
 	PriorFindings       []byte
 	Reason              string
 	UpdatedAt           time.Time
+
+	// Failure bookkeeping (design §2): set while Status == failed, cleared by
+	// a retry. FinishedAt is set on stop_success, stop_escalate and a
+	// terminal failed; nil otherwise. AcceptedAt is tasks.created_at.
+	ErrorClass string
+	Retryable  bool
+	RetryCount int
+	AcceptedAt time.Time
+	FinishedAt *time.Time
 }
 
 // orchestrator.tasks.status values (design §4.2). Note the underscores —
@@ -98,6 +107,7 @@ const (
 	TaskStatusWaitingApproval = "waiting_approval"
 	TaskStatusStopSuccess     = "stop_success"
 	TaskStatusStopEscalate    = "stop_escalate"
+	TaskStatusFailed          = "failed"
 )
 
 // TaskRecord is a Task joined with its live TaskState — what TaskStore.GetTask

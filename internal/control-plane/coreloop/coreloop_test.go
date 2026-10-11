@@ -635,3 +635,96 @@ func TestRunRound_AlreadyCompletedStepsAreSkipped(t *testing.T) {
 		t.Fatalf("expected stop-success, got %v (%s)", res.Outcome, res.Reason)
 	}
 }
+
+// recordingAppender is a coreloop.EventAppender capturing events (and
+// optionally failing on one type).
+type recordingAppender struct {
+	mu     sync.Mutex
+	events []domain.TaskEvent
+	failOn string
+}
+
+func (r *recordingAppender) AppendEvents(ctx context.Context, events ...domain.TaskEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range events {
+		if e.Type == r.failOn {
+			return context.DeadlineExceeded
+		}
+		r.events = append(r.events, e)
+	}
+	return nil
+}
+
+func (r *recordingAppender) types() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, e := range r.events {
+		out = append(out, e.Type)
+	}
+	return out
+}
+
+func TestRunRound_EmitsPolicyAndPhaseEvents(t *testing.T) {
+	events := &recordingAppender{}
+	policy := &fakes.FakePolicyClient{
+		EvaluateFunc: func(ctx context.Context, req policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+			return policyclient.PolicyDecision{Decision: "allow", PolicyBundleVersion: "v7", ResolvedSteps: []policyclient.ResolvedStep{
+				{StepID: "review", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseReview},
+			}}, nil
+		},
+	}
+	_, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+		Policy: policy, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(&fakes.FakeContainerLauncher{}),
+		Audit: &fakes.FakeAuditWriter{}, Events: events,
+	}, domain.Task{ID: "task-1"}, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("RunRound: %v", err)
+	}
+	got := strings.Join(events.types(), ",")
+	if want := "policy.decided,phase.started,phase.finished"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if events.events[0].Payload["bundle_version"] != "v7" || events.events[0].Payload["decision"] != "allow" {
+		t.Fatalf("policy.decided payload = %v", events.events[0].Payload)
+	}
+	if events.events[2].Payload["phase"] != policyclient.PhaseReview {
+		t.Fatalf("phase.finished payload = %v", events.events[2].Payload)
+	}
+}
+
+func TestRunRound_ReasonKinds(t *testing.T) {
+	round := func(decision policyclient.PolicyDecision) coreloop.RoundResult {
+		res, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+			Policy: &fakes.FakePolicyClient{EvaluateFunc: func(context.Context, policyclient.PolicyRequest) (policyclient.PolicyDecision, error) {
+				return decision, nil
+			}},
+			Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(&fakes.FakeContainerLauncher{}), Audit: &fakes.FakeAuditWriter{},
+		}, domain.Task{ID: "task-1", PRNumber: 1}, 1, nil, nil)
+		if err != nil {
+			t.Fatalf("RunRound: %v", err)
+		}
+		return res
+	}
+	if got := round(policyclient.PolicyDecision{Decision: "deny"}).ReasonKind; got != domain.ReasonPolicyDenied {
+		t.Fatalf("deny ReasonKind = %q", got)
+	}
+	two := []policyclient.ResolvedStep{
+		{StepID: "a", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate},
+		{StepID: "b", Type: executor.StepTypeAgentStage, Phase: policyclient.PhaseGenerate},
+	}
+	if got := round(policyclient.PolicyDecision{Decision: "allow", ResolvedSteps: two}).ReasonKind; got != domain.ReasonInvalidPhaseConfig {
+		t.Fatalf("bad phase config ReasonKind = %q", got)
+	}
+}
+
+func TestRunRound_EventAppendFailureFailsRound(t *testing.T) {
+	_, err := coreloop.RunRound(context.Background(), coreloop.Dependencies{
+		Policy: &fakes.FakePolicyClient{}, Approval: &fakes.FakeApprovalVerifier{}, Executors: newRegistry(&fakes.FakeContainerLauncher{}),
+		Audit: &fakes.FakeAuditWriter{}, Events: &recordingAppender{failOn: domain.EventPolicyDecided},
+	}, domain.Task{ID: "task-1"}, 1, nil, nil)
+	if err == nil {
+		t.Fatal("expected an event-append failure to fail the round")
+	}
+}

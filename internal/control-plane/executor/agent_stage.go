@@ -10,6 +10,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
@@ -63,7 +64,7 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 	if err != nil {
 		log.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
 		auditLaunchFailure(e.Audit, sc, invocationID)
-		return domain.StepRun{}, fmt.Errorf("launch agent-stage step %s: %w", sc.Step.StepID, err)
+		return domain.StepRun{}, classifyLaunchError(fmt.Errorf("launch agent-stage step %s: %w", sc.Step.StepID, err))
 	}
 
 	log.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
@@ -71,7 +72,7 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
-		return domain.StepRun{}, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err)
+		return domain.StepRun{}, failure.Dependency(failure.DepLauncher, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err))
 	}
 	log.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
 		"structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))
@@ -79,12 +80,12 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 	var parsed agentStageResult
 	if len(logs.StructuredResultJSON) > 0 {
 		if err := json.Unmarshal(logs.StructuredResultJSON, &parsed); err != nil {
-			return domain.StepRun{}, fmt.Errorf("parse structured result for %s: %w", result.InvocationID, err)
+			return domain.StepRun{}, failure.Agent(fmt.Errorf("parse structured result for %s: %w", result.InvocationID, err))
 		}
 	}
 
 	if err := auditStepRun(ctx, e.Audit, sc, invocationID, result); err != nil {
-		return domain.StepRun{}, fmt.Errorf("audit agent-stage step %s: %w", sc.Step.StepID, err)
+		return domain.StepRun{}, failure.Platform(fmt.Errorf("audit agent-stage step %s: %w", sc.Step.StepID, err))
 	}
 
 	return domain.StepRun{

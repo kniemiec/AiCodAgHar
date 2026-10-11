@@ -3,7 +3,9 @@ package taskrunner
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -35,15 +37,62 @@ func (s *PostgresTaskStore) Close() error {
 	return s.db.Close()
 }
 
+// execer is the part of *sql.DB / *sql.Tx the helpers below need.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// withTx runs fn in one transaction: commit on nil, rollback otherwise. It is
+// what makes "state change and its event" atomic (design §3, TS-3).
+func (s *PostgresTaskStore) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertEvents appends events to orchestrator.task_events via ex.
+func insertEvents(ctx context.Context, ex execer, events []domain.TaskEvent) error {
+	for _, e := range events {
+		payload := e.Payload
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal %s payload: %w", e.Type, err)
+		}
+		if _, err := ex.ExecContext(ctx, `
+			INSERT INTO orchestrator.task_events (task_id, round, step_id, invocation_id, type, payload, trace_id, span_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			e.TaskID, e.Round, nullableString(e.StepID), nullableString(e.InvocationID), e.Type, b,
+			nullableString(e.TraceID), nullableString(e.SpanID),
+		); err != nil {
+			return fmt.Errorf("insert %s event: %w", e.Type, err)
+		}
+	}
+	return nil
+}
+
 func (s *PostgresTaskStore) CreateTask(ctx context.Context, task domain.Task) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO orchestrator.tasks (
-			id, type, target_repo, triggering_principal, bot_account, risk_tier,
-			branch, base_branch, pr_number, description, status, current_round
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',0)`,
-		task.ID, task.Type, task.TargetRepo, task.TriggeringPrincipal, task.BotAccount, task.RiskTier,
-		task.Branch, task.BaseBranch, task.PRNumber, task.Description,
-	)
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO orchestrator.tasks (
+				id, type, target_repo, triggering_principal, bot_account, risk_tier,
+				branch, base_branch, pr_number, description, status, current_round
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',0)`,
+			task.ID, task.Type, task.TargetRepo, task.TriggeringPrincipal, task.BotAccount, task.RiskTier,
+			task.Branch, task.BaseBranch, task.PRNumber, task.Description,
+		); err != nil {
+			return err
+		}
+		return insertEvents(ctx, tx, []domain.TaskEvent{domain.TaskAcceptedEvent(task)})
+	})
 	if err != nil {
 		return fmt.Errorf("taskrunner: insert task %s: %w", task.ID, err)
 	}
@@ -53,17 +102,21 @@ func (s *PostgresTaskStore) CreateTask(ctx context.Context, task domain.Task) er
 func (s *PostgresTaskStore) GetTask(ctx context.Context, taskID string) (domain.TaskRecord, bool, error) {
 	var rec domain.TaskRecord
 	var approvalIssue sql.NullInt32
-	var approvedBy, reason sql.NullString
+	var approvedBy, reason, errorClass sql.NullString
+	var retryable sql.NullBool
+	var finishedAt sql.NullTime
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, type, target_repo, triggering_principal, bot_account, risk_tier,
 		       branch, base_branch, pr_number, description,
-		       status, current_round, approval_issue_number, approved_by, prior_findings, reason, updated_at
+		       status, current_round, approval_issue_number, approved_by, prior_findings, reason, updated_at,
+		       error_class, retryable, retry_count, created_at, finished_at
 		FROM orchestrator.tasks WHERE id = $1`, taskID,
 	).Scan(
 		&rec.Task.ID, &rec.Task.Type, &rec.Task.TargetRepo, &rec.Task.TriggeringPrincipal, &rec.Task.BotAccount, &rec.Task.RiskTier,
 		&rec.Task.Branch, &rec.Task.BaseBranch, &rec.Task.PRNumber, &rec.Task.Description,
 		&rec.State.Status, &rec.State.CurrentRound, &approvalIssue, &approvedBy, &rec.State.PriorFindings, &reason, &rec.State.UpdatedAt,
+		&errorClass, &retryable, &rec.State.RetryCount, &rec.State.AcceptedAt, &finishedAt,
 	)
 	if err == sql.ErrNoRows {
 		return domain.TaskRecord{}, false, nil
@@ -79,40 +132,189 @@ func (s *PostgresTaskStore) GetTask(ctx context.Context, taskID string) (domain.
 	}
 	rec.State.ApprovedBy = approvedBy.String
 	rec.State.Reason = reason.String
+	rec.State.ErrorClass = errorClass.String
+	rec.State.Retryable = retryable.Bool
+	if finishedAt.Valid {
+		t := finishedAt.Time
+		rec.State.FinishedAt = &t
+	}
 	return rec, true, nil
 }
 
-func (s *PostgresTaskStore) UpdateTaskState(ctx context.Context, state domain.TaskState) error {
+func (s *PostgresTaskStore) UpdateTaskState(ctx context.Context, state domain.TaskState, events ...domain.TaskEvent) error {
 	var approvalIssue any
 	if state.ApprovalIssueNumber != nil {
 		approvalIssue = *state.ApprovalIssueNumber
 	}
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE orchestrator.tasks
-		SET status = $2, current_round = $3, approval_issue_number = $4, approved_by = $5,
-		    prior_findings = $6, reason = $7, updated_at = now()
-		WHERE id = $1`,
-		state.TaskID, state.Status, state.CurrentRound, approvalIssue, nullableString(state.ApprovedBy),
-		nullableJSON(state.PriorFindings), nullableString(state.Reason),
-	)
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE orchestrator.tasks
+			SET status = $2, current_round = $3, approval_issue_number = $4, approved_by = $5,
+			    prior_findings = $6, reason = $7, updated_at = now(),
+			    finished_at = CASE WHEN $2 IN ('stop_success', 'stop_escalate') THEN now() ELSE finished_at END
+			WHERE id = $1`,
+			state.TaskID, state.Status, state.CurrentRound, approvalIssue, nullableString(state.ApprovedBy),
+			nullableJSON(state.PriorFindings), nullableString(state.Reason),
+		)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("no such task")
+		}
+		return insertEvents(ctx, tx, events)
+	})
 	if err != nil {
 		return fmt.Errorf("taskrunner: update task state %s: %w", state.TaskID, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("taskrunner: update task state %s: no such task", state.TaskID)
 	}
 	return nil
 }
 
-func (s *PostgresTaskStore) SetTaskReason(ctx context.Context, taskID, reason string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE orchestrator.tasks SET reason = $2, updated_at = now() WHERE id = $1`, taskID, nullableString(reason))
+func (s *PostgresTaskStore) FailTask(ctx context.Context, rec domain.FailureRecord, events ...domain.TaskEvent) error {
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE orchestrator.tasks
+			SET status = 'failed', error_class = $2, retryable = $3, reason = $4, updated_at = now(),
+			    finished_at = CASE WHEN $3 THEN NULL ELSE now() END
+			WHERE id = $1`,
+			rec.TaskID, rec.Class, rec.Retryable, nullableString(rec.Reason),
+		)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("no such task")
+		}
+		return insertEvents(ctx, tx, events)
+	})
 	if err != nil {
-		return fmt.Errorf("taskrunner: set reason for %s: %w", taskID, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("taskrunner: set reason for %s: no such task", taskID)
+		return fmt.Errorf("taskrunner: fail task %s: %w", rec.TaskID, err)
 	}
 	return nil
+}
+
+func (s *PostgresTaskStore) RetryTask(ctx context.Context, taskID string, maxRetries int, ev domain.TaskEvent) (domain.TaskState, error) {
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var previous sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			WITH prev AS (SELECT error_class FROM orchestrator.tasks WHERE id = $1 FOR UPDATE)
+			UPDATE orchestrator.tasks t
+			SET status = 'running', error_class = NULL, retryable = NULL, reason = NULL,
+			    retry_count = retry_count + 1, finished_at = NULL, updated_at = now()
+			FROM prev
+			WHERE t.id = $1 AND t.status = 'failed' AND t.retryable AND t.retry_count < $2
+			RETURNING prev.error_class`, taskID, maxRetries).Scan(&previous)
+		if err == sql.ErrNoRows {
+			return domain.ErrNotRetryable
+		}
+		if err != nil {
+			return err
+		}
+		if ev.Payload == nil {
+			ev.Payload = map[string]any{}
+		}
+		ev.Payload["previous_class"] = previous.String
+		return insertEvents(ctx, tx, []domain.TaskEvent{ev})
+	})
+	if err != nil {
+		if err == domain.ErrNotRetryable {
+			return domain.TaskState{}, err
+		}
+		return domain.TaskState{}, fmt.Errorf("taskrunner: retry task %s: %w", taskID, err)
+	}
+	rec, ok, err := s.GetTask(ctx, taskID)
+	if err != nil || !ok {
+		return domain.TaskState{}, fmt.Errorf("taskrunner: retry task %s: reload: %v", taskID, err)
+	}
+	return rec.State, nil
+}
+
+func (s *PostgresTaskStore) AppendEvents(ctx context.Context, events ...domain.TaskEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	err := s.withTx(ctx, func(tx *sql.Tx) error { return insertEvents(ctx, tx, events) })
+	if err != nil {
+		return fmt.Errorf("taskrunner: append events: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresTaskStore) ListEvents(ctx context.Context, taskID string, f domain.EventFilter) ([]domain.TaskEvent, error) {
+	q := `SELECT id, at, task_id, round, step_id, invocation_id, type, payload, trace_id, span_id
+	      FROM orchestrator.task_events WHERE task_id = $1 AND id > $2`
+	args := []any{taskID, f.AfterID}
+	if f.Type != "" {
+		args = append(args, f.Type)
+		q += fmt.Sprintf(" AND type = $%d", len(args))
+	}
+	if !f.Since.IsZero() {
+		args = append(args, f.Since)
+		q += fmt.Sprintf(" AND at >= $%d", len(args))
+	}
+	if !f.Until.IsZero() {
+		args = append(args, f.Until)
+		q += fmt.Sprintf(" AND at <= $%d", len(args))
+	}
+	q += " ORDER BY id ASC"
+	if f.Limit > 0 {
+		args = append(args, f.Limit)
+		q += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("taskrunner: list events for %s: %w", taskID, err)
+	}
+	defer rows.Close()
+
+	var out []domain.TaskEvent
+	for rows.Next() {
+		var e domain.TaskEvent
+		var stepID, invID, traceID, spanID sql.NullString
+		var payload []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.TaskID, &e.Round, &stepID, &invID, &e.Type, &payload, &traceID, &spanID); err != nil {
+			return nil, fmt.Errorf("taskrunner: scan event for %s: %w", taskID, err)
+		}
+		e.StepID, e.InvocationID, e.TraceID, e.SpanID = stepID.String, invID.String, traceID.String, spanID.String
+		if len(payload) > 0 {
+			if err := json.Unmarshal(payload, &e.Payload); err != nil {
+				return nil, fmt.Errorf("taskrunner: decode %s payload for %s: %w", e.Type, taskID, err)
+			}
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("taskrunner: iterate events for %s: %w", taskID, err)
+	}
+	return out, nil
+}
+
+func (s *PostgresTaskStore) ListTasksByStatus(ctx context.Context, status string) ([]domain.TaskAge, error) {
+	sinceType := ""
+	switch status {
+	case domain.TaskStatusWaitingApproval:
+		sinceType = domain.EventApprovalRequested
+	case domain.TaskStatusFailed:
+		sinceType = domain.EventTaskFailed
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.id, COALESCE((SELECT max(e.at) FROM orchestrator.task_events e WHERE e.task_id = t.id AND e.type = $2), t.updated_at)
+		FROM orchestrator.tasks t WHERE t.status = $1 ORDER BY 2 ASC`, status, sinceType)
+	if err != nil {
+		return nil, fmt.Errorf("taskrunner: list %s tasks: %w", status, err)
+	}
+	defer rows.Close()
+	var out []domain.TaskAge
+	for rows.Next() {
+		a := domain.TaskAge{Status: status}
+		var since time.Time
+		if err := rows.Scan(&a.TaskID, &since); err != nil {
+			return nil, fmt.Errorf("taskrunner: scan %s task: %w", status, err)
+		}
+		a.Since = since
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (s *PostgresTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
@@ -126,23 +328,46 @@ func (s *PostgresTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, 
 	return nil
 }
 
-func (s *PostgresTaskStore) EnsureRound(ctx context.Context, taskID string, round int) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO orchestrator.rounds (task_id, round_number) VALUES ($1, $2)
-		ON CONFLICT (task_id, round_number) DO NOTHING`, taskID, round)
+func (s *PostgresTaskStore) EnsureRound(ctx context.Context, taskID string, round int) (bool, error) {
+	var created bool
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO orchestrator.rounds (task_id, round_number) VALUES ($1, $2)
+			ON CONFLICT (task_id, round_number) DO NOTHING`, taskID, round)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		created = n == 1
+		if !created {
+			return nil
+		}
+		return insertEvents(ctx, tx, []domain.TaskEvent{domain.RoundStartedEvent(taskID, round)})
+	})
 	if err != nil {
-		return fmt.Errorf("taskrunner: ensure round %d for %s: %w", round, taskID, err)
+		return false, fmt.Errorf("taskrunner: ensure round %d for %s: %w", round, taskID, err)
 	}
-	return nil
+	return created, nil
 }
 
 func (s *PostgresTaskStore) RecordStepLaunched(ctx context.Context, taskID string, round int, step policyclient.ResolvedStep, invocationID string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO orchestrator.step_runs (task_id, round_number, step_id, step_type, invocation_id, blocking, status)
-		VALUES ($1,$2,$3,$4,$5,$6,'launched')
-		ON CONFLICT (invocation_id) DO NOTHING`,
-		taskID, round, step.StepID, step.Type, invocationID, step.Blocking,
-	)
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO orchestrator.step_runs (task_id, round_number, step_id, step_type, invocation_id, blocking, status)
+			VALUES ($1,$2,$3,$4,$5,$6,'launched')
+			ON CONFLICT (invocation_id) DO NOTHING`,
+			taskID, round, step.StepID, step.Type, invocationID, step.Blocking,
+		)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil // already recorded; no second step.launched
+		}
+		return insertEvents(ctx, tx, []domain.TaskEvent{
+			domain.StepLaunchedEvent(taskID, round, step.StepID, invocationID, step.Type, step.Phase, step.Blocking),
+		})
+	})
 	if err != nil {
 		return fmt.Errorf("taskrunner: record step %s launched for %s: %w", step.StepID, taskID, err)
 	}
@@ -162,17 +387,29 @@ func (s *PostgresTaskStore) CompleteStepRun(ctx context.Context, taskID string, 
 		structuredResult = nullableJSON(run.StructuredResult)
 	}
 
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE orchestrator.step_runs
-		SET status = $2, exit_code = $3, has_finding = $4, structured_result = $5, updated_at = now()
-		WHERE invocation_id = $1`,
-		invocationID, status, exitCode, hasFinding, structuredResult,
-	)
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var round int
+		var stepID string
+		var durationMS int64
+		err := tx.QueryRowContext(ctx, `
+			UPDATE orchestrator.step_runs
+			SET status = $2, exit_code = $3, has_finding = $4, structured_result = $5, updated_at = now()
+			WHERE invocation_id = $1
+			RETURNING round_number, step_id, (extract(epoch FROM (now() - created_at)) * 1000)::bigint`,
+			invocationID, status, exitCode, hasFinding, structuredResult,
+		).Scan(&round, &stepID, &durationMS)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("no such row")
+		}
+		if err != nil {
+			return err
+		}
+		return insertEvents(ctx, tx, []domain.TaskEvent{
+			domain.StepResolvedEvent(taskID, round, stepID, invocationID, run, execErr, time.Duration(durationMS)*time.Millisecond),
+		})
+	})
 	if err != nil {
 		return fmt.Errorf("taskrunner: complete step_run %s for %s: %w", invocationID, taskID, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("taskrunner: complete step_run %s for %s: no such row", invocationID, taskID)
 	}
 	return nil
 }

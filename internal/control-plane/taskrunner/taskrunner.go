@@ -30,6 +30,32 @@ type Dependencies struct {
 	// MaxRetries bounds operator retries per task (TASK_MAX_RETRIES). Zero
 	// means DefaultMaxRetries.
 	MaxRetries int
+
+	// Metrics receives the runner's own counts that no event carries
+	// (reconcile outcomes, failures it could not persist). Nil is a no-op.
+	Metrics RunnerMetrics
+}
+
+// RunnerMetrics is Dependencies.Metrics' interface (design §6: MT-10, ER-5).
+type RunnerMetrics interface {
+	// Reconciled counts one ReconcileTask call by outcome (Reconcile*).
+	Reconciled(ctx context.Context, outcome string)
+	// PersistenceFailure counts a task failure that could not be persisted.
+	PersistenceFailure(ctx context.Context)
+}
+
+// ReconcileTask outcomes for RunnerMetrics.Reconciled.
+const (
+	ReconcileResumed = "resumed"
+	ReconcileFailed  = "failed" // a launched step could not be reconciled
+	ReconcileNoop    = "noop"   // not running (finished, failed, or unknown)
+	ReconcileError   = "error"
+)
+
+func (r *Runner) reconciled(ctx context.Context, outcome string) {
+	if r.deps.Metrics != nil {
+		r.deps.Metrics.Reconciled(ctx, outcome)
+	}
 }
 
 // DefaultMaxRetries is the operator-retry bound when Dependencies.MaxRetries
@@ -257,7 +283,7 @@ func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err erro
 		"error_class", class, "retryable", retryable, "dependency", dep, "error", err)
 
 	reason := failure.Bound(err.Error())
-	payload := map[string]any{"error_class": string(class), "retryable": retryable, "error": reason}
+	payload := map[string]any{"error_class": string(class), "retryable": retryable, "error": reason, "target_repo": task.TargetRepo}
 	if dep != "" {
 		payload["dependency"] = dep
 	}
@@ -270,6 +296,9 @@ func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err erro
 	rec := domain.FailureRecord{TaskID: task.ID, Round: round, Class: string(class), Retryable: retryable, Reason: reason}
 	if serr := r.deps.Store.FailTask(ctx, rec, ev); serr != nil {
 		slog.ErrorContext(ctx, "could not persist task failure; task left running for reconciliation", "error", serr)
+		if r.deps.Metrics != nil {
+			r.deps.Metrics.PersistenceFailure(ctx)
+		}
 	}
 	if done != nil {
 		done <- Result{TaskID: task.ID, Err: err}
@@ -342,7 +371,7 @@ func (r *Runner) finish(ctx context.Context, task domain.Task, round int, result
 	}
 	wall, wait, _ := domain.WaitActive(history, now)
 	finished := domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventTaskFinished, Payload: map[string]any{
-		"outcome": outcome, "reason_kind": result.ReasonKind, "rounds": round,
+		"outcome": outcome, "reason_kind": result.ReasonKind, "rounds": round, "target_repo": task.TargetRepo,
 		"wall_ms": wall.Milliseconds(), "wait_ms": wait.Milliseconds(),
 	}}
 
@@ -424,7 +453,8 @@ func (r *Runner) RecordApproval(ctx context.Context, taskID, approvedBy, evidenc
 		ApprovalIssueNumber: rec.State.ApprovalIssueNumber, ApprovedBy: approvedBy,
 		PriorFindings: rec.State.PriorFindings, UpdatedAt: time.Now(),
 	}
-	granted := domain.TaskEvent{TaskID: taskID, Round: rec.State.CurrentRound + 1, Type: domain.EventApprovalGranted, Payload: map[string]any{"by": approvedBy}}
+	granted := domain.TaskEvent{TaskID: taskID, Round: rec.State.CurrentRound + 1, Type: domain.EventApprovalGranted,
+		Payload: map[string]any{"by": approvedBy, "wait_ms": r.approvalWait(ctx, taskID).Milliseconds()}}
 	if err := r.deps.Store.UpdateTaskState(ctx, state, granted); err != nil {
 		return fmt.Errorf("taskrunner: record approval for %s: %w", taskID, err)
 	}
@@ -448,8 +478,20 @@ func (r *Runner) RecordRejection(ctx context.Context, taskID, rejectedBy, eviden
 		TaskID: taskID, Outcome: coreloop.OutcomeStopEscalate, RoundsRun: round,
 		Reason: fmt.Sprintf("approval rejected by %s", rejectedBy), ReasonKind: domain.ReasonApprovalRejected,
 	}
-	rejected := domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventApprovalRejected, Payload: map[string]any{"by": rejectedBy}}
+	rejected := domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventApprovalRejected,
+		Payload: map[string]any{"by": rejectedBy, "wait_ms": r.approvalWait(ctx, taskID).Milliseconds()}}
 	return r.finish(ctx, rec.Task, round, result, &approvalEvidence{Approved: false, ApprovedBy: rejectedBy, Evidence: evidence}, rejected)
+}
+
+// approvalWait is how long the task has waited since its latest
+// approval.requested (MT-7); zero when that cannot be read, since the wait
+// is reporting, not a reason to refuse the approval.
+func (r *Runner) approvalWait(ctx context.Context, taskID string) time.Duration {
+	events, err := r.deps.Store.ListEvents(ctx, taskID, domain.EventFilter{Type: domain.EventApprovalRequested})
+	if err != nil || len(events) == 0 {
+		return 0
+	}
+	return time.Since(events[len(events)-1].At)
 }
 
 // TaskStatus is a task's current, queryable state — GET /tasks/{id}'s
@@ -546,9 +588,11 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 	ctx = logging.WithTask(ctx, taskID)
 	rec, ok, err := r.deps.Store.GetTask(ctx, taskID)
 	if err != nil {
+		r.reconciled(ctx, ReconcileError)
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: load task: %w", taskID, err)
 	}
 	if !ok || rec.State.Status != domain.TaskStatusRunning {
+		r.reconciled(ctx, ReconcileNoop)
 		return Result{TaskID: taskID}, nil
 	}
 
@@ -564,15 +608,19 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 	alreadyCompleted, err := r.loadAlreadyCompleted(ctx, rec.Task, round)
 	if err != nil {
 		if r.failUnreconcilable(ctx, rec.Task, round, err, done) {
+			r.reconciled(ctx, ReconcileFailed)
 			result := <-done
 			return result, result.Err
 		}
+		r.reconciled(ctx, ReconcileError)
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: %w", taskID, err)
 	}
 	if err := r.deps.Store.AppendEvents(ctx, domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventTaskReconciled,
 		Payload: map[string]any{"from_status": rec.State.Status, "resume_round": round, "completed_steps": len(alreadyCompleted)}}); err != nil {
+		r.reconciled(ctx, ReconcileError)
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: %w", taskID, err)
 	}
+	r.reconciled(ctx, ReconcileResumed)
 	r.runLoop(ctx, rec.Task, round, rec.State.PriorFindings, alreadyCompleted, domain.RoundResumeReconcile, done)
 	result := <-done
 	return result, result.Err

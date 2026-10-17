@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 	"google.golang.org/grpc/codes"
@@ -46,14 +48,24 @@ func revokeCredential(secrets secretsclient.SecretsClient, sc StepContext, cred 
 	}
 }
 
-// classifyLaunchError classes a ContainerLauncher.Launch error by gRPC code
-// alone: the launcher's per-outcome detail (BOOT_FAILURE vs GUEST_ERROR vs
-// TIMEOUT) arrives with the launcher outcome contract (design §7) and will
-// refine this. Until then Unavailable/DeadlineExceeded/Canceled mean the
-// launcher itself was unreachable (dependency), InvalidArgument is our own
-// bad request (platform), and anything else the launcher reports — in
-// practice a failed boot — is an infrastructure fault.
+// classifyLaunchError classes a ContainerLauncher.Launch error (design §2).
+// When the launcher reported its outcome (a *launcherclient.LaunchError),
+// that decides: BOOT_FAILURE and KILLED are infrastructure faults (retryable),
+// TIMEOUT and GUEST_ERROR are the agent's (terminal). Without an outcome —
+// the launcher was unreachable, rejected the request, or predates the outcome
+// contract — the gRPC code decides: Unavailable/DeadlineExceeded/Canceled mean
+// the launcher itself (dependency), InvalidArgument is our own bad request
+// (platform), and anything else is an infrastructure fault.
 func classifyLaunchError(err error) error {
+	var le *launcherclient.LaunchError
+	if errors.As(err, &le) {
+		switch le.Outcome {
+		case launcherclient.OutcomeTimeout, launcherclient.OutcomeGuestError:
+			return failure.Agent(err)
+		case launcherclient.OutcomeBootFailure, launcherclient.OutcomeKilled:
+			return failure.Infrastructure(err)
+		}
+	}
 	switch status.Code(err) {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
 		return failure.Dependency(failure.DepLauncher, err)
@@ -61,6 +73,30 @@ func classifyLaunchError(err error) error {
 		return failure.Platform(err)
 	}
 	return failure.Infrastructure(err)
+}
+
+// launchInfo is the launcher's account of an invocation, for the
+// step.resolved event. A failed Launch still has one when the launcher
+// reported it (LaunchError); otherwise it is zero.
+func launchInfo(result launcherclient.RunResult, err error) domain.LaunchInfo {
+	var le *launcherclient.LaunchError
+	if err != nil {
+		if !errors.As(err, &le) {
+			return domain.LaunchInfo{}
+		}
+		result = le.Result
+	}
+	return domain.LaunchInfo{
+		Outcome: result.Outcome, QueueWait: result.QueueWait, Boot: result.Boot,
+		GuestRun: result.GuestRun, EffectiveTimeout: result.EffectiveTimeout,
+	}
+}
+
+// failedLaunchRun is what an executor returns beside a Launch error: no
+// result, but the step's identity and whatever the launcher reported.
+func failedLaunchRun(sc StepContext, stepType, invocationID string, launch domain.LaunchInfo) domain.StepRun {
+	return domain.StepRun{Round: sc.Round, StepID: sc.Step.StepID, StepType: stepType, InvocationID: invocationID,
+		Blocking: sc.Step.Blocking, Launch: launch}
 }
 
 // stepContext attaches the step's correlation attributes to ctx so every

@@ -56,11 +56,13 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 	if err != nil {
 		slog.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
 		auditLaunchFailure(e.Audit, sc, invocationID)
-		return domain.StepRun{}, fmt.Errorf("launch deterministic-step %s: %w", sc.Step.StepID, err)
+		return failedLaunchRun(sc, StepTypeDeterministicStep, invocationID, launchInfo(result, err)),
+			classifyLaunchError(fmt.Errorf("launch deterministic-step %s: %w", sc.Step.StepID, err))
 	}
 
-	slog.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
-		"started_at", result.StartedAt, "finished_at", result.FinishedAt, "duration", time.Since(launchStarted))
+	slog.InfoContext(ctx, "launch finished", "status", result.Status, "outcome", result.Outcome, "exit_code", result.ExitCode,
+		"started_at", result.StartedAt, "finished_at", result.FinishedAt, "duration", time.Since(launchStarted),
+		"queue_wait", result.QueueWait, "boot", result.Boot, "guest_run", result.GuestRun, "effective_timeout", result.EffectiveTimeout)
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
@@ -78,6 +80,7 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 		StepID:           sc.Step.StepID,
 		StepType:         StepTypeDeterministicStep,
 		InvocationID:     result.InvocationID,
+		Launch:           launchInfo(result, nil),
 		Blocking:         sc.Step.Blocking,
 		ExitCode:         result.ExitCode,
 		HasFinding:       result.ExitCode != 0,

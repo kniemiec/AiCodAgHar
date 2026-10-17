@@ -103,13 +103,42 @@ func (c *Client) Launch(ctx context.Context, req LaunchRequest) (RunResult, erro
 		GrantedScopes:  req.GrantedScopes,
 	})
 	if err != nil {
-		return RunResult{}, fmt.Errorf("launcherclient: launch %s: %w", req.InvocationID, err)
+		err = fmt.Errorf("launcherclient: launch %s: %w", req.InvocationID, err)
+		if detail := launchResponseDetail(err); detail != nil {
+			result := runResult(detail)
+			return result, &LaunchError{Result: result, Outcome: result.Outcome, Err: err}
+		}
+		return RunResult{}, err
 	}
+	return runResult(resp), nil
+}
 
+// launchResponseDetail returns the LaunchResponse a failed Launch carries as
+// a status detail (platform-observability design §7), or nil — e.g. from a
+// launcher that predates it, which callers then classify by gRPC code alone.
+func launchResponseDetail(err error) *launcherv1.LaunchResponse {
+	st, ok := status.FromError(err)
+	if !ok {
+		return nil
+	}
+	for _, d := range st.Details() {
+		if r, ok := d.(*launcherv1.LaunchResponse); ok {
+			return r
+		}
+	}
+	return nil
+}
+
+func runResult(resp *launcherv1.LaunchResponse) RunResult {
 	result := RunResult{
-		InvocationID: resp.InvocationId,
-		ExitCode:     resp.ExitCode,
-		Status:       resp.Status,
+		InvocationID:     resp.InvocationId,
+		ExitCode:         resp.ExitCode,
+		Status:           resp.Status,
+		Outcome:          outcomeString(resp.Outcome),
+		QueueWait:        resp.QueueWait.AsDuration(),
+		Boot:             resp.Boot.AsDuration(),
+		GuestRun:         resp.GuestRun.AsDuration(),
+		EffectiveTimeout: time.Duration(resp.EffectiveTimeoutSeconds) * time.Second,
 	}
 	if resp.StartedAt != nil {
 		result.StartedAt = resp.StartedAt.AsTime()
@@ -117,7 +146,23 @@ func (c *Client) Launch(ctx context.Context, req LaunchRequest) (RunResult, erro
 	if resp.FinishedAt != nil {
 		result.FinishedAt = resp.FinishedAt.AsTime()
 	}
-	return result, nil
+	return result
+}
+
+func outcomeString(o launcherv1.LaunchOutcome) string {
+	switch o {
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_COMPLETED:
+		return OutcomeCompleted
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_BOOT_FAILURE:
+		return OutcomeBootFailure
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_TIMEOUT:
+		return OutcomeTimeout
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR:
+		return OutcomeGuestError
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_KILLED:
+		return OutcomeKilled
+	}
+	return ""
 }
 
 func (c *Client) Kill(ctx context.Context, invocationID string) error {

@@ -165,8 +165,8 @@ func isSensitive(r slog.Record) bool {
 // Setup installs a slog default logger tagged with component, host and
 // build version, configured from LOG_LEVEL (debug|info|warn|error, default
 // info) and LOG_FORMAT (text|json, default text). stderr is always on;
-// extra sinks (added by later telemetry wiring) receive every
-// non-sensitive record. slog.SetDefault also redirects the stdlib log
+// extra sinks (the OTLP log bridge, internal/telemetry) receive every
+// non-sensitive record at or above LOG_LEVEL; nil sinks are ignored. slog.SetDefault also redirects the stdlib log
 // package, so startup log.Fatalf lines go through the same handler.
 func Setup(component string, extra ...slog.Handler) {
 	slog.SetDefault(slog.New(NewHandler(os.Stderr, component, extra...)))
@@ -175,7 +175,8 @@ func Setup(component string, extra ...slog.Handler) {
 // NewHandler builds Setup's handler over w; exported so tests can capture
 // exactly what the process would emit.
 func NewHandler(w io.Writer, component string, extra ...slog.Handler) slog.Handler {
-	opts := &slog.HandlerOptions{Level: parseLevel(os.Getenv("LOG_LEVEL"))}
+	level := parseLevel(os.Getenv("LOG_LEVEL"))
+	opts := &slog.HandlerOptions{Level: level}
 	var base slog.Handler
 	if strings.EqualFold(os.Getenv("LOG_FORMAT"), "json") {
 		base = slog.NewJSONHandler(w, opts)
@@ -188,7 +189,32 @@ func NewHandler(w io.Writer, component string, extra ...slog.Handler) slog.Handl
 		slog.String("host", host),
 		slog.String("version", buildinfo.Version),
 	}
-	return contextHandler{fanout{primary: base, sinks: extra}.WithAttrs(attrs)}
+	sinks := make([]slog.Handler, 0, len(extra))
+	for _, h := range extra {
+		if h != nil {
+			sinks = append(sinks, levelFilter{Handler: h, level: level})
+		}
+	}
+	return contextHandler{fanout{primary: base, sinks: sinks}.WithAttrs(attrs)}
+}
+
+// levelFilter applies LOG_LEVEL to an extra sink, which (like the OTLP
+// bridge) may otherwise accept every level.
+type levelFilter struct {
+	slog.Handler
+	level slog.Level
+}
+
+func (h levelFilter) Enabled(ctx context.Context, l slog.Level) bool {
+	return l >= h.level && h.Handler.Enabled(ctx, l)
+}
+
+func (h levelFilter) WithAttrs(as []slog.Attr) slog.Handler {
+	return levelFilter{Handler: h.Handler.WithAttrs(as), level: h.level}
+}
+
+func (h levelFilter) WithGroup(n string) slog.Handler {
+	return levelFilter{Handler: h.Handler.WithGroup(n), level: h.level}
 }
 
 func parseLevel(s string) slog.Level {

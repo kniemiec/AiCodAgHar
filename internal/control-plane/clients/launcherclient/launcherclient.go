@@ -20,13 +20,41 @@ type LaunchRequest struct {
 }
 
 // RunResult mirrors api/proto/launcher/v1/launcher.proto's LaunchResponse.
+// Outcome and the durations are zero against a launcher that predates them.
 type RunResult struct {
 	InvocationID string
 	ExitCode     int32
 	Status       string // completed | timed_out | killed | error
 	StartedAt    time.Time
 	FinishedAt   time.Time
+
+	Outcome          string // one of the Outcome* constants; "" if the launcher didn't say
+	QueueWait        time.Duration
+	Boot             time.Duration
+	GuestRun         time.Duration
+	EffectiveTimeout time.Duration
 }
+
+// LaunchOutcome values (LA-1), as RunResult.Outcome reports them.
+const (
+	OutcomeCompleted   = "completed"
+	OutcomeBootFailure = "boot_failure"
+	OutcomeTimeout     = "timeout"
+	OutcomeGuestError  = "guest_error"
+	OutcomeKilled      = "killed"
+)
+
+// LaunchError is a failed Launch for which the launcher still reported its
+// outcome and timings (they travel as a gRPC status detail). Err keeps the
+// gRPC status in its chain, so status.Code(err) still works.
+type LaunchError struct {
+	Result  RunResult
+	Outcome string
+	Err     error
+}
+
+func (e *LaunchError) Error() string { return e.Err.Error() }
+func (e *LaunchError) Unwrap() error { return e.Err }
 
 // LogBundle mirrors api/proto/launcher/v1/launcher.proto's ExtractLogsResponse.
 type LogBundle struct {

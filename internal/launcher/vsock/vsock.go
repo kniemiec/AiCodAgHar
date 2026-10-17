@@ -156,13 +156,22 @@ func (l *Listener) WaitForResult(ctx context.Context) (Result, error) {
 // — only the literal secret bytes the launcher itself injected are ever
 // scrubbed.
 func Redact(data []byte, secrets map[string]string) []byte {
+	out, _ := RedactCounted(data, secrets)
+	return out
+}
+
+// RedactCounted is Redact that also reports how many replacements it made
+// (launcher_redactions_total, MT-12).
+func RedactCounted(data []byte, secrets map[string]string) ([]byte, int) {
+	n := 0
 	for label, value := range secrets {
 		if value == "" {
 			continue
 		}
+		n += bytes.Count(data, []byte(value))
 		data = bytes.ReplaceAll(data, []byte(value), []byte("[REDACTED:"+label+"]"))
 	}
-	return data
+	return data, n
 }
 
 func readEnvelopes(ctx context.Context, conn net.Conn) (Result, error) {

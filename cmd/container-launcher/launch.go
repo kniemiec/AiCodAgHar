@@ -101,9 +101,20 @@ func newFirecrackerLauncher(cfg config) *firecrackerLauncher {
 	return &firecrackerLauncher{cfg: cfg, egressCfg: egress.DefaultConfig(cfg.JailerUID)}
 }
 
-func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, env map[string]string, task, command string, timeoutSeconds int32) (bootOutcome, error) {
+func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, env map[string]string, task, command string, timeoutSeconds int32) (out bootOutcome, err error) {
 	log := slog.Default()
 	bootStart := time.Now()
+	// boot is bootStart -> InstanceStart, run is InstanceStart -> return
+	// (design §7). Every return path below goes through this.
+	var guestStart time.Time
+	defer func() {
+		if guestStart.IsZero() {
+			out.boot = time.Since(bootStart)
+			return
+		}
+		out.boot = guestStart.Sub(bootStart)
+		out.run = time.Since(guestStart)
+	}()
 	// stage logs one completed boot step at debug. Failures aren't logged
 	// here: they're returned and logged once by server.go's Launch.
 	stage := func(name string, attrs ...any) {
@@ -282,6 +293,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: instance-start: %w", err)
 	}
+	guestStart = time.Now()
 	log.InfoContext(ctx, "microVM started", "boot_elapsed", time.Since(bootStart), "jailer_log", jailerLogPath,
 		"mode", launchMode(task, command))
 
@@ -304,10 +316,15 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 
 	timeout := resolveTimeout(timeoutSeconds, l.cfg.DefaultTimeoutSeconds)
 	log.InfoContext(ctx, "waiting for guest completion", "timeout", timeout)
+	// From here on the guest is running: an "error" is the guest's, not
+	// the boot's (GUEST_ERROR vs BOOT_FAILURE, design §7).
 	if task != "" {
-		return l.waitForAgentCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+		out, err = l.waitForAgentCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+	} else {
+		out, err = l.waitForCommandCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
 	}
-	return l.waitForCommandCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+	out.reachedGuest = true
+	return out, err
 }
 
 func launchMode(task, command string) string {
@@ -391,11 +408,14 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, log *s
 		"FORGEJO_TOKEN": env["FORGEJO_TOKEN"],
 		"LLM_API_KEY":   l.cfg.LLMAPIKey,
 	}
+	redactedResult, n1 := vsock.RedactCounted(structuredResultJSON, secrets)
+	redactedStdout, n2 := vsock.RedactCounted(stdout, secrets)
 	return bootOutcome{
 		exitCode:             exitCode,
 		status:               status,
-		structuredResultJSON: vsock.Redact(structuredResultJSON, secrets),
-		stdout:               vsock.Redact(stdout, secrets),
+		structuredResultJSON: redactedResult,
+		stdout:               redactedStdout,
+		redactions:           n1 + n2,
 	}, outErr
 }
 
@@ -464,10 +484,12 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, log 
 	}
 
 	secrets := map[string]string{"FORGEJO_TOKEN": env["FORGEJO_TOKEN"]}
+	redactedStdout, n := vsock.RedactCounted(stdout, secrets)
 	return bootOutcome{
-		exitCode: exitCode,
-		status:   status,
-		stdout:   vsock.Redact(stdout, secrets),
+		exitCode:   exitCode,
+		status:     status,
+		stdout:     redactedStdout,
+		redactions: n,
 	}, outErr
 }
 

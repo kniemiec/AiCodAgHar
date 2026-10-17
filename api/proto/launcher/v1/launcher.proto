@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package launcher.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1;launcherv1";
@@ -36,6 +37,26 @@ message LaunchResponse {
   string status = 3; // completed | timed_out | killed | error
   google.protobuf.Timestamp started_at = 4;
   google.protobuf.Timestamp finished_at = 5;
+  // Fields 6-10 are additive (platform-observability design §7). On a failed
+  // Launch the whole LaunchResponse also travels as a gRPC status detail, so
+  // the caller still learns the outcome and timings.
+  LaunchOutcome outcome = 6;
+  google.protobuf.Duration queue_wait = 7; // waiting for the VM slot
+  google.protobuf.Duration boot = 8;       // jail setup through InstanceStart
+  google.protobuf.Duration guest_run = 9;  // InstanceStart through completion
+  int32 effective_timeout_seconds = 10;    // the caller's timeout, or the launcher default
+}
+
+// LaunchOutcome is the closed set of invocation outcomes (LA-1). It refines
+// LaunchResponse.status: "error" splits into BOOT_FAILURE (the guest never
+// started) and GUEST_ERROR (it started and then failed).
+enum LaunchOutcome {
+  LAUNCH_OUTCOME_UNSPECIFIED = 0;
+  LAUNCH_OUTCOME_COMPLETED = 1;
+  LAUNCH_OUTCOME_BOOT_FAILURE = 2;
+  LAUNCH_OUTCOME_TIMEOUT = 3;
+  LAUNCH_OUTCOME_GUEST_ERROR = 4;
+  LAUNCH_OUTCOME_KILLED = 5;
 }
 
 message KillRequest {

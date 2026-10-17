@@ -163,6 +163,15 @@ func (e *env) start(t *testing.T, r *taskrunner.Runner) taskrunner.Result {
 	return <-done
 }
 
+// launchFailsWith scripts a Launch that fails but reports outcome, the way
+// launcherclient does when the launcher attaches its LaunchResponse.
+func launchFailsWith(outcome string) func(context.Context, launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+	return func(_ context.Context, req launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+		res := launcherclient.RunResult{InvocationID: req.InvocationID, Status: "error", Outcome: outcome}
+		return res, &launcherclient.LaunchError{Result: res, Outcome: outcome, Err: status.Error(codes.Internal, "launch failed")}
+	}
+}
+
 func agentStep(id, phase string) policyclient.ResolvedStep {
 	return policyclient.ResolvedStep{StepID: id, Type: executor.StepTypeAgentStage, Phase: phase}
 }
@@ -170,8 +179,7 @@ func agentStep(id, phase string) policyclient.ResolvedStep {
 // TestRunner_FailureTable is the ER-1 table test: every failure path in the
 // design's §2 table that this PR can reach ends the task failed with the
 // listed class/retryable, exactly one task.failed event, and a restart never
-// picks it up again. (The launcher-outcome rows arrive with the launcher
-// outcome contract.)
+// picks it up again.
 func TestRunner_FailureTable(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -218,6 +226,19 @@ func TestRunner_FailureTable(t *testing.T) {
 				return launcherclient.RunResult{}, status.Error(codes.InvalidArgument, "bad payload_ref")
 			}
 		}, []policyclient.ResolvedStep{agentStep("review", "")}, "platform", false, ""},
+		{"launch outcome boot failure", func(e *env) { e.launcher.LaunchFunc = launchFailsWith(launcherclient.OutcomeBootFailure) },
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "infrastructure", true, ""},
+		{"launch outcome killed", func(e *env) { e.launcher.LaunchFunc = launchFailsWith(launcherclient.OutcomeKilled) },
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "infrastructure", true, ""},
+		{"launch outcome timeout", func(e *env) { e.launcher.LaunchFunc = launchFailsWith(launcherclient.OutcomeTimeout) },
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "agent", false, ""},
+		{"launch outcome guest error", func(e *env) { e.launcher.LaunchFunc = launchFailsWith(launcherclient.OutcomeGuestError) },
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "agent", false, ""},
+		{"deterministic launch unavailable", func(e *env) {
+			e.launcher.LaunchFunc = func(context.Context, launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+				return launcherclient.RunResult{}, status.Error(codes.Unavailable, "down")
+			}
+		}, []policyclient.ResolvedStep{{StepID: "unit-tests", Type: executor.StepTypeDeterministicStep}}, "dependency", true, "launcher"},
 		{"extract logs", func(e *env) {
 			e.launcher.ExtractLogsFunc = func(context.Context, string) (launcherclient.LogBundle, error) {
 				return launcherclient.LogBundle{}, errBoom

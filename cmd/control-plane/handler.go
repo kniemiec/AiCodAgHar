@@ -12,6 +12,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/instrumented"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 )
 
@@ -89,6 +90,7 @@ type server struct {
 	git     gitclient.GitHostClient
 	secrets secretsclient.SecretsClient
 	runner  *taskrunner.Runner
+	metrics *instrumented.Metrics // nil-safe
 }
 
 func newServeMux(s *server) *http.ServeMux {

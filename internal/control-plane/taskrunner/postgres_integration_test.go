@@ -320,6 +320,70 @@ func TestPG_Migration006(t *testing.T) {
 	}
 }
 
+// Design §6: the observer sees exactly the committed events (and nothing
+// from a rolled-back write), step.resolved carries the row's step_type, and
+// FleetSnapshot counts this task in the right buckets.
+func TestPG_EventObserverAndFleetSnapshot(t *testing.T) {
+	s := newPGStore(t)
+	var mu sync.Mutex
+	var seen []domain.TaskEvent
+	s.SetEventObserver(func(_ context.Context, evs []domain.TaskEvent) {
+		mu.Lock()
+		seen = append(seen, evs...)
+		mu.Unlock()
+	})
+	ctx := context.Background()
+	id := uniqueID(t, "fleet")
+	if err := s.CreateTask(ctx, domain.Task{ID: id, Type: "new-task"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureRound(ctx, id, 1); err != nil {
+		t.Fatal(err)
+	}
+	inv := id + "-r1-review"
+	if err := s.RecordStepLaunched(ctx, id, 1, policyclient.ResolvedStep{StepID: "review", Type: "agent-stage"}, inv); err != nil {
+		t.Fatal(err)
+	}
+	run := domain.StepRun{Launch: domain.LaunchInfo{Outcome: "completed", QueueWait: 2 * time.Second}}
+	if err := s.CompleteStepRun(ctx, id, inv, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A rolled-back write must not reach the observer.
+	_ = s.UpdateTaskState(ctx, domain.TaskState{TaskID: id, Status: domain.TaskStatusStopSuccess}, domain.TaskEvent{TaskID: "no-such-task", Type: "x"})
+
+	mu.Lock()
+	got := eventTypes(seen)
+	resolved := seen[len(seen)-1]
+	mu.Unlock()
+	want := []string{domain.EventTaskAccepted, domain.EventRoundStarted, domain.EventStepLaunched, domain.EventStepResolved}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("observed %v, want %v", got, want)
+	}
+	if resolved.Payload["step_type"] != "agent-stage" || resolved.Payload["launcher_outcome"] != "completed" || resolved.Payload["queue_wait_ms"] != int64(2000) {
+		t.Errorf("step.resolved payload = %v", resolved.Payload)
+	}
+
+	snap, err := s.FleetSnapshot(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.ByStatus[domain.TaskStatusRunning] < 1 || snap.Stuck < 1 {
+		t.Errorf("running task not counted (stuckAfter=0): %+v", snap)
+	}
+	issue := 1
+	if err := s.UpdateTaskState(ctx, domain.TaskState{TaskID: id, Status: domain.TaskStatusWaitingApproval, ApprovalIssueNumber: &issue},
+		domain.TaskEvent{TaskID: id, Round: 1, Type: domain.EventApprovalRequested}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = s.FleetSnapshot(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.WaitingApprovals < 1 || snap.OldestApprovalWait < 0 {
+		t.Errorf("waiting task not counted: %+v", snap)
+	}
+}
+
 func contains(ids []string, id string) bool {
 	for _, x := range ids {
 		if x == id {

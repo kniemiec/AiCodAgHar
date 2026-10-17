@@ -239,6 +239,20 @@ func TestRedact(t *testing.T) {
 	}
 }
 
+func TestRedactCounted(t *testing.T) {
+	secrets := map[string]string{"FORGEJO_TOKEN": "tok-1", "LLM_API_KEY": "sk-2", "EMPTY": ""}
+	got, n := RedactCounted([]byte("tok-1 and tok-1 and sk-2"), secrets)
+	if n != 3 {
+		t.Errorf("n = %d, want 3", n)
+	}
+	if want := "[REDACTED:FORGEJO_TOKEN] and [REDACTED:FORGEJO_TOKEN] and [REDACTED:LLM_API_KEY]"; string(got) != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if _, n := RedactCounted([]byte("nothing here"), secrets); n != 0 {
+		t.Errorf("clean input: n = %d, want 0", n)
+	}
+}
+
 func TestRedact_SymbolicReferenceLeftAlone(t *testing.T) {
 	secrets := map[string]string{"FORGEJO_TOKEN": "sekret-token-123"}
 	data := []byte(`echo "using \${FORGEJO_TOKEN} from env"`)

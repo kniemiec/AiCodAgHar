@@ -28,13 +28,27 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/instrumented"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 	"github.com/kniemiec/AiCodAgHar/internal/health"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 func main() {
-	logging.Setup("control-plane")
+	// Telemetry first, so the OTLP log sink (when enabled) sees startup too.
+	tel, err := telemetry.Setup(context.Background(), "control-plane")
+	if err != nil {
+		logging.Setup("control-plane")
+		log.Fatalf("control-plane: telemetry: %v", err)
+	}
+	logging.Setup("control-plane", tel.LogHandler)
+	tel.RegisterBuildInfo()
+	metrics := instrumented.NewMetrics(tel.Meter(), instrumented.Options{
+		TargetRepos: envList("TELEMETRY_TARGET_REPOS"),
+		StepIDs:     envList("TELEMETRY_STEP_IDS"),
+	})
 
 	addr := os.Getenv("ADDR")
 	if addr == "" {
@@ -56,17 +70,22 @@ func main() {
 		"launcher_addr", launcherAddr, "orchestrator_instance_id", orchestratorInstanceID,
 		"webhook_approval_enabled", os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true",
 		"task_max_retries", envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
-		"heartbeat_interval", envDuration("HEARTBEAT_INTERVAL", 5*time.Minute))
+		"heartbeat_interval", envDuration("HEARTBEAT_INTERVAL", 5*time.Minute),
+		"stuck_task_interval", envDuration("STUCK_TASK_INTERVAL", defaultStuckInterval),
+		"otlp_export", tel.LogHandler != nil)
 
-	git, err := gitclient.NewClient(forgejoURL, forgejoToken)
+	// Every dependency client is wrapped in its instrumented decorator
+	// (MT-13); the raw clients are only used for Close/Ping below.
+	gitRaw, err := gitclient.NewClient(forgejoURL, forgejoToken)
 	if err != nil {
 		log.Fatalf("control-plane: git client: %v", err)
 	}
+	git := instrumented.Git{Next: gitRaw, M: metrics}
 
-	policy := policyclient.NewClient(pdpURL)
-	secrets := secretsclient.NewClient(secretsURL)
+	policy := instrumented.Policy{Next: policyclient.NewClient(pdpURL), M: metrics}
+	secrets := instrumented.Secrets{Next: secretsclient.NewClient(secretsURL), M: metrics}
 
-	launcher, err := launcherclient.NewClient(launcherAddr, launcherclient.TLSConfig{
+	launcherRaw, err := launcherclient.NewClient(launcherAddr, launcherclient.TLSConfig{
 		CACertPath:     requireEnv("TLS_CA_CERT"),
 		ClientCertPath: requireEnv("TLS_CLIENT_CERT"),
 		ClientKeyPath:  requireEnv("TLS_CLIENT_KEY"),
@@ -74,19 +93,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("control-plane: launcher client: %v", err)
 	}
-	defer launcher.Close()
+	defer launcherRaw.Close()
+	launcher := instrumented.Launcher{Next: launcherRaw, M: metrics}
 
-	auditWriter, err := audit.NewPostgresWriter(requireEnv("AUDIT_DB_DSN"))
+	auditRaw, err := audit.NewPostgresWriter(requireEnv("AUDIT_DB_DSN"))
 	if err != nil {
 		log.Fatalf("control-plane: audit writer: %v", err)
 	}
-	defer auditWriter.Close()
+	defer auditRaw.Close()
+	auditWriter := instrumented.Audit{Next: auditRaw, M: metrics}
 
-	taskStore, err := taskrunner.NewPostgresTaskStore(requireEnv("ORCHESTRATOR_DB_DSN"))
+	pgStore, err := taskrunner.NewPostgresTaskStore(requireEnv("ORCHESTRATOR_DB_DSN"))
 	if err != nil {
 		log.Fatalf("control-plane: task store: %v", err)
 	}
-	defer taskStore.Close()
+	defer pgStore.Close()
+	// Task/round/phase/step metrics are derived from committed events
+	// (design §6), never emitted at call sites.
+	pgStore.SetEventObserver(metrics.Observe)
+	taskStore := instrumented.Store{Next: pgStore, M: metrics}
+	metrics.RegisterFleetGauges(taskStore, envDuration("STUCK_TASK_INTERVAL", defaultStuckInterval))
 
 	registry := executor.NewRegistry(
 		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
@@ -117,6 +143,7 @@ func main() {
 		Store:      taskStore,
 		Launcher:   launcher,
 		MaxRetries: envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
+		Metrics:    metrics,
 	})
 
 	// Startup reconciliation (design §4.2): resume any task left
@@ -126,7 +153,7 @@ func main() {
 		log.Fatalf("control-plane: startup reconciliation: %v", err)
 	}
 
-	srv := &server{git: git, secrets: secrets, runner: runner}
+	srv := &server{git: git, secrets: secrets, runner: runner, metrics: metrics}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -137,11 +164,14 @@ func main() {
 	secretsProbe := health.NewProber("secrets_issuer", secretsURL)
 	go pdpProbe.Run(ctx, probeInterval)
 	go secretsProbe.Run(ctx, probeInterval)
+	metrics.RegisterDependencyUp(map[string]func() bool{
+		failure.DepPDP: pdpProbe.Up, failure.DepSecretsIssuer: secretsProbe.Up,
+	})
 
 	mux := newServeMux(srv)
 	health.Register(mux,
-		health.Check{Name: "orchestrator_db", Fn: taskStore.Ping},
-		health.Check{Name: "audit_db", Fn: auditWriter.Ping},
+		health.Check{Name: "orchestrator_db", Fn: pgStore.Ping},
+		health.Check{Name: "audit_db", Fn: auditRaw.Ping},
 		pdpProbe.Check(), secretsProbe.Check(),
 	)
 
@@ -181,11 +211,15 @@ func main() {
 			slog.Warn("control-plane: shutdown", "addr", hs.Addr, "error", err)
 		}
 	}
+	if err := tel.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("control-plane: telemetry shutdown", "error", err)
+	}
 }
 
 const (
-	probeInterval   = 10 * time.Second
-	shutdownTimeout = 5 * time.Second
+	probeInterval        = 10 * time.Second
+	shutdownTimeout      = 5 * time.Second
+	defaultStuckInterval = 30 * time.Minute
 )
 
 // logRequests logs each request with its response status and duration.
@@ -246,6 +280,17 @@ func envDuration(name string, def time.Duration) time.Duration {
 		log.Fatalf("control-plane: %s must be a non-negative duration like 5m, got %q", name, v)
 	}
 	return d
+}
+
+// envList reads a comma-separated env var; unset or empty is nil.
+func envList(name string) []string {
+	var out []string
+	for _, v := range strings.Split(os.Getenv(name), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func requireEnv(name string) string {

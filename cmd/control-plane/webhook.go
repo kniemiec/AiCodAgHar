@@ -17,6 +17,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/config"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/instrumented"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
@@ -65,16 +66,26 @@ type forgejoIssueWebhook struct {
 // escalated, since a misconfigured or momentarily-unreachable check must
 // never manufacture a false approval.
 func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
+	outcome := s.processForgejoWebhook(w, r)
+	s.metrics.WebhookEvent(r.Context(), outcome)
+}
+
+// processForgejoWebhook is handleForgejoWebhook's body; it returns the
+// delivery's outcome for harness_webhook_events_total (MT-14): rejected for
+// a bad payload or signature or an unauthorised sender, failed when a
+// lookup or write needed to process it failed, ignored when there was
+// nothing to do, processed when it changed or started a task.
+func (s *server) processForgejoWebhook(w http.ResponseWriter, r *http.Request) string {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBodyBytes))
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
-		return
+		return instrumented.WebhookRejected
 	}
 
 	var payload forgejoIssueWebhook
 	if err := json.Unmarshal(body, &payload); err != nil || payload.Repository.FullName == "" {
 		http.Error(w, "invalid or incomplete webhook payload", http.StatusBadRequest)
-		return
+		return instrumented.WebhookRejected
 	}
 
 	ctx := r.Context()
@@ -87,41 +98,40 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.WarnContext(ctx, "webhook: no secret provisioned", "repo", payload.Repository.FullName, "error", err)
 		w.WriteHeader(http.StatusForbidden)
-		return
+		return instrumented.WebhookRejected
 	}
 	if !verifyForgejoSignature(secret, body, r.Header.Get("X-Forgejo-Signature")) {
 		slog.WarnContext(ctx, "webhook: signature verification failed", "repo", payload.Repository.FullName)
 		w.WriteHeader(http.StatusForbidden)
-		return
+		return instrumented.WebhookRejected
 	}
 
 	owner, name, ok := strings.Cut(payload.Repository.FullName, "/")
 	if !ok {
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookIgnored
 	}
 	repo := gitclient.RepoRef{Owner: owner, Name: name}
 
 	switch payload.Action {
 	case "opened":
-		s.handleIssueOpened(ctx, w, repo, payload)
-		return
+		return s.handleIssueOpened(ctx, w, repo, payload)
 	case "label_updated":
 		// falls through to the approval/rejection handling below
 	default:
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookIgnored
 	}
 
 	taskID, ok, err := s.runner.FindWaitingApprovalTask(ctx, payload.Repository.FullName, payload.Issue.Number)
 	if err != nil {
 		slog.ErrorContext(ctx, "webhook: find waiting-approval task failed", "repo", payload.Repository.FullName, "issue", payload.Issue.Number, "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookFailed
 	}
 	if !ok {
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookIgnored
 	}
 	ctx = logging.WithTask(ctx, taskID)
 
@@ -129,38 +139,38 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.ErrorContext(ctx, "webhook: list labels failed", "repo", payload.Repository.FullName, "issue", payload.Issue.Number, "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookFailed
 	}
 	rejected := slices.Contains(labels, labelRejected)
 	approved := slices.Contains(labels, labelApproved)
 	if !rejected && !approved {
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookIgnored
 	}
 
 	status, ok, err := s.runner.GetTaskStatus(ctx, taskID)
 	if err != nil || !ok {
 		slog.ErrorContext(ctx, "webhook: load task failed", "found", ok, "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookFailed
 	}
 
 	approversRaw, err := s.git.GetFileContents(ctx, repo, approversPath, status.Task.BaseBranch)
 	if err != nil {
 		slog.ErrorContext(ctx, "webhook: read approvers file failed", "path", approversPath, "repo", payload.Repository.FullName, "ref", status.Task.BaseBranch, "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookFailed
 	}
 	if !slices.Contains(config.ParseApprovers(approversRaw), payload.Sender.Login) {
 		slog.WarnContext(ctx, "webhook: sender is not a listed approver", "sender", payload.Sender.Login, "path", approversPath, "repo", payload.Repository.FullName)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookRejected
 	}
 	hasWrite, err := s.git.VerifyCollaboratorRole(ctx, repo, payload.Sender.Login, gitclient.RoleWrite)
 	if err != nil || !hasWrite {
 		slog.WarnContext(ctx, "webhook: sender failed live collaborator-role check", "sender", payload.Sender.Login, "repo", payload.Repository.FullName, "has_write", hasWrite, "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return collaboratorCheckOutcome(err)
 	}
 
 	label := labelApproved
@@ -172,15 +182,17 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	if rejected {
 		if err := s.runner.RecordRejection(ctx, taskID, payload.Sender.Login, evidence); err != nil {
 			slog.ErrorContext(ctx, "webhook: record rejection failed", "error", err)
+			w.WriteHeader(http.StatusOK)
+			return instrumented.WebhookFailed
 		}
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookProcessed
 	}
 
 	if err := s.runner.RecordApproval(ctx, taskID, payload.Sender.Login, evidence); err != nil {
 		slog.ErrorContext(ctx, "webhook: record approval failed", "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookFailed
 	}
 	// Resume in a new goroutine (design §4.4 step 5) so the webhook
 	// response returns fast — the task's execution must outlive this
@@ -197,6 +209,7 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	w.WriteHeader(http.StatusOK)
+	return instrumented.WebhookProcessed
 }
 
 // handleIssueOpened implements Task Intent Propagation design §3: a Forgejo
@@ -209,24 +222,24 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 // approving a publish, isn't itself irreversible. Every failure path is
 // fail-closed: logged, no task created, 200 returned regardless (never
 // revealing to an unauthorized caller why nothing happened).
-func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, repo gitclient.RepoRef, payload forgejoIssueWebhook) {
+func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, repo gitclient.RepoRef, payload forgejoIssueWebhook) string {
 	taskID := fmt.Sprintf("issue-%s-%d", strings.ReplaceAll(payload.Repository.FullName, "/", "-"), payload.Issue.Number)
 	ctx = logging.WithTask(ctx, taskID)
 
 	if _, ok, err := s.runner.GetTaskStatus(ctx, taskID); err != nil {
 		slog.ErrorContext(ctx, "webhook: check existing task failed", "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookFailed
 	} else if ok {
 		w.WriteHeader(http.StatusOK)
-		return
+		return instrumented.WebhookIgnored
 	}
 
 	hasWrite, err := s.git.VerifyCollaboratorRole(ctx, repo, payload.Sender.Login, gitclient.RoleWrite)
 	if err != nil || !hasWrite {
 		slog.WarnContext(ctx, "webhook: sender failed live collaborator-role check", "sender", payload.Sender.Login, "repo", payload.Repository.FullName, "has_write", hasWrite, "error", err)
 		w.WriteHeader(http.StatusOK)
-		return
+		return collaboratorCheckOutcome(err)
 	}
 
 	task := domain.Task{
@@ -241,8 +254,20 @@ func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, r
 	}
 	if _, _, err := s.runner.Start(ctx, task); err != nil {
 		slog.ErrorContext(ctx, "webhook: start task failed", "error", err)
+		w.WriteHeader(http.StatusOK)
+		return instrumented.WebhookFailed
 	}
 	w.WriteHeader(http.StatusOK)
+	return instrumented.WebhookProcessed
+}
+
+// collaboratorCheckOutcome: a role check that couldn't run is a processing
+// failure; one that ran and said no is a rejected sender.
+func collaboratorCheckOutcome(err error) string {
+	if err != nil {
+		return instrumented.WebhookFailed
+	}
+	return instrumented.WebhookRejected
 }
 
 // verifyForgejoSignature checks body's HMAC-SHA256 (hex-encoded) against

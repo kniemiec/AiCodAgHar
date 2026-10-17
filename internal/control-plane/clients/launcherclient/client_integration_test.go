@@ -5,9 +5,11 @@ package launcherclient_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	giteasdk "code.gitea.io/sdk/gitea"
 
@@ -102,6 +104,41 @@ func TestClient_UnknownPayloadRefFails(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error for an unknown payload_ref")
+	}
+}
+
+// LA-4 / design §7: a failed launch still reports its outcome — the mock
+// attaches its LaunchResponse as a status detail, like the real launcher.
+// The post-pr-comment fixture fails without its env.
+func TestClient_FailedLaunchCarriesOutcome(t *testing.T) {
+	client := newTestClient(t)
+	_, err := client.Launch(context.Background(), launcherclient.LaunchRequest{
+		InvocationID:   "inv-detail-1",
+		TaskID:         "task-1",
+		StepType:       "agent-stage",
+		StepID:         "review",
+		PayloadRef:     "post-pr-comment",
+		TimeoutSeconds: 42,
+	})
+	var le *launcherclient.LaunchError
+	if !errors.As(err, &le) {
+		t.Fatalf("err = %v, want a *LaunchError carrying the outcome", err)
+	}
+	if le.Outcome != launcherclient.OutcomeGuestError || le.Result.EffectiveTimeout != 42*time.Second {
+		t.Errorf("LaunchError = %+v", le)
+	}
+}
+
+func TestClient_SuccessCarriesOutcome(t *testing.T) {
+	client := newTestClient(t)
+	result, err := client.Launch(context.Background(), launcherclient.LaunchRequest{
+		InvocationID: "inv-outcome-ok-1", TaskID: "task-1", StepType: "agent-stage", StepID: "review", PayloadRef: "noop-success",
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if result.Outcome != launcherclient.OutcomeCompleted {
+		t.Errorf("Outcome = %q, want completed", result.Outcome)
 	}
 }
 

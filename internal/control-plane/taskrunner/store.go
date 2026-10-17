@@ -10,6 +10,7 @@ package taskrunner
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/approval"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/policyclient"
@@ -72,6 +73,11 @@ type TaskStore interface {
 	// with the time it entered it (latest approval.requested for
 	// waiting_approval, latest task.failed for failed, else updated_at).
 	ListTasksByStatus(ctx context.Context, status string) ([]domain.TaskAge, error)
+
+	// FleetSnapshot reads the gauge inputs (task counts by status, stuck
+	// running tasks, waiting approvals) — design §6. A running task is stuck
+	// when its latest event is older than stuckAfter.
+	FleetSnapshot(ctx context.Context, stuckAfter time.Duration) (domain.FleetSnapshot, error)
 
 	// RecordStepLaunched inserts a step_runs row the instant a step is
 	// dispatched (status=launched), before its outcome is known.

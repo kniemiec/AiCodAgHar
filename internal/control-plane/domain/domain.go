@@ -65,6 +65,21 @@ type StepRun struct {
 	HasFinding       bool
 	StructuredResult []byte
 	Status           string // launched | completed | failed ("" when not persistence-backed)
+
+	// Launch is what the launcher reported about this step's invocation
+	// (outcome and timings, platform-observability design §7). It is set on
+	// failed steps too, when the launcher got far enough to report. Not
+	// persisted in step_runs; it travels into the step.resolved event.
+	Launch LaunchInfo
+}
+
+// LaunchInfo is the launcher's own account of one invocation.
+type LaunchInfo struct {
+	Outcome          string // completed | boot_failure | timeout | guest_error | killed; "" if unknown
+	QueueWait        time.Duration
+	Boot             time.Duration
+	GuestRun         time.Duration
+	EffectiveTimeout time.Duration
 }
 
 // step_runs.status values (design §4.2/§5).
@@ -109,6 +124,9 @@ const (
 	TaskStatusStopEscalate    = "stop_escalate"
 	TaskStatusFailed          = "failed"
 )
+
+// TaskStatuses is every task status, for gauges that report zero counts too.
+var TaskStatuses = []string{TaskStatusRunning, TaskStatusWaitingApproval, TaskStatusStopSuccess, TaskStatusStopEscalate, TaskStatusFailed}
 
 // TaskRecord is a Task joined with its live TaskState — what TaskStore.GetTask
 // reads back, since both live in the same orchestrator.tasks row.

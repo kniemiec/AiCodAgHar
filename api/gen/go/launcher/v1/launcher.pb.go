@@ -9,6 +9,7 @@ package launcherv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
@@ -21,6 +22,67 @@ const (
 	// Verify that runtime/protoimpl is sufficiently up-to-date.
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
+
+// LaunchOutcome is the closed set of invocation outcomes (LA-1). It refines
+// LaunchResponse.status: "error" splits into BOOT_FAILURE (the guest never
+// started) and GUEST_ERROR (it started and then failed).
+type LaunchOutcome int32
+
+const (
+	LaunchOutcome_LAUNCH_OUTCOME_UNSPECIFIED  LaunchOutcome = 0
+	LaunchOutcome_LAUNCH_OUTCOME_COMPLETED    LaunchOutcome = 1
+	LaunchOutcome_LAUNCH_OUTCOME_BOOT_FAILURE LaunchOutcome = 2
+	LaunchOutcome_LAUNCH_OUTCOME_TIMEOUT      LaunchOutcome = 3
+	LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR  LaunchOutcome = 4
+	LaunchOutcome_LAUNCH_OUTCOME_KILLED       LaunchOutcome = 5
+)
+
+// Enum value maps for LaunchOutcome.
+var (
+	LaunchOutcome_name = map[int32]string{
+		0: "LAUNCH_OUTCOME_UNSPECIFIED",
+		1: "LAUNCH_OUTCOME_COMPLETED",
+		2: "LAUNCH_OUTCOME_BOOT_FAILURE",
+		3: "LAUNCH_OUTCOME_TIMEOUT",
+		4: "LAUNCH_OUTCOME_GUEST_ERROR",
+		5: "LAUNCH_OUTCOME_KILLED",
+	}
+	LaunchOutcome_value = map[string]int32{
+		"LAUNCH_OUTCOME_UNSPECIFIED":  0,
+		"LAUNCH_OUTCOME_COMPLETED":    1,
+		"LAUNCH_OUTCOME_BOOT_FAILURE": 2,
+		"LAUNCH_OUTCOME_TIMEOUT":      3,
+		"LAUNCH_OUTCOME_GUEST_ERROR":  4,
+		"LAUNCH_OUTCOME_KILLED":       5,
+	}
+)
+
+func (x LaunchOutcome) Enum() *LaunchOutcome {
+	p := new(LaunchOutcome)
+	*p = x
+	return p
+}
+
+func (x LaunchOutcome) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LaunchOutcome) Descriptor() protoreflect.EnumDescriptor {
+	return file_launcher_v1_launcher_proto_enumTypes[0].Descriptor()
+}
+
+func (LaunchOutcome) Type() protoreflect.EnumType {
+	return &file_launcher_v1_launcher_proto_enumTypes[0]
+}
+
+func (x LaunchOutcome) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LaunchOutcome.Descriptor instead.
+func (LaunchOutcome) EnumDescriptor() ([]byte, []int) {
+	return file_launcher_v1_launcher_proto_rawDescGZIP(), []int{0}
+}
 
 type LaunchRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -123,14 +185,22 @@ func (x *LaunchRequest) GetGrantedScopes() []string {
 }
 
 type LaunchResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	InvocationId  string                 `protobuf:"bytes,1,opt,name=invocation_id,json=invocationId,proto3" json:"invocation_id,omitempty"`
-	ExitCode      int32                  `protobuf:"varint,2,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
-	Status        string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"` // completed | timed_out | killed | error
-	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
-	FinishedAt    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=finished_at,json=finishedAt,proto3" json:"finished_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	InvocationId string                 `protobuf:"bytes,1,opt,name=invocation_id,json=invocationId,proto3" json:"invocation_id,omitempty"`
+	ExitCode     int32                  `protobuf:"varint,2,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	Status       string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"` // completed | timed_out | killed | error
+	StartedAt    *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	FinishedAt   *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=finished_at,json=finishedAt,proto3" json:"finished_at,omitempty"`
+	// Fields 6-10 are additive (platform-observability design §7). On a failed
+	// Launch the whole LaunchResponse also travels as a gRPC status detail, so
+	// the caller still learns the outcome and timings.
+	Outcome                 LaunchOutcome        `protobuf:"varint,6,opt,name=outcome,proto3,enum=launcher.v1.LaunchOutcome" json:"outcome,omitempty"`
+	QueueWait               *durationpb.Duration `protobuf:"bytes,7,opt,name=queue_wait,json=queueWait,proto3" json:"queue_wait,omitempty"`                                               // waiting for the VM slot
+	Boot                    *durationpb.Duration `protobuf:"bytes,8,opt,name=boot,proto3" json:"boot,omitempty"`                                                                          // jail setup through InstanceStart
+	GuestRun                *durationpb.Duration `protobuf:"bytes,9,opt,name=guest_run,json=guestRun,proto3" json:"guest_run,omitempty"`                                                  // InstanceStart through completion
+	EffectiveTimeoutSeconds int32                `protobuf:"varint,10,opt,name=effective_timeout_seconds,json=effectiveTimeoutSeconds,proto3" json:"effective_timeout_seconds,omitempty"` // the caller's timeout, or the launcher default
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *LaunchResponse) Reset() {
@@ -196,6 +266,41 @@ func (x *LaunchResponse) GetFinishedAt() *timestamppb.Timestamp {
 		return x.FinishedAt
 	}
 	return nil
+}
+
+func (x *LaunchResponse) GetOutcome() LaunchOutcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return LaunchOutcome_LAUNCH_OUTCOME_UNSPECIFIED
+}
+
+func (x *LaunchResponse) GetQueueWait() *durationpb.Duration {
+	if x != nil {
+		return x.QueueWait
+	}
+	return nil
+}
+
+func (x *LaunchResponse) GetBoot() *durationpb.Duration {
+	if x != nil {
+		return x.Boot
+	}
+	return nil
+}
+
+func (x *LaunchResponse) GetGuestRun() *durationpb.Duration {
+	if x != nil {
+		return x.GuestRun
+	}
+	return nil
+}
+
+func (x *LaunchResponse) GetEffectiveTimeoutSeconds() int32 {
+	if x != nil {
+		return x.EffectiveTimeoutSeconds
+	}
+	return 0
 }
 
 type KillRequest struct {
@@ -394,7 +499,7 @@ var File_launcher_v1_launcher_proto protoreflect.FileDescriptor
 
 const file_launcher_v1_launcher_proto_rawDesc = "" +
 	"\n" +
-	"\x1alauncher/v1/launcher.proto\x12\vlauncher.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe3\x02\n" +
+	"\x1alauncher/v1/launcher.proto\x12\vlauncher.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe3\x02\n" +
 	"\rLaunchRequest\x12#\n" +
 	"\rinvocation_id\x18\x01 \x01(\tR\finvocationId\x12\x17\n" +
 	"\atask_id\x18\x02 \x01(\tR\x06taskId\x12\x1b\n" +
@@ -407,7 +512,7 @@ const file_launcher_v1_launcher_proto_rawDesc = "" +
 	"\x0egranted_scopes\x18\b \x03(\tR\rgrantedScopes\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe2\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf5\x03\n" +
 	"\x0eLaunchResponse\x12#\n" +
 	"\rinvocation_id\x18\x01 \x01(\tR\finvocationId\x12\x1b\n" +
 	"\texit_code\x18\x02 \x01(\x05R\bexitCode\x12\x16\n" +
@@ -415,7 +520,14 @@ const file_launcher_v1_launcher_proto_rawDesc = "" +
 	"\n" +
 	"started_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12;\n" +
 	"\vfinished_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"finishedAt\"2\n" +
+	"finishedAt\x124\n" +
+	"\aoutcome\x18\x06 \x01(\x0e2\x1a.launcher.v1.LaunchOutcomeR\aoutcome\x128\n" +
+	"\n" +
+	"queue_wait\x18\a \x01(\v2\x19.google.protobuf.DurationR\tqueueWait\x12-\n" +
+	"\x04boot\x18\b \x01(\v2\x19.google.protobuf.DurationR\x04boot\x126\n" +
+	"\tguest_run\x18\t \x01(\v2\x19.google.protobuf.DurationR\bguestRun\x12:\n" +
+	"\x19effective_timeout_seconds\x18\n" +
+	" \x01(\x05R\x17effectiveTimeoutSeconds\"2\n" +
 	"\vKillRequest\x12#\n" +
 	"\rinvocation_id\x18\x01 \x01(\tR\finvocationId\"&\n" +
 	"\fKillResponse\x12\x16\n" +
@@ -425,7 +537,14 @@ const file_launcher_v1_launcher_proto_rawDesc = "" +
 	"\x13ExtractLogsResponse\x12\x16\n" +
 	"\x06stdout\x18\x01 \x01(\fR\x06stdout\x12\x16\n" +
 	"\x06stderr\x18\x02 \x01(\fR\x06stderr\x124\n" +
-	"\x16structured_result_json\x18\x03 \x01(\fR\x14structuredResultJson2\xec\x01\n" +
+	"\x16structured_result_json\x18\x03 \x01(\fR\x14structuredResultJson*\xc5\x01\n" +
+	"\rLaunchOutcome\x12\x1e\n" +
+	"\x1aLAUNCH_OUTCOME_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18LAUNCH_OUTCOME_COMPLETED\x10\x01\x12\x1f\n" +
+	"\x1bLAUNCH_OUTCOME_BOOT_FAILURE\x10\x02\x12\x1a\n" +
+	"\x16LAUNCH_OUTCOME_TIMEOUT\x10\x03\x12\x1e\n" +
+	"\x1aLAUNCH_OUTCOME_GUEST_ERROR\x10\x04\x12\x19\n" +
+	"\x15LAUNCH_OUTCOME_KILLED\x10\x052\xec\x01\n" +
 	"\x18ContainerLauncherService\x12A\n" +
 	"\x06Launch\x12\x1a.launcher.v1.LaunchRequest\x1a\x1b.launcher.v1.LaunchResponse\x12;\n" +
 	"\x04Kill\x12\x18.launcher.v1.KillRequest\x1a\x19.launcher.v1.KillResponse\x12P\n" +
@@ -443,32 +562,39 @@ func file_launcher_v1_launcher_proto_rawDescGZIP() []byte {
 	return file_launcher_v1_launcher_proto_rawDescData
 }
 
+var file_launcher_v1_launcher_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_launcher_v1_launcher_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_launcher_v1_launcher_proto_goTypes = []any{
-	(*LaunchRequest)(nil),         // 0: launcher.v1.LaunchRequest
-	(*LaunchResponse)(nil),        // 1: launcher.v1.LaunchResponse
-	(*KillRequest)(nil),           // 2: launcher.v1.KillRequest
-	(*KillResponse)(nil),          // 3: launcher.v1.KillResponse
-	(*ExtractLogsRequest)(nil),    // 4: launcher.v1.ExtractLogsRequest
-	(*ExtractLogsResponse)(nil),   // 5: launcher.v1.ExtractLogsResponse
-	nil,                           // 6: launcher.v1.LaunchRequest.EnvEntry
-	(*timestamppb.Timestamp)(nil), // 7: google.protobuf.Timestamp
+	(LaunchOutcome)(0),            // 0: launcher.v1.LaunchOutcome
+	(*LaunchRequest)(nil),         // 1: launcher.v1.LaunchRequest
+	(*LaunchResponse)(nil),        // 2: launcher.v1.LaunchResponse
+	(*KillRequest)(nil),           // 3: launcher.v1.KillRequest
+	(*KillResponse)(nil),          // 4: launcher.v1.KillResponse
+	(*ExtractLogsRequest)(nil),    // 5: launcher.v1.ExtractLogsRequest
+	(*ExtractLogsResponse)(nil),   // 6: launcher.v1.ExtractLogsResponse
+	nil,                           // 7: launcher.v1.LaunchRequest.EnvEntry
+	(*timestamppb.Timestamp)(nil), // 8: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),   // 9: google.protobuf.Duration
 }
 var file_launcher_v1_launcher_proto_depIdxs = []int32{
-	6, // 0: launcher.v1.LaunchRequest.env:type_name -> launcher.v1.LaunchRequest.EnvEntry
-	7, // 1: launcher.v1.LaunchResponse.started_at:type_name -> google.protobuf.Timestamp
-	7, // 2: launcher.v1.LaunchResponse.finished_at:type_name -> google.protobuf.Timestamp
-	0, // 3: launcher.v1.ContainerLauncherService.Launch:input_type -> launcher.v1.LaunchRequest
-	2, // 4: launcher.v1.ContainerLauncherService.Kill:input_type -> launcher.v1.KillRequest
-	4, // 5: launcher.v1.ContainerLauncherService.ExtractLogs:input_type -> launcher.v1.ExtractLogsRequest
-	1, // 6: launcher.v1.ContainerLauncherService.Launch:output_type -> launcher.v1.LaunchResponse
-	3, // 7: launcher.v1.ContainerLauncherService.Kill:output_type -> launcher.v1.KillResponse
-	5, // 8: launcher.v1.ContainerLauncherService.ExtractLogs:output_type -> launcher.v1.ExtractLogsResponse
-	6, // [6:9] is the sub-list for method output_type
-	3, // [3:6] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	7,  // 0: launcher.v1.LaunchRequest.env:type_name -> launcher.v1.LaunchRequest.EnvEntry
+	8,  // 1: launcher.v1.LaunchResponse.started_at:type_name -> google.protobuf.Timestamp
+	8,  // 2: launcher.v1.LaunchResponse.finished_at:type_name -> google.protobuf.Timestamp
+	0,  // 3: launcher.v1.LaunchResponse.outcome:type_name -> launcher.v1.LaunchOutcome
+	9,  // 4: launcher.v1.LaunchResponse.queue_wait:type_name -> google.protobuf.Duration
+	9,  // 5: launcher.v1.LaunchResponse.boot:type_name -> google.protobuf.Duration
+	9,  // 6: launcher.v1.LaunchResponse.guest_run:type_name -> google.protobuf.Duration
+	1,  // 7: launcher.v1.ContainerLauncherService.Launch:input_type -> launcher.v1.LaunchRequest
+	3,  // 8: launcher.v1.ContainerLauncherService.Kill:input_type -> launcher.v1.KillRequest
+	5,  // 9: launcher.v1.ContainerLauncherService.ExtractLogs:input_type -> launcher.v1.ExtractLogsRequest
+	2,  // 10: launcher.v1.ContainerLauncherService.Launch:output_type -> launcher.v1.LaunchResponse
+	4,  // 11: launcher.v1.ContainerLauncherService.Kill:output_type -> launcher.v1.KillResponse
+	6,  // 12: launcher.v1.ContainerLauncherService.ExtractLogs:output_type -> launcher.v1.ExtractLogsResponse
+	10, // [10:13] is the sub-list for method output_type
+	7,  // [7:10] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_launcher_v1_launcher_proto_init() }
@@ -481,13 +607,14 @@ func file_launcher_v1_launcher_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_launcher_v1_launcher_proto_rawDesc), len(file_launcher_v1_launcher_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_launcher_v1_launcher_proto_goTypes,
 		DependencyIndexes: file_launcher_v1_launcher_proto_depIdxs,
+		EnumInfos:         file_launcher_v1_launcher_proto_enumTypes,
 		MessageInfos:      file_launcher_v1_launcher_proto_msgTypes,
 	}.Build()
 	File_launcher_v1_launcher_proto = out.File

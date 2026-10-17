@@ -36,6 +36,11 @@ type FakeTaskStore struct {
 	// *before* touching state — the in-memory equivalent of an event INSERT
 	// violating a row inside the Postgres transaction (TS-3).
 	FailEventAppend func(domain.TaskEvent) error
+
+	// Observer, when set, sees every batch of events right after it is
+	// stored — PostgresTaskStore.SetEventObserver's in-memory equivalent
+	// (metrics are derived from committed events, design §6).
+	Observer func(context.Context, []domain.TaskEvent)
 }
 
 // appendEvents stamps and stores events; callers hold f.mu. It validates
@@ -48,10 +53,15 @@ func (f *FakeTaskStore) appendEvents(events []domain.TaskEvent) error {
 			}
 		}
 	}
+	stored := make([]domain.TaskEvent, 0, len(events))
 	for _, e := range events {
 		e.ID = int64(len(f.events) + 1)
 		e.At = time.Now()
 		f.events = append(f.events, e)
+		stored = append(stored, e)
+	}
+	if f.Observer != nil && len(stored) > 0 {
+		f.Observer(context.Background(), stored)
 	}
 	return nil
 }
@@ -244,6 +254,43 @@ func (f *FakeTaskStore) ListTasksByStatus(ctx context.Context, status string) ([
 	return out, nil
 }
 
+func (f *FakeTaskStore) FleetSnapshot(ctx context.Context, stuckAfter time.Duration) (domain.FleetSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	snap := domain.FleetSnapshot{ByStatus: map[string]int{}}
+	now := time.Now()
+	for id, rec := range f.tasks {
+		snap.ByStatus[rec.State.Status]++
+		var last, requested time.Time
+		for _, e := range f.events {
+			if e.TaskID != id {
+				continue
+			}
+			last = e.At
+			if e.Type == domain.EventApprovalRequested {
+				requested = e.At
+			}
+		}
+		if last.IsZero() {
+			last = rec.State.UpdatedAt
+		}
+		switch rec.State.Status {
+		case domain.TaskStatusRunning:
+			if now.Sub(last) > stuckAfter {
+				snap.Stuck++
+			}
+		case domain.TaskStatusWaitingApproval:
+			if requested.IsZero() {
+				requested = rec.State.UpdatedAt
+			}
+			snap.WaitingApprovals++
+			snap.OldestApprovalWait = max(snap.OldestApprovalWait, now.Sub(requested))
+		}
+	}
+	return snap, nil
+}
+
 func (f *FakeTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -313,7 +360,7 @@ func (f *FakeTaskStore) CompleteStepRun(ctx context.Context, taskID string, invo
 	rows := f.stepRuns[loc.taskID][loc.round]
 	existing := rows[loc.idx]
 	if err := f.appendEvents([]domain.TaskEvent{
-		domain.StepResolvedEvent(taskID, loc.round, existing.StepID, invocationID, run, execErr, time.Since(f.launched[invocationID])),
+		domain.StepResolvedEvent(taskID, loc.round, existing.StepID, existing.StepType, invocationID, run, execErr, time.Since(f.launched[invocationID])),
 	}); err != nil {
 		return err
 	}

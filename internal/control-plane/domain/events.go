@@ -45,6 +45,19 @@ type FailureRecord struct {
 	Reason    string
 }
 
+// FleetSnapshot is the fleet-wide state the gauges report (design §6, MT-7,
+// MT-9), read in one store call per collection.
+type FleetSnapshot struct {
+	ByStatus map[string]int
+	// Stuck counts running tasks with no event for longer than the stuck
+	// interval (SLO-1).
+	Stuck int
+	// WaitingApprovals and OldestApprovalWait describe tasks in
+	// waiting_approval, aged from their latest approval.requested.
+	WaitingApprovals   int
+	OldestApprovalWait time.Duration
+}
+
 // TaskAge is one row of the admin "tasks by status" listing.
 type TaskAge struct {
 	TaskID string
@@ -107,9 +120,18 @@ func StepLaunchedEvent(taskID string, round int, stepID, invocationID, stepType,
 }
 
 // StepResolvedEvent is written by CompleteStepRun in the same transaction.
-// execErr is the executor's own error (nil on success).
-func StepResolvedEvent(taskID string, round int, stepID, invocationID string, run StepRun, execErr error, duration time.Duration) TaskEvent {
-	payload := map[string]any{"duration_ms": duration.Milliseconds()}
+// execErr is the executor's own error (nil on success); stepType comes from
+// the step_runs row. run.Launch, when the launcher reported one, adds the
+// launcher's outcome and timings (design §7) — on failures too.
+func StepResolvedEvent(taskID string, round int, stepID, stepType, invocationID string, run StepRun, execErr error, duration time.Duration) TaskEvent {
+	payload := map[string]any{"duration_ms": duration.Milliseconds(), "step_type": stepType}
+	if l := run.Launch; l.Outcome != "" {
+		payload["launcher_outcome"] = l.Outcome
+		payload["queue_wait_ms"] = l.QueueWait.Milliseconds()
+		payload["boot_ms"] = l.Boot.Milliseconds()
+		payload["run_ms"] = l.GuestRun.Milliseconds()
+		payload["effective_timeout_s"] = int64(l.EffectiveTimeout / time.Second)
+	}
 	if execErr != nil {
 		class, _, dep := failure.Classify(execErr)
 		payload["outcome"] = StepRunStatusFailed

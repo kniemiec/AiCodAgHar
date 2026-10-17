@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -80,5 +81,18 @@ func TestSensitiveViaWithAttrsLoggerStillFiltered(t *testing.T) {
 	l.InfoContext(context.Background(), "x", Sensitive())
 	if len(sink.msgs) != 0 {
 		t.Errorf("sink got %v", sink.msgs)
+	}
+}
+
+// Extra sinks (the OTLP bridge accepts every level) still honour LOG_LEVEL;
+// a nil sink (telemetry disabled) is ignored.
+func TestExtraSinksHonourLogLevel(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	sink := &captureSink{}
+	l := slog.New(NewHandler(io.Discard, "test", sink, nil))
+	l.DebugContext(context.Background(), "chatter")
+	l.InfoContext(context.Background(), "lifecycle")
+	if len(sink.msgs) != 1 || sink.msgs[0] != "lifecycle" {
+		t.Errorf("sink got %v, want only the info record", sink.msgs)
 	}
 }

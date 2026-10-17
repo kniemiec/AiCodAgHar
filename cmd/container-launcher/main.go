@@ -16,7 +16,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -28,10 +30,18 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/buildinfo"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/egress"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 func main() {
-	logging.Setup("container-launcher")
+	// Telemetry first, so the OTLP log sink (when enabled) sees startup too.
+	tel, err := telemetry.Setup(context.Background(), "container-launcher")
+	if err != nil {
+		logging.Setup("container-launcher")
+		log.Fatalf("container-launcher: telemetry: %v", err)
+	}
+	logging.Setup("container-launcher", tel.LogHandler)
+	tel.RegisterBuildInfo()
 	cfg := loadConfig()
 	slog.Info("container-launcher starting",
 		"version", buildinfo.Version, "commit", buildinfo.Commit, "health_addr", cfg.HealthAddr,
@@ -39,7 +49,8 @@ func main() {
 		"jailer_binary", cfg.JailerBinary, "firecracker_binary", cfg.FirecrackerBinary,
 		"jailer_uid", cfg.JailerUID, "jailer_gid", cfg.JailerGID,
 		"default_timeout_seconds", cfg.DefaultTimeoutSeconds,
-		"llm_model", cfg.LLMModel, "llm_api_key_set", cfg.LLMAPIKey != "")
+		"llm_model", cfg.LLMModel, "llm_api_key_set", cfg.LLMAPIKey != "",
+		"otlp_export", tel.LogHandler != nil)
 
 	// Static, one-time host-level egress setup (design §10) — must
 	// complete before the first Launch call, so it runs at startup, not
@@ -74,13 +85,34 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer(grpc.Creds(creds), grpc.UnaryInterceptor(logUnaryRPC))
-	launcherv1.RegisterContainerLauncherServiceServer(grpcServer, newLauncherServer(cfg))
+	srv := newLauncherServer(cfg)
+	srv.metrics = newLauncherMetrics(tel.Meter(), srv)
+	launcherv1.RegisterContainerLauncherServiceServer(grpcServer, srv)
+
+	// On SIGINT/SIGTERM stop serving (in-flight invocations are cancelled,
+	// which tears their VMs down) and flush telemetry before exiting.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		slog.Info("container-launcher shutting down")
+		grpcServer.Stop()
+	}()
 
 	slog.Info("container-launcher listening (mTLS)", "addr", cfg.Addr)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("container-launcher: serve: %v", err)
+	serveErr := grpcServer.Serve(lis)
+	flushCtx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
+	defer cancel()
+	if err := tel.Shutdown(flushCtx); err != nil {
+		slog.Warn("container-launcher: telemetry shutdown", "error", err)
+	}
+	if serveErr != nil && ctx.Err() == nil {
+		log.Fatalf("container-launcher: serve: %v", serveErr)
 	}
 }
+
+// telemetryFlushTimeout bounds the final telemetry flush on exit.
+const telemetryFlushTimeout = 5 * time.Second
 
 // logUnaryRPC logs every RPC with its outcome code. Requests rejected
 // before the handler logs anything (e.g. InvalidArgument) still show up.

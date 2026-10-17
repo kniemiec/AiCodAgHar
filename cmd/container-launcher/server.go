@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
@@ -64,6 +67,32 @@ type bootOutcome struct {
 	status               string
 	structuredResultJSON []byte
 	stdout               []byte
+
+	// reachedGuest is set once the guest is running and its completion is
+	// being awaited, so an "error" after that point is GUEST_ERROR rather
+	// than BOOT_FAILURE (platform-observability design §7).
+	reachedGuest bool
+	// boot is jail setup through InstanceStart; run is InstanceStart
+	// through completion (zero if the guest never started).
+	boot, run time.Duration
+	// redactions counts secret values vsock.RedactCounted replaced.
+	redactions int
+}
+
+// classify maps a bootOutcome onto the closed LaunchOutcome set (LA-1).
+func classify(o bootOutcome) launcherv1.LaunchOutcome {
+	switch o.status {
+	case "completed":
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_COMPLETED
+	case "timed_out":
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_TIMEOUT
+	case "killed":
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_KILLED
+	}
+	if o.reachedGuest {
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR
+	}
+	return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_BOOT_FAILURE
 }
 
 type invocationRecord struct {
@@ -99,6 +128,14 @@ type launcherServer struct {
 	// the whole invocation; callers that fan out (coreloop.fanOut) queue
 	// here instead. Waiting is cancellable by Kill.
 	vmSlot chan struct{}
+	// waiters counts Launch calls queued for vmSlot (launcher_queue_depth).
+	waiters atomic.Int64
+
+	// defaultTimeoutSeconds is LAUNCHER_DEFAULT_TIMEOUT_SECONDS, used to
+	// report the effective timeout on every response (LA-3).
+	defaultTimeoutSeconds int
+	// metrics is nil-safe: tests build launcherServer without it.
+	metrics *launcherMetrics
 
 	mu          sync.Mutex
 	invocations map[string]invocationRecord
@@ -107,10 +144,11 @@ type launcherServer struct {
 
 func newLauncherServer(cfg config) *launcherServer {
 	return &launcherServer{
-		booter:      newFirecrackerLauncher(cfg),
-		vmSlot:      make(chan struct{}, 1),
-		invocations: map[string]invocationRecord{},
-		inFlight:    map[string]context.CancelCauseFunc{},
+		booter:                newFirecrackerLauncher(cfg),
+		vmSlot:                make(chan struct{}, 1),
+		defaultTimeoutSeconds: cfg.DefaultTimeoutSeconds,
+		invocations:           map[string]invocationRecord{},
+		inFlight:              map[string]context.CancelCauseFunc{},
 	}
 }
 
@@ -168,25 +206,39 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	startedAt := time.Now()
 	var outcome bootOutcome
 	var bootErr error
+	var queueWait time.Duration
+	s.waiters.Add(1)
 	select {
 	case s.vmSlot <- struct{}{}:
-		if waited := time.Since(startedAt); waited > time.Second {
-			log.InfoContext(ctx, "vm slot acquired", "waited", waited)
+		s.waiters.Add(-1)
+		queueWait = time.Since(startedAt)
+		if queueWait > time.Second {
+			log.InfoContext(ctx, "vm slot acquired", "waited", queueWait)
 		}
 		outcome, bootErr = s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
 		<-s.vmSlot
 	case <-killCtx.Done():
+		s.waiters.Add(-1)
+		queueWait = time.Since(startedAt)
 		outcome, bootErr = bootOutcome{status: statusForCancellation(killCtx)}, context.Cause(killCtx)
 	}
 	finishedAt := time.Now()
+	launchOutcome := classify(outcome)
+	effectiveTimeout := resolveTimeout(req.TimeoutSeconds, s.defaultTimeoutSeconds)
 
 	resp := &launcherv1.LaunchResponse{
-		InvocationId: req.InvocationId,
-		ExitCode:     outcome.exitCode,
-		Status:       outcome.status,
-		StartedAt:    timestamppb.New(startedAt),
-		FinishedAt:   timestamppb.New(finishedAt),
+		InvocationId:            req.InvocationId,
+		ExitCode:                outcome.exitCode,
+		Status:                  outcome.status,
+		StartedAt:               timestamppb.New(startedAt),
+		FinishedAt:              timestamppb.New(finishedAt),
+		Outcome:                 launchOutcome,
+		QueueWait:               durationpb.New(queueWait),
+		Boot:                    durationpb.New(outcome.boot),
+		GuestRun:                durationpb.New(outcome.run),
+		EffectiveTimeoutSeconds: int32(effectiveTimeout / time.Second),
 	}
+	s.metrics.observe(ctx, req.StepType, launchOutcome, queueWait, outcome.boot, outcome.run, outcome.redactions)
 
 	s.mu.Lock()
 	s.invocations[req.InvocationId] = invocationRecord{
@@ -198,18 +250,34 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	}
 	s.mu.Unlock()
 
-	attrs := []any{"status", outcome.status, "exit_code", outcome.exitCode, "duration", finishedAt.Sub(startedAt),
+	attrs := []any{"status", outcome.status, "outcome", outcomeLabel(launchOutcome), "exit_code", outcome.exitCode,
+		"duration", finishedAt.Sub(startedAt), "queue_wait", queueWait, "boot", outcome.boot, "guest_run", outcome.run,
+		"effective_timeout", effectiveTimeout, "redactions", outcome.redactions,
 		"stdout_bytes", len(outcome.stdout), "structured_result_bytes", len(outcome.structuredResultJSON)}
 	if bootErr != nil {
 		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
 		if len(outcome.stdout) > 0 {
 			log.WarnContext(ctx, "guest event log tail", logging.Sensitive(), "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
 		}
-		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
+		return resp, launchFailedStatus(ctx, resp, fmt.Sprintf("container-launcher: launch %s: %v", req.InvocationId, bootErr))
 	}
 	log.InfoContext(ctx, "launch finished", attrs...)
 	log.DebugContext(ctx, "structured result", logging.Sensitive(), "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
+}
+
+// launchFailedStatus is the Internal status a failed Launch returns, with
+// resp attached as a status detail: gRPC sends no response body alongside a
+// non-OK status, so this is how the caller still learns the outcome and
+// timings (design §7). Old clients ignore the detail.
+func launchFailedStatus(ctx context.Context, resp *launcherv1.LaunchResponse, msg string) error {
+	st := status.New(codes.Internal, msg)
+	withDetails, err := st.WithDetails(resp)
+	if err != nil {
+		slog.WarnContext(ctx, "could not attach launch response to error status", "error", err)
+		return st.Err()
+	}
+	return withDetails.Err()
 }
 
 // eventLogTailBytes is how much of a failed invocation's event log

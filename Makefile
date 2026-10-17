@@ -1,4 +1,4 @@
-.PHONY: build test test-spike test-integration test-e2e test-launcher-kvm compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
+.PHONY: build test test-spike test-integration test-e2e test-launcher-kvm compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy task-logs
 
 BUF := buf
 
@@ -51,6 +51,12 @@ test-e2e:
 
 tidy:
 	go mod tidy
+
+# One task's control-plane/launcher log lines from Loki, in time order
+# (platform-observability design §11). Needs the compose stack up.
+task-logs:
+	@test -n "$(TASK)" || { echo "usage: make task-logs TASK=<task_id>"; exit 2; }
+	./deploy/observability/task-logs.sh "$(TASK)"
 
 # KVM-gated: needs a Linux host with hardware virtualization, root (jailer
 # requires it), and the real jailer/firecracker binaries + golden image env

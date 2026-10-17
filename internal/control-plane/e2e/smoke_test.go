@@ -12,13 +12,17 @@ package e2e
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -508,4 +512,138 @@ func TestSmoke_ApprovalWebhookFlow(t *testing.T) {
 
 func base64Encode(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
+}
+
+// TestSmoke_TaskLogsInLoki is platform-observability design PR D's pipeline
+// check (LG-3…LG-5): a task's control-plane lines travel slog → OTLP →
+// Collector → Loki and come back by task_id alone, with task_id held as
+// structured metadata rather than an index label. Launcher lines aren't
+// covered: compose runs launcher-mock, which exports no telemetry.
+func TestSmoke_TaskLogsInLoki(t *testing.T) {
+	e := requireEnv(t)
+	lokiURL := os.Getenv("LOKI_URL")
+	if lokiURL == "" {
+		lokiURL = "http://localhost:3100"
+	}
+	if resp, err := http.Get(lokiURL + "/ready"); err != nil {
+		t.Fatalf("Loki not reachable at %s (it is part of `make compose-up`): %v", lokiURL, err)
+	} else {
+		resp.Body.Close()
+	}
+
+	start := time.Now().Add(-time.Minute)
+	taskID := postTask(t, e.controlPlaneURL, createTaskRequest{
+		TargetRepo:          e.owner + "/sample-repo",
+		BaseBranch:          "main",
+		RiskTier:            "low",
+		TriggeringPrincipal: "e2e-smoke-test-loki",
+		BotAccount:          "requesting-account",
+		Description:         "Driven by internal/control-plane/e2e/smoke_test.go (Loki scenario)",
+	})
+	if final := pollUntilTerminal(t, e.controlPlaneURL, taskID); final.Status != domain.TaskStatusStopSuccess {
+		t.Fatalf("expected stop_success, got %q (reason: %s)", final.Status, final.Reason)
+	}
+
+	// Export is batched (SDK, then Collector), so lines land a few seconds
+	// after the task finishes; wait for the last lifecycle line.
+	var lines []lokiLine
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		lines = queryLokiTaskLines(t, lokiURL, taskID, start)
+		if slices.ContainsFunc(lines, func(l lokiLine) bool { return l.msg == "round finished" }) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	if len(lines) == 0 {
+		t.Fatalf("no control-plane lines in Loki for task %s within 60s — check the otel-collector and loki container logs", taskID)
+	}
+	accepted, finished := -1, -1
+	for i, l := range lines {
+		if got := l.labels["task_id"]; got != taskID {
+			t.Fatalf("line %q carries task_id %q, want %q", l.msg, got, taskID)
+		}
+		if l.labels["service_name"] != "control-plane" {
+			t.Fatalf("line %q has service_name %q, want control-plane", l.msg, l.labels["service_name"])
+		}
+		switch l.msg {
+		case "task accepted":
+			accepted = i
+		case "round finished":
+			finished = i
+		}
+	}
+	if accepted < 0 || finished < 0 || accepted > finished {
+		t.Fatalf("want \"task accepted\" before \"round finished\" in time order, got positions %d and %d of %d lines", accepted, finished, len(lines))
+	}
+
+	// LG-4: task_id must stay structured metadata. A per-task index label
+	// would create one Loki stream per task.
+	resp, err := http.Get(lokiURL + "/loki/api/v1/labels")
+	if err != nil {
+		t.Fatalf("GET labels: %v", err)
+	}
+	defer resp.Body.Close()
+	var labels struct {
+		Data []string `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&labels); err != nil {
+		t.Fatalf("decode labels: %v", err)
+	}
+	if !slices.Contains(labels.Data, "service_name") {
+		t.Fatalf("index labels %v lack service_name — the labels query proves nothing", labels.Data)
+	}
+	for _, k := range []string{"task_id", "round", "step_id", "invocation_id"} {
+		if slices.Contains(labels.Data, k) {
+			t.Fatalf("%s is a Loki index label (%v); it must be structured metadata", k, labels.Data)
+		}
+	}
+}
+
+type lokiLine struct {
+	ts     int64
+	msg    string
+	labels map[string]string
+}
+
+// queryLokiTaskLines runs task-logs.sh's query (one service here) and
+// returns the lines merged across streams, oldest first.
+func queryLokiTaskLines(t *testing.T, lokiURL, taskID string, since time.Time) []lokiLine {
+	t.Helper()
+	q := fmt.Sprintf(`{service_name="control-plane"} | task_id=%q`, taskID)
+	u := fmt.Sprintf("%s/loki/api/v1/query_range?query=%s&start=%d&end=%d&limit=5000&direction=forward",
+		lokiURL, url.QueryEscape(q), since.UnixNano(), time.Now().Add(time.Minute).UnixNano())
+	resp, err := http.Get(u)
+	if err != nil {
+		t.Fatalf("Loki query: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Loki query: status %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		Data struct {
+			Result []struct {
+				Stream map[string]string `json:"stream"`
+				Values [][2]string       `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode Loki response: %v", err)
+	}
+	var lines []lokiLine
+	for _, s := range out.Data.Result {
+		for _, v := range s.Values {
+			ts, err := strconv.ParseInt(v[0], 10, 64)
+			if err != nil {
+				t.Fatalf("Loki timestamp %q: %v", v[0], err)
+			}
+			lines = append(lines, lokiLine{ts: ts, msg: v[1], labels: s.Stream})
+		}
+	}
+	slices.SortStableFunc(lines, func(a, b lokiLine) int { return cmp.Compare(a.ts, b.ts) })
+	return lines
 }

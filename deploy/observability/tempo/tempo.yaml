@@ -1,0 +1,30 @@
+# Tempo, monolithic mode (platform-observability design §11). Receives
+# traces over OTLP from the Collector; nothing emits spans until PR E.
+
+server:
+  http_listen_port: 3200
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+overrides:
+  defaults:
+    compaction:
+      # Retention (CC-3, provisional): 7 days.
+      block_retention: 168h
+
+usage_report:
+  reporting_enabled: false

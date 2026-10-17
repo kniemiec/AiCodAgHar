@@ -17,8 +17,16 @@ This is a testing/dev-environment concern, not part of the orchestrator's own ar
 | `launcher-mock` | Step launcher | `mocks/launcher-mock` | `9443` (mTLS only) |
 | `forgejo` | Git host (real) | `codeberg.org/forgejo/forgejo:16` | `3001` (UI/API), `2222` (SSH) |
 | `postgres` | `orchestrator` + `audit` schemas (real) | `postgres:16-alpine` | `5432` |
+| `otel-collector` | Per-host OpenTelemetry Collector | `otel/opentelemetry-collector-contrib:0.161.0` | `127.0.0.1:4317` (OTLP/gRPC), `127.0.0.1:4318` (OTLP/HTTP) |
+| `prometheus` | Metrics store (remote-write receiver) | `prom/prometheus:v3.15.0` | `127.0.0.1:9090` |
+| `alertmanager` | Alert routing (null receiver) | `prom/alertmanager:v0.34.1` | `127.0.0.1:9093` |
+| `loki` | Log store (OTLP ingest) | `grafana/loki:3.7.8` | `127.0.0.1:3100` |
+| `tempo` | Trace store (receives nothing until tracing lands) | `grafana/tempo:3.1.0` | `127.0.0.1:3200` |
+| `grafana` | UI over Prometheus/Loki/Tempo | `grafana/grafana:13.2.3` | `127.0.0.1:3002` (anonymous read-only; admin `admin` / `$GRAFANA_ADMIN_PASSWORD`, default `changeme-local-only`) |
 
 `pdp-mock` computes real decisions by reading `.harness/*.yaml` live from Forgejo. `launcher-mock` is fixture-driven but performs real Forgejo side effects (commits, comments) using the credential injected for each step. `secrets-mock` hands out a static, pre-provisioned bot-token pool. None of the three persist meaningfully beyond process lifetime.
+
+**Observability pipeline** (platform-observability design §11). The last six services are defined in `deploy/docker-compose.observability.yml` and pulled into `deploy/docker-compose.yml` with `include:` — needs **Docker Compose ≥ 2.20** — so every `docker compose -f deploy/docker-compose.yml …` command covers them. `control-plane` exports metrics and non-sensitive logs over OTLP to `otel-collector` (`OTEL_EXPORTER_OTLP_ENDPOINT`, `LOG_FORMAT=json`), which pushes logs to Loki, traces to Tempo and metrics to Prometheus by remote write; configs are under `deploy/observability/`. Retention (provisional, CC-3): Prometheus 30 d (`--storage.tsdb.retention.time`), Loki 14 d (`limits_config.retention_period`, compactor), Tempo 7 d (`overrides.defaults.compaction.block_retention`). Every port is on host loopback only — there is no authentication in front of any of these UIs yet. `launcher-mock` exports nothing. Image tags are pinned; bump them deliberately, never to `latest`.
 
 ## 2. Prerequisites
 
@@ -30,7 +38,7 @@ Go toolchain, Docker + Docker Compose, `openssl` (cert generation).
 cp deploy/.env.example deploy/.env
 #    (edit passwords if you want; the defaults are fine for local dev)
 
-make compose-up          # Forgejo + Postgres + the 3 mocks + control-plane; generates dev mTLS certs
+make compose-up          # Forgejo + Postgres + the 3 mocks + control-plane + observability pipeline; generates dev mTLS certs
 make bootstrap-admin      # mints a Forgejo admin token, recreates pdp-mock/control-plane to pick it up
 make migrate               # applies deploy/migrations/*.sql
 make seed                  # provisions bot accounts + the global-baseline and sample-repo config repos
@@ -38,7 +46,7 @@ make seed                  # provisions bot accounts + the global-baseline and s
 
 **Upgrading an existing stack across migration `006`** (failed status, `task_events`): stop the control-plane first — `docker compose -f deploy/docker-compose.yml stop control-plane` — then `make migrate`, rebuild (`docker compose -f deploy/docker-compose.yml build control-plane`) and `up -d`. `006` converts tasks the old code left `running` with an `error:` reason into retryable `failed` tasks, and a live `runLoop` could otherwise be flipped mid-flight. Afterwards, `GET /tasks/{id}/events` shows a task's timeline and, for a retryable failure, `curl -X POST localhost:8090/admin/tasks/<id>/retry -d '{"operator":"you"}'` resumes it.
 
-**Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). Set `LOG_FORMAT=json` to get `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` as fields. The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
+**Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). Compose sets `LOG_FORMAT=json`, so stderr lines carry `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` as fields. `make task-logs TASK=<task_id>` prints one task's lines from Loki in time order; Grafana is at `http://localhost:3002` (Explore → Loki). See [`docs/runbooks/observability.md`](runbooks/observability.md). The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
 
 After that: Forgejo at `http://localhost:3001` (admin login `forgejo-admin` / `changeme-local-only` — **not** `:3000`, and **not** the reserved `admin` username), `control-plane` at `http://localhost:8080`.
 
@@ -111,10 +119,12 @@ docker compose -f deploy/docker-compose.yml exec -T postgres \
 |---|---|---|---|
 | Integration | `compose-up` + `bootstrap-admin` + `migrate` | `make test-integration` | Each production client against its real/stand-in counterpart — incl. mTLS enforcement, the Postgres-role privilege test, and the tamper-detection test |
 | Spike | `compose-up` + `bootstrap-admin` | `make test-spike` | `code.gitea.io/sdk/gitea` actually covers `GitHostClient`'s surface |
-| E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/control-plane/e2e/smoke_test.go` |
+| E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/control-plane/e2e/smoke_test.go`. `TestSmoke_TaskLogsInLoki` also checks a task's control-plane lines reach Loki by `task_id` (`LOKI_URL`, default `http://localhost:3100`) |
 
 ## 6. Troubleshooting
 
+- **`make compose-up` fails with `include` unknown / "additional properties 'include' not allowed".** Docker Compose is older than 2.20; upgrade it (`docker compose version`).
+- **`make task-logs` finds nothing.** Lines reach Loki a few seconds after they're written (two batching stages). If still empty, `docker compose -f deploy/docker-compose.yml logs otel-collector loki`, and check `control-plane` was recreated after the compose change (`up -d control-plane`) so it has `OTEL_EXPORTER_OTLP_ENDPOINT`. Runbook §2 has more.
 - **Forgejo admin login doesn't work.** Check you're on **`:3001`**, not `:3000` — a leftover, unrelated Forgejo container from earlier work may be squatting on the default port. `docker ps --format '{{.Names}}: {{.Ports}}'` shows both if so.
 - **`pdp-mock` / `control-plane` crash-looping with "required env var FORGEJO_TOKEN is not set."** Expected before `make bootstrap-admin` has minted a token on a first-ever `compose-up` — it recreates both containers once the token exists. If you see this after that, check `deploy/.env` actually has `FORGEJO_ADMIN_TOKEN` set.
 - **A migration you just applied doesn't seem to take effect.** Postgres client connections (including `control-plane`'s pool) can cache prepared-statement type metadata from before a schema change. Restart the affected container after altering a column type.

@@ -1,0 +1,10 @@
+# Alertmanager (platform-observability design §11). Routing and on-call are
+# a process detail (ADR-5), so every alert goes to a receiver that sends
+# nothing; alerts are still visible in the Alertmanager UI.
+
+route:
+  receiver: "null"
+  group_by: [alertname]
+
+receivers:
+  - name: "null"

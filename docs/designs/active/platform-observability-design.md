@@ -398,6 +398,18 @@ HTTP surface: `GET /tasks/{id}` (+ additive fields, status `failed`), `GET /task
 - The launcher gained `SIGINT`/`SIGTERM` handling (`grpcServer.Stop`, then a 5 s telemetry flush) so the final export isn't lost; stopping cancels in-flight invocations, which tears their VMs down.
 - Not built: MT-17 (HTTP request metrics, "Could").
 
+**As built in PR D** (differences from §11/§17, narrowing or additive):
+
+- Pinned images (§17), each released at least two weeks before 2026-10-17 per Docker Hub push dates: `otel/opentelemetry-collector-contrib:0.161.0` (0.162.0 was 12 days old), `prom/prometheus:v3.15.0`, `prom/alertmanager:v0.34.1`, `grafana/loki:3.7.8`, `grafana/tempo:3.1.0`, `grafana/grafana:13.2.3`. Recorded in `docs/local-development.md` §1. Compose's `include:` was checked against Compose 2.29.7 (`docker compose config`).
+- Collector 0.161 names the exporters `otlp_http` / `otlp_grpc` (`otlphttp`/`otlp` are deprecated aliases), and `prometheusremotewrite`'s `resource_to_telemetry_conversion` is deprecated, so the config uses `resource_constant_labels: {included: [service.name, host.name, deployment.environment]}` instead. The Collector's own metrics are scraped by Prometheus (`job=otel-collector`, `:8888`), as are Loki, Tempo and Alertmanager, so SLO-9's `up{…}` has series. No `rule_files` yet (PR F).
+- Loki: `otlp_config.resource_attributes.ignore_defaults: true` with exactly the three §11 index labels; log attributes stay structured metadata (Loki's default). Retention via `limits_config.retention_period: 336h` + compactor. Tempo 3 (monolithic, no Kafka) sets retention as `overrides.defaults.compaction.block_retention: 168h`.
+- Networking: the pipeline lives on its own `telemetry` network (a second `orchestrator-net` definition in the included file would conflict); only `control-plane` joins both. It has no `depends_on` on the Collector, so an absent Collector can't hold the control-plane back (CC-4). Every pipeline port, including OTLP 4317/4318, is published on host loopback only; Grafana is `127.0.0.1:3002` (`:3000` is often a stray Forgejo), anonymous Viewer plus an `admin` login.
+- `launcher-mock` gets no `OTEL_*`/`ADMIN_ADDR` env: it's a stdlib-`log` mock with no telemetry, so §11's sentence about it would configure nothing. The e2e Loki check therefore covers control-plane lines only (as the Testing Strategy already anticipated); launcher lines through a per-host Collector are a manual check (runbook §4).
+- Compose sets `OTEL_METRIC_EXPORT_INTERVAL=15000` and `OTEL_RESOURCE_ATTRIBUTES=deployment.environment=local` on `control-plane`.
+- `task-logs.sh` rejects IDs outside `[A-Za-z0-9_-]` (no LogQL injection), merges Loki's per-label-set streams and sorts by timestamp. The e2e test is `TestSmoke_TaskLogsInLoki` in `smoke_test.go`; it also asserts `task_id`/`round`/`step_id`/`invocation_id` are not Loki index labels (the Named Risk on Loki label promotion).
+- Grafana provisions the Prometheus, Loki and Tempo datasources only; dashboards and the Postgres datasource are PR F. Runbook skeleton: `docs/runbooks/observability.md`.
+- Not verified in this change: the compose stack was not brought up (the Docker daemon wasn't running), so the configs were checked against the pinned versions' upstream docs, not by running them; the PR C note on metric-name suffixing is still unconfirmed.
+
 ### 16. Configuration reference
 
 | Variable | Binary | Default | Section |

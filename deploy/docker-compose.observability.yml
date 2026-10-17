@@ -1,0 +1,104 @@
+# Observability pipeline (platform-observability design §11, PR D): one
+# Collector (agent mode, as on each production host) pushing logs to Loki,
+# traces to Tempo and metrics to Prometheus by remote_write, plus
+# Alertmanager and Grafana. Pulled into deploy/docker-compose.yml with
+# `include:` (Compose >= 2.20), so `make compose-up` and every existing
+# `docker compose -f deploy/docker-compose.yml ...` command cover it.
+#
+# Image tags are pinned exactly; versions are recorded in
+# docs/local-development.md §1. Every UI/API port is published on host
+# loopback only — there is no authentication in front of any of them yet
+# (SEC-6, PR G). None of these services receives a database DSN (SEC-5).
+
+networks:
+  telemetry: {}
+
+volumes:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    restart: unless-stopped
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      # Lets a binary run on the host (`go run ./cmd/...`) export too.
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    networks: [telemetry]
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Retention (CC-3, provisional).
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [telemetry]
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      - ./observability/alertmanager:/etc/alertmanager:ro
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks: [telemetry]
+
+  loki:
+    image: grafana/loki:3.7.8
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:3100:3100"
+    networks: [telemetry]
+
+  tempo:
+    image: grafana/tempo:3.1.0
+    restart: unless-stopped
+    command:
+      - -target=all
+      - -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "127.0.0.1:3200:3200"
+    networks: [telemetry]
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    restart: unless-stopped
+    depends_on: [prometheus, loki, tempo]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-changeme-local-only}
+      # Read-only browsing without logging in; loopback-published only.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # :3000 is often taken by a stray Forgejo (docs/local-development.md §6).
+      - "127.0.0.1:3002:3000"
+    networks: [telemetry]

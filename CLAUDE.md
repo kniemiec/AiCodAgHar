@@ -32,10 +32,7 @@ Local stack (Forgejo + Postgres + 3 mocks + control-plane, plus the Collector/Pr
 
 ## Architecture
 
-Read the matching doc before changing a component:
-- `docs/components/orchestrator.md`, `docs/components/container-launcher.md` — **living** current-state guides; when they disagree with `docs/designs/` or ADRs, trust these. Update them in the same change that makes them stale.
-- `docs/architecture/` (ADRs), `docs/designs/completed/`, `docs/intents/` — frozen historical records; don't edit to match new code.
-- `.claude/skills/wf-design` writes new designs to `docs/designs/active/` (created on first use).
+Read the matching living guide (see Documentation below) before changing a component.
 
 **Orchestrator** (`internal/control-plane/*`). The key boundary is `coreloop` vs `taskrunner`:
 - `coreloop.RunRound` is a pure single-round function: PDP evaluate → create task branch → generate phase → open review PR → review phase → aggregate → approve gate → `publish`. Phases run sequentially, steps within a phase concurrently. It knows nothing about round caps or resumption.
@@ -51,3 +48,28 @@ Read the matching doc before changing a component:
 **HTTP API** (documented in `docs/components/orchestrator.md` §4): `POST /tasks` (only `target_repo` required; returns 202), `GET /tasks/{id}` to poll, `POST /webhooks/forgejo`. No authn/authz exists yet.
 
 **Config contracts**: `.harness/stages.yaml`, `.harness/policy.yaml`, `.harness/APPROVERS` live in *target* repos; `internal/config` parses them and validates against `schemas/*.schema.json` (fixtures in `schemas/fixtures/`). SQL migrations are in `deploy/migrations/` (applied by `make migrate`).
+
+## Documentation
+
+- **Living current-state guides**: `docs/components/orchestrator.md`, `docs/components/container-launcher.md`. When they disagree with designs or ADRs, trust these. Update them in the same change that makes them stale.
+- **Frozen historical records**: `docs/architecture/` (ADRs), `docs/intents/`, `docs/designs/completed/`. Don't edit them to match new code; a changed decision gets a new ADR that extends or supersedes the old one.
+- **Requirements (intent) docs**: `docs/intents/week<N>-<ISO date>-<kebab-slug>.md`, status `Draft` until the author promotes it.
+- **ADRs**: `docs/architecture/week<N>-adr-<number>-<kebab-slug>.md`, numbered one above the highest existing ADR, status `Proposed` until the author accepts it. ADR-5, ADR-11 and ADR-12 are good format examples. Header defaults: **Deciders** `Me`, **Informed** `Engineering leadership, platform team`.
+- **`week<N>`**: take the most recent `week<N>-…` file in `docs/architecture/` or `docs/intents/` and add the weeks elapsed since its date; ask if that isn't clear.
+- **Designs**: `docs/designs/active/<kebab-slug>.md` while in progress; the author moves them to `docs/designs/completed/`. Differences between a design and what was actually built are recorded in the design as "As built in <slice>" entries.
+
+## Making changes
+
+- **Order**: contracts first (proto + `make proto-gen`, interfaces, domain types), then implementations and fakes, then wiring in `cmd/*/main.go`, then tests.
+- **Proto changes are additive only** (new field numbers, new enums with an `UNSPECIFIED` zero); old clients and servers must keep working, and the `mocks/` services must speak the new contract too. Regenerated `api/gen/go` is committed.
+- **Copy existing patterns**: fakes in `internal/control-plane/fakes/`, existing error classing/wrapping, env config reading (e.g. `LAUNCHER_*` in `cmd/container-launcher/config.go`), context logging with `task_id`/`round`/`step_id`.
+- **Go dependencies**: exact versions, one release train for modules that belong together (e.g. OpenTelemetry), check the version exists (e.g. a `semconv` package inside the pinned SDK), then `go mod tidy`. Note transitive bumps (e.g. grpc) in the design doc.
+
+**Verification**, in order, one command at a time:
+1. `make build`, `make test`.
+2. `go vet ./...`, plus `go vet -tags <tag> ./...` for each build tag whose files changed.
+3. `buf lint` / `make proto-gen` if the proto changed.
+4. `go test -race` on packages with new goroutines, callbacks, shared state or atomics.
+5. `gofmt -l` on touched files only.
+6. `make test-integration` / `make test-e2e` only if the local stack is already up: rebuild changed images, `up -d`, `make seed`, `-count=1`. Don't start the stack unasked; report these suites as not run.
+7. Clean up: `go build` without `-o` drops binaries in the repo root.

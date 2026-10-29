@@ -72,7 +72,7 @@ func TestTeardown_RemovesJailDirectoryTree(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 
-	teardown(jailDir)
+	teardown(context.Background(), jailDir)
 
 	if _, err := os.Stat(jailDir); !os.IsNotExist(err) {
 		t.Errorf("jailDir still exists after teardown (err=%v), want removed", err)
@@ -83,7 +83,7 @@ func TestTeardown_NonexistentDirIsNotAnError(t *testing.T) {
 	// teardown is unconditionally deferred, including on paths where the
 	// jail directory was never created (e.g. jailer.Config.Validate failed
 	// before anything was staged) — must not panic or block.
-	teardown(filepath.Join(t.TempDir(), "never-created"))
+	teardown(context.Background(), filepath.Join(t.TempDir(), "never-created"))
 }
 
 func TestAddProxyEnv_OverridesCallerValues(t *testing.T) {

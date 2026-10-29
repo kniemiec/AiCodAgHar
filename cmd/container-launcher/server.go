@@ -120,8 +120,8 @@ func newLauncherServer(cfg config) *launcherServer {
 var validInvocationID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchRequest) (*launcherv1.LaunchResponse, error) {
-	log := slog.With("invocation_id", req.InvocationId, "task_id", req.TaskId, "step_id", req.StepId,
-		"step_type", req.StepType, "payload_ref", req.PayloadRef)
+	ctx = logging.WithStep(logging.WithTask(ctx, req.TaskId), req.StepId, req.InvocationId)
+	log := slog.With("step_type", req.StepType, "payload_ref", req.PayloadRef)
 	if !validInvocationID.MatchString(req.InvocationId) {
 		log.WarnContext(ctx, "launch rejected: invalid invocation_id", "allowed_pattern", validInvocationID.String())
 		return nil, status.Errorf(codes.InvalidArgument, "container-launcher: invalid invocation_id %q", req.InvocationId)
@@ -140,7 +140,7 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 			return nil, status.Errorf(codes.InvalidArgument, "container-launcher: unknown payload_ref %q", req.PayloadRef)
 		}
 		task = rendered
-		log.DebugContext(ctx, "prompt rendered", "prompt_bytes", len(task), "prompt_prefix", logging.Truncate(task, 500))
+		log.DebugContext(ctx, "prompt rendered", "prompt_bytes", len(task), logging.Sensitive(), "prompt_prefix", logging.Truncate(task, 500))
 	case stepTypeDeterministicStep:
 		rendered, ok := prompts.RenderCommand(req.PayloadRef)
 		if !ok {
@@ -203,12 +203,12 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	if bootErr != nil {
 		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
 		if len(outcome.stdout) > 0 {
-			log.WarnContext(ctx, "guest event log tail", "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
+			log.WarnContext(ctx, "guest event log tail", logging.Sensitive(), "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
 		}
 		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
 	}
 	log.InfoContext(ctx, "launch finished", attrs...)
-	log.DebugContext(ctx, "structured result", "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
+	log.DebugContext(ctx, "structured result", logging.Sensitive(), "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
 }
 
@@ -232,6 +232,7 @@ func eventLogTail(stdout []byte, n int) string {
 }
 
 func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) (*launcherv1.KillResponse, error) {
+	ctx = logging.WithStep(ctx, "", req.InvocationId)
 	s.mu.Lock()
 	cancel, inFlight := s.inFlight[req.InvocationId]
 	_, completed := s.invocations[req.InvocationId]
@@ -244,11 +245,11 @@ func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) 
 		// Known, but already finished by the time Kill arrived — nothing
 		// left to pre-empt. Not an error: this is a legitimate race, not a
 		// caller mistake.
-		slog.InfoContext(ctx, "kill requested for already-finished invocation", "invocation_id", req.InvocationId)
+		slog.InfoContext(ctx, "kill requested for already-finished invocation")
 		return &launcherv1.KillResponse{Killed: false}, nil
 	}
 
-	slog.InfoContext(ctx, "killing in-flight invocation", "invocation_id", req.InvocationId)
+	slog.InfoContext(ctx, "killing in-flight invocation")
 	cancel(errInvocationKilled)
 	return &launcherv1.KillResponse{Killed: true}, nil
 }

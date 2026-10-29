@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -51,14 +52,13 @@ func NewClient(addr string, tlsCfg TLSConfig) (*Client, error) {
 // InvalidArgument is visible here even when no caller logs the error.
 func logUnaryCall(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	start := time.Now()
-	var invocationID string
-	if r, ok := req.(interface{ GetInvocationId() string }); ok {
-		invocationID = r.GetInvocationId()
+	if r, ok := req.(interface{ GetInvocationId() string }); ok && r.GetInvocationId() != "" {
+		ctx = logging.WithStep(ctx, "", r.GetInvocationId())
 	}
-	slog.DebugContext(ctx, "launcher rpc start", "method", method, "invocation_id", invocationID)
+	slog.DebugContext(ctx, "launcher rpc start", "method", method)
 	err := invoker(ctx, method, req, reply, cc, opts...)
 	st := status.Convert(err)
-	attrs := []any{"method", method, "invocation_id", invocationID, "code", st.Code().String(), "duration", time.Since(start)}
+	attrs := []any{"method", method, "code", st.Code().String(), "duration", time.Since(start)}
 	if st.Code() != codes.OK {
 		slog.WarnContext(ctx, "launcher rpc failed", append(attrs, "message", st.Message())...)
 	} else {

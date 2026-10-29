@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -17,6 +17,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/config"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 // maxWebhookBodyBytes bounds how much of a webhook request body this
@@ -84,12 +85,12 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	// repository.full_name is trusted until the signature check below passes.
 	secret, err := s.secrets.GetWebhookSecret(ctx, payload.Repository.FullName)
 	if err != nil {
-		log.Printf("webhook: no secret provisioned for %s: %v", payload.Repository.FullName, err)
+		slog.WarnContext(ctx, "webhook: no secret provisioned", "repo", payload.Repository.FullName, "error", err)
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 	if !verifyForgejoSignature(secret, body, r.Header.Get("X-Forgejo-Signature")) {
-		log.Printf("webhook: signature verification failed for %s", payload.Repository.FullName)
+		slog.WarnContext(ctx, "webhook: signature verification failed", "repo", payload.Repository.FullName)
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -114,7 +115,7 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 
 	taskID, ok, err := s.runner.FindWaitingApprovalTask(ctx, payload.Repository.FullName, payload.Issue.Number)
 	if err != nil {
-		log.Printf("webhook: find waiting-approval task for %s#%d: %v", payload.Repository.FullName, payload.Issue.Number, err)
+		slog.ErrorContext(ctx, "webhook: find waiting-approval task failed", "repo", payload.Repository.FullName, "issue", payload.Issue.Number, "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -122,10 +123,11 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	ctx = logging.WithTask(ctx, taskID)
 
 	labels, err := s.git.ListIssueLabels(ctx, repo, payload.Issue.Number)
 	if err != nil {
-		log.Printf("webhook: list labels for %s#%d: %v", payload.Repository.FullName, payload.Issue.Number, err)
+		slog.ErrorContext(ctx, "webhook: list labels failed", "repo", payload.Repository.FullName, "issue", payload.Issue.Number, "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -138,25 +140,25 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 
 	status, ok, err := s.runner.GetTaskStatus(ctx, taskID)
 	if err != nil || !ok {
-		log.Printf("webhook: load task %s: ok=%v err=%v", taskID, ok, err)
+		slog.ErrorContext(ctx, "webhook: load task failed", "found", ok, "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	approversRaw, err := s.git.GetFileContents(ctx, repo, approversPath, status.Task.BaseBranch)
 	if err != nil {
-		log.Printf("webhook: read %s on %s@%s: %v", approversPath, payload.Repository.FullName, status.Task.BaseBranch, err)
+		slog.ErrorContext(ctx, "webhook: read approvers file failed", "path", approversPath, "repo", payload.Repository.FullName, "ref", status.Task.BaseBranch, "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	if !slices.Contains(config.ParseApprovers(approversRaw), payload.Sender.Login) {
-		log.Printf("webhook: %s is not listed in %s on %s", payload.Sender.Login, approversPath, payload.Repository.FullName)
+		slog.WarnContext(ctx, "webhook: sender is not a listed approver", "sender", payload.Sender.Login, "path", approversPath, "repo", payload.Repository.FullName)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	hasWrite, err := s.git.VerifyCollaboratorRole(ctx, repo, payload.Sender.Login, gitclient.RoleWrite)
 	if err != nil || !hasWrite {
-		log.Printf("webhook: %s failed live collaborator-role check on %s: hasWrite=%v err=%v", payload.Sender.Login, payload.Repository.FullName, hasWrite, err)
+		slog.WarnContext(ctx, "webhook: sender failed live collaborator-role check", "sender", payload.Sender.Login, "repo", payload.Repository.FullName, "has_write", hasWrite, "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -169,28 +171,29 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 
 	if rejected {
 		if err := s.runner.RecordRejection(ctx, taskID, payload.Sender.Login, evidence); err != nil {
-			log.Printf("webhook: record rejection for %s: %v", taskID, err)
+			slog.ErrorContext(ctx, "webhook: record rejection failed", "error", err)
 		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	if err := s.runner.RecordApproval(ctx, taskID, payload.Sender.Login, evidence); err != nil {
-		log.Printf("webhook: record approval for %s: %v", taskID, err)
+		slog.ErrorContext(ctx, "webhook: record approval failed", "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	// Resume in a new goroutine (design §4.4 step 5) so the webhook
 	// response returns fast — the task's execution must outlive this
 	// request the same way Start's does.
+	resumeCtx := logging.WithTask(context.Background(), taskID)
 	go func() {
-		result, err := s.runner.Resume(context.Background(), taskID)
+		result, err := s.runner.Resume(resumeCtx, taskID)
 		if err != nil {
-			log.Printf("webhook: resume %s: %v", taskID, err)
+			slog.ErrorContext(resumeCtx, "webhook: resume failed", "error", err)
 			return
 		}
 		if result.Err != nil {
-			log.Printf("webhook: resume %s: %v", taskID, result.Err)
+			slog.ErrorContext(resumeCtx, "webhook: resume ended with error", "error", result.Err)
 		}
 	}()
 	w.WriteHeader(http.StatusOK)
@@ -208,9 +211,10 @@ func (s *server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 // revealing to an unauthorized caller why nothing happened).
 func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, repo gitclient.RepoRef, payload forgejoIssueWebhook) {
 	taskID := fmt.Sprintf("issue-%s-%d", strings.ReplaceAll(payload.Repository.FullName, "/", "-"), payload.Issue.Number)
+	ctx = logging.WithTask(ctx, taskID)
 
 	if _, ok, err := s.runner.GetTaskStatus(ctx, taskID); err != nil {
-		log.Printf("webhook: check existing task %s: %v", taskID, err)
+		slog.ErrorContext(ctx, "webhook: check existing task failed", "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	} else if ok {
@@ -220,7 +224,7 @@ func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, r
 
 	hasWrite, err := s.git.VerifyCollaboratorRole(ctx, repo, payload.Sender.Login, gitclient.RoleWrite)
 	if err != nil || !hasWrite {
-		log.Printf("webhook: %s failed live collaborator-role check on %s: hasWrite=%v err=%v", payload.Sender.Login, payload.Repository.FullName, hasWrite, err)
+		slog.WarnContext(ctx, "webhook: sender failed live collaborator-role check", "sender", payload.Sender.Login, "repo", payload.Repository.FullName, "has_write", hasWrite, "error", err)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -236,7 +240,7 @@ func (s *server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, r
 		Description:         payload.Issue.Body,
 	}
 	if _, _, err := s.runner.Start(ctx, task); err != nil {
-		log.Printf("webhook: start task %s: %v", taskID, err)
+		slog.ErrorContext(ctx, "webhook: start task failed", "error", err)
 	}
 	w.WriteHeader(http.StatusOK)
 }

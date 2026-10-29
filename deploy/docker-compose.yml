@@ -85,6 +85,9 @@ services:
         condition: service_started
     environment:
       ADDR: ":8080"
+      # Admin routes (retry, waiting/failed listing) have no authn yet; bind
+      # inside the container, publish on host loopback only (see ports below).
+      ADMIN_ADDR: "0.0.0.0:8090"
       FORGEJO_URL: "http://forgejo:3000"
       # Empty until `make bootstrap-admin` has run and deploy/.env carries a
       # real token — this container crash-loops with a clear log message
@@ -132,6 +135,9 @@ services:
         condition: service_started
     environment:
       ADDR: ":8080"
+      # Admin routes (retry, waiting/failed listing) have no authn yet; bind
+      # inside the container, publish on host loopback only (see ports below).
+      ADMIN_ADDR: "0.0.0.0:8090"
       FORGEJO_URL: "http://forgejo:3000"
       # Same first-boot caveat as pdp-mock: empty until `make bootstrap-admin`
       # has run; crash-loops with a clear log message until then.
@@ -157,4 +163,5 @@ services:
       - ./certs:/certs:ro
     ports:
       - "8080:8080"
+      - "127.0.0.1:8090:8090"
     networks: [orchestrator-net]

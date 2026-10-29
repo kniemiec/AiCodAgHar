@@ -3,12 +3,14 @@ package executor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/audit"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/launcherclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
@@ -30,7 +32,7 @@ type DeterministicStepExecutor struct {
 
 func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext) (domain.StepRun, error) {
 	invocationID := InvocationID(sc)
-	log := stepLogger(sc)
+	ctx = stepContext(ctx, sc)
 
 	cred, err := mintCredential(ctx, e.Secrets, sc)
 	if err != nil {
@@ -39,7 +41,7 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 	defer revokeCredential(e.Secrets, sc, cred)
 
 	env := launchEnv(e.ForgejoURL, sc, cred)
-	log.DebugContext(ctx, "launch request", "payload_ref", sc.Step.StepID, "env_keys", logging.Keys(env), "granted_scopes", sc.GrantedScopes)
+	slog.DebugContext(ctx, "launch request", "payload_ref", sc.Step.StepID, "env_keys", logging.Keys(env), "granted_scopes", sc.GrantedScopes)
 	launchStarted := time.Now()
 	result, err := e.Launcher.Launch(ctx, launcherclient.LaunchRequest{
 		InvocationID:   invocationID,
@@ -52,19 +54,19 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 		TimeoutSeconds: 0,
 	})
 	if err != nil {
-		log.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
+		slog.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
 		auditLaunchFailure(e.Audit, sc, invocationID)
 		return domain.StepRun{}, fmt.Errorf("launch deterministic-step %s: %w", sc.Step.StepID, err)
 	}
 
-	log.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
+	slog.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
 		"started_at", result.StartedAt, "finished_at", result.FinishedAt, "duration", time.Since(launchStarted))
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
-		return domain.StepRun{}, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err)
+		return domain.StepRun{}, failure.Dependency(failure.DepLauncher, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err))
 	}
-	log.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
+	slog.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
 		"structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))
 
 	if err := auditStepRun(ctx, e.Audit, sc, invocationID, result); err != nil {

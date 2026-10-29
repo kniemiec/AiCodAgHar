@@ -11,7 +11,7 @@ This is a testing/dev-environment concern, not part of the orchestrator's own ar
 
 | Service | Stands in for | Source | Port |
 |---|---|---|---|
-| `control-plane` | — (the real orchestrator) | `cmd/control-plane` | `8080` |
+| `control-plane` | — (the real orchestrator) | `cmd/control-plane` | `8080` (API), `127.0.0.1:8090` (admin: retry, waiting/failed listing — host loopback only) |
 | `pdp-mock` | Policy Decision Point | `mocks/pdp-mock` | `8081` |
 | `secrets-mock` | Secrets / credential issuer | `mocks/secrets-mock` | `8082` |
 | `launcher-mock` | Step launcher | `mocks/launcher-mock` | `9443` (mTLS only) |
@@ -35,6 +35,10 @@ make bootstrap-admin      # mints a Forgejo admin token, recreates pdp-mock/cont
 make migrate               # applies deploy/migrations/*.sql
 make seed                  # provisions bot accounts + the global-baseline and sample-repo config repos
 ```
+
+**Upgrading an existing stack across migration `006`** (failed status, `task_events`): stop the control-plane first — `docker compose -f deploy/docker-compose.yml stop control-plane` — then `make migrate`, rebuild (`docker compose -f deploy/docker-compose.yml build control-plane`) and `up -d`. `006` converts tasks the old code left `running` with an `error:` reason into retryable `failed` tasks, and a live `runLoop` could otherwise be flipped mid-flight. Afterwards, `GET /tasks/{id}/events` shows a task's timeline and, for a retryable failure, `curl -X POST localhost:8090/admin/tasks/<id>/retry -d '{"operator":"you"}'` resumes it.
+
+**Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). Set `LOG_FORMAT=json` to get `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` as fields. The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
 
 After that: Forgejo at `http://localhost:3001` (admin login `forgejo-admin` / `changeme-local-only` — **not** `:3000`, and **not** the reserved `admin` username), `control-plane` at `http://localhost:8080`.
 

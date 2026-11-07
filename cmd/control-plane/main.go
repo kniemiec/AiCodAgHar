@@ -41,6 +41,7 @@ func main() {
 		addr = ":8080"
 	}
 	forgejoURL := requireEnv("FORGEJO_URL")
+	launchForgejoURL := launchForgejoURLFrom(forgejoURL, os.Getenv("LAUNCH_FORGEJO_URL"))
 	forgejoToken := requireEnv("FORGEJO_TOKEN")
 	pdpURL := requireEnv("PDP_MOCK_URL")
 	secretsURL := requireEnv("SECRETS_MOCK_URL")
@@ -52,7 +53,7 @@ func main() {
 
 	slog.Info("control-plane starting",
 		"version", buildinfo.Version, "commit", buildinfo.Commit,
-		"addr", addr, "forgejo_url", forgejoURL, "pdp_url", pdpURL, "secrets_url", secretsURL,
+		"addr", addr, "forgejo_url", forgejoURL, "launch_forgejo_url", launchForgejoURL, "pdp_url", pdpURL, "secrets_url", secretsURL,
 		"launcher_addr", launcherAddr, "orchestrator_instance_id", orchestratorInstanceID,
 		"webhook_approval_enabled", os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true",
 		"task_max_retries", envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
@@ -89,8 +90,8 @@ func main() {
 	defer taskStore.Close()
 
 	registry := executor.NewRegistry(
-		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
-		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: forgejoURL},
+		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: launchForgejoURL},
+		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: launchForgejoURL},
 	)
 
 	// Real ApprovalVerifier (design §4.4): the actual verification work
@@ -246,6 +247,16 @@ func envDuration(name string, def time.Duration) time.Duration {
 		log.Fatalf("control-plane: %s must be a non-negative duration like 5m, got %q", name, v)
 	}
 	return d
+}
+
+// launchForgejoURLFrom picks the Forgejo URL handed to launched steps. It can
+// differ from the control-plane's own FORGEJO_URL: a Firecracker guest can't
+// resolve compose hostnames or localhost, only the host's tap gateway.
+func launchForgejoURLFrom(forgejoURL, override string) string {
+	if override != "" {
+		return override
+	}
+	return forgejoURL
 }
 
 func requireEnv(name string) string {

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -393,5 +395,29 @@ func TestEventLogTail_StripsANSIAndKeepsEnd(t *testing.T) {
 	got := eventLogTail([]byte("\x1b[92mstart\x1b[0m middle \x1b[1;3mend\x1b[0m"), 9)
 	if got != "iddle end" {
 		t.Errorf("eventLogTail = %q, want %q", got, "iddle end")
+	}
+}
+
+func TestDumpFailedEventLog(t *testing.T) {
+	if path, err := dumpFailedEventLog("", "inv-1", []byte("x")); path != "" || err != nil {
+		t.Fatalf("disabled: got (%q, %v), want (\"\", nil)", path, err)
+	}
+	dir := filepath.Join(t.TempDir(), "nested")
+	path, err := dumpFailedEventLog(dir, "inv-1", []byte("\x1b[92mhello\x1b[0m world"))
+	if err != nil {
+		t.Fatalf("dumpFailedEventLog: %v", err)
+	}
+	if want := filepath.Join(dir, "inv-1.log"); path != want {
+		t.Errorf("path = %q, want %q", path, want)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello world" {
+		t.Errorf("contents = %q, want ANSI-stripped %q", got, "hello world")
+	}
+	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
 	}
 }

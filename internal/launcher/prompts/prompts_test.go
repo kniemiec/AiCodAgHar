@@ -63,7 +63,7 @@ func TestRender_Implement_PinsTaskBranch(t *testing.T) {
 				t.Fatalf("Render: %v", err)
 			}
 			for _, want := range []string{
-				"git checkout add-feature",
+				"add-feature is already checked out",
 				"push it only to the add-feature branch",
 				"Never push to any other branch",
 				"do not work on any other branch",

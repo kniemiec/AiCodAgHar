@@ -1,0 +1,14 @@
+# Overlay: run the control-plane against the real container-launcher on the
+# Docker host instead of launcher-mock.
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.real-launcher.yml \
+#     up -d --no-deps control-plane
+#
+# The name "launcher-mock" is kept so it matches the server cert's SAN; it
+# resolves to the host, where the real launcher listens on :9443.
+services:
+  control-plane:
+    depends_on:
+      launcher-mock: !reset null
+    extra_hosts:
+      - "launcher-mock:host-gateway"

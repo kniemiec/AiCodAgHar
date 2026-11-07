@@ -263,7 +263,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	mmdsData := env
 	switch {
 	case task != "":
-		mmdsData = mergeAgentEnv(env, task, l.cfg.LLMAPIKey, l.cfg.LLMModel)
+		mmdsData = mergeAgentEnv(env, task, l.cfg.LLMAPIKey, l.cfg.LLMModel, l.cfg.LLMBaseURL)
 	case command != "":
 		mmdsData = mergeCommandEnv(env, command)
 	}
@@ -499,8 +499,8 @@ func mergeCommandEnv(env map[string]string, command string) map[string]string {
 // credentials on top of the caller's Env, all in the same UPPER_SNAKE_CASE
 // key style — the guest wrapper exports every key but TASK straight into
 // OpenHands' environment (design §7).
-func mergeAgentEnv(env map[string]string, task, llmAPIKey, llmModel string) map[string]string {
-	merged := make(map[string]string, len(env)+3)
+func mergeAgentEnv(env map[string]string, task, llmAPIKey, llmModel, llmBaseURL string) map[string]string {
+	merged := make(map[string]string, len(env)+4)
 	for k, v := range env {
 		merged[k] = v
 	}
@@ -510,6 +510,9 @@ func mergeAgentEnv(env map[string]string, task, llmAPIKey, llmModel string) map[
 	}
 	if llmModel != "" {
 		merged["LLM_MODEL"] = llmModel
+	}
+	if llmBaseURL != "" {
+		merged["LLM_BASE_URL"] = llmBaseURL
 	}
 	return merged
 }

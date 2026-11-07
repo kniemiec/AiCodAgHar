@@ -197,6 +197,7 @@ Environment variables `cmd/control-plane/main.go` reads:
 | Variable | Required | Purpose |
 |---|---|---|
 | `FORGEJO_URL` | Yes | Git host base URL |
+| `LAUNCH_FORGEJO_URL` | No | Git host URL passed to launched steps as `FORGEJO_URL`; defaults to `FORGEJO_URL`. Set it when the launcher's guest reaches Forgejo at a different address (real Firecracker launcher: `http://172.16.0.1:3000`) |
 | `FORGEJO_TOKEN` | Yes | Bot/admin token `GitHostClient` authenticates as |
 | `PDP_MOCK_URL` | Yes | `PolicyClient` base URL |
 | `SECRETS_MOCK_URL` | Yes | `SecretsClient` base URL |

@@ -27,7 +27,6 @@ Local stack (Forgejo + Postgres + 3 mocks + control-plane): `cp deploy/.env.exam
 - `docker compose up -d` does **not** rebuild images — after changing `cmd/control-plane` or `mocks/*`, run `docker compose -f deploy/docker-compose.yml build <svc>` then `up -d`, then `make seed`.
 - Use `-count=1` for live-stack tests; a cached "ok" ignores rebuilt images.
 - `make test-*` source `deploy/.env` with bash, so JSON values in it (e.g. `SECRETS_MOCK_WEBHOOK_POOL_JSON`) must be wrapped in single quotes.
-- Forgejo is on `:3001`, not `:3000`.
 - Debugging: `LOG_LEVEL` (`debug|info|warn|error`) and `LOG_FORMAT=json`; log lines carry `task_id`/`round`/`step_id`, so one task can be followed across control-plane and launcher.
 
 ## Architecture

@@ -15,7 +15,7 @@ This is a testing/dev-environment concern, not part of the orchestrator's own ar
 | `pdp-mock` | Policy Decision Point | `mocks/pdp-mock` | `8081` |
 | `secrets-mock` | Secrets / credential issuer | `mocks/secrets-mock` | `8082` |
 | `launcher-mock` | Step launcher | `mocks/launcher-mock` | `9443` (mTLS only) |
-| `forgejo` | Git host (real) | `codeberg.org/forgejo/forgejo:16` | `3001` (UI/API), `2222` (SSH) |
+| `forgejo` | Git host (real) | `codeberg.org/forgejo/forgejo:16` | `3000` (UI/API), `2222` (SSH) |
 | `postgres` | `orchestrator` + `audit` schemas (real) | `postgres:16-alpine` | `5432` |
 
 `pdp-mock` computes real decisions by reading `.harness/*.yaml` live from Forgejo. `launcher-mock` is fixture-driven but performs real Forgejo side effects (commits, comments) using the credential injected for each step. `secrets-mock` hands out a static, pre-provisioned bot-token pool. None of the three persist meaningfully beyond process lifetime.
@@ -40,7 +40,7 @@ make seed                  # provisions bot accounts + the global-baseline and s
 
 **Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). Set `LOG_FORMAT=json` to get `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` as fields. The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
 
-After that: Forgejo at `http://localhost:3001` (admin login `forgejo-admin` / `changeme-local-only` — **not** `:3000`, and **not** the reserved `admin` username), `control-plane` at `http://localhost:8080`.
+After that: Forgejo at `http://localhost:3000` (admin login `forgejo-admin` / `changeme-local-only` — **not** the reserved `admin` username), `control-plane` at `http://localhost:8080`.
 
 **If you change code** in `cmd/control-plane`, `mocks/pdp-mock`, `mocks/launcher-mock`, `mocks/secrets-mock`, or anything they import, rebuild the relevant image(s) — `docker compose up -d` alone does not rebuild:
 
@@ -113,9 +113,49 @@ docker compose -f deploy/docker-compose.yml exec -T postgres \
 | Spike | `compose-up` + `bootstrap-admin` | `make test-spike` | `code.gitea.io/sdk/gitea` actually covers `GitHostClient`'s surface |
 | E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/control-plane/e2e/smoke_test.go` |
 
+### Using a local LLM (Ollama on Windows) for agent steps
+
+The compose stack uses `launcher-mock`, so it never calls an LLM. To run real agent steps without API costs, run the real launcher (see `docs/components/container-launcher.md`) against Ollama on another machine on your LAN.
+
+**On the Windows machine**
+
+1. Install Ollama from ollama.com (runs as a tray app) and pull a model. For a 16 GB GPU, start with `gpt-oss:20b`; `devstral:24b` (built for OpenHands-style agents) is stronger but only fits at a reduced context (~16k), and anything that spills out of VRAM becomes very slow. Pick a model with tool-calling support. Check actual sizes with `ollama show <model>`.
+   ```powershell
+   ollama pull gpt-oss:20b
+   ```
+2. Make it listen on the LAN (it binds to `127.0.0.1` by default) and raise the context length — OpenHands prompts are large and a small context truncates silently:
+   ```powershell
+   setx OLLAMA_HOST "0.0.0.0:11434"
+   setx OLLAMA_CONTEXT_LENGTH "32768"
+   setx OLLAMA_KEEP_ALIVE "30m"
+   ```
+   `setx` doesn't affect running processes: right-click the tray icon → **Quit**, then start Ollama again. (Newer versions also have an "Expose Ollama to the network" toggle in Settings.)
+3. Open the firewall for the launcher host only (Administrator PowerShell). Ollama has no authentication.
+   ```powershell
+   New-NetFirewallRule -DisplayName "Ollama LAN" -Direction Inbound -Protocol TCP `
+     -LocalPort 11434 -Action Allow -RemoteAddress <launcher-host-ip> -Profile Private
+   ```
+   If `Get-NetConnectionProfile` shows the network as Public, either switch it with `Set-NetConnectionProfile -NetworkCategory Private` or drop `-Profile Private`.
+4. Find the machine's IP with `ipconfig` (a DHCP reservation keeps it stable) and disable sleep while tests run.
+
+**On the launcher host** — verify, then configure:
+
+```sh
+curl http://<windows-ip>:11434/api/tags
+curl http://<windows-ip>:11434/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-oss:20b","messages":[{"role":"user","content":"hi"}]}'
+```
+
+```sh
+LAUNCHER_LLM_BASE_URL=http://<windows-ip>:11434/v1
+LAUNCHER_LLM_MODEL=openai/gpt-oss:20b
+LAUNCHER_LLM_API_KEY=ollama        # must be non-empty; Ollama ignores it
+```
+
+Notes: the guest reaches Ollama through the launcher's forward proxy (tinyproxy), so the proxy host must be able to route to the Windows machine. The review phase uses the same model as implement. Small local models may fail tasks for model reasons (invalid tool calls, loops) — separate that from observability problems when reading `task_events`. If Ollama runs inside WSL2 rather than natively, it isn't LAN-reachable without mirrored networking or `netsh interface portproxy`.
+
 ## 6. Troubleshooting
 
-- **Forgejo admin login doesn't work.** Check you're on **`:3001`**, not `:3000` — a leftover, unrelated Forgejo container from earlier work may be squatting on the default port. `docker ps --format '{{.Names}}: {{.Ports}}'` shows both if so.
 - **`pdp-mock` / `control-plane` crash-looping with "required env var FORGEJO_TOKEN is not set."** Expected before `make bootstrap-admin` has minted a token on a first-ever `compose-up` — it recreates both containers once the token exists. If you see this after that, check `deploy/.env` actually has `FORGEJO_ADMIN_TOKEN` set.
 - **A migration you just applied doesn't seem to take effect.** Postgres client connections (including `control-plane`'s pool) can cache prepared-statement type metadata from before a schema change. Restart the affected container after altering a column type.
 - **`make seed` fails with a password/auth error for a bot account.** If a bot account already exists with a different password than `cmd/seed` expects, it deletes and recreates it — expected and safe for these throwaway local accounts.

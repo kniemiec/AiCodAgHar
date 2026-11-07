@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
@@ -93,6 +95,9 @@ type launcherServer struct {
 
 	booter vmLauncher
 
+	// failedLogDir is config.FailedLogDir; empty disables the dump.
+	failedLogDir string
+
 	// vmSlot serializes VM boots: every microVM shares the one tap device,
 	// guest CID and MAC (egress.DefaultConfig, launch.go), so a second
 	// concurrent boot fails with EBUSY on tap0. Launch holds the slot for
@@ -107,10 +112,11 @@ type launcherServer struct {
 
 func newLauncherServer(cfg config) *launcherServer {
 	return &launcherServer{
-		booter:      newFirecrackerLauncher(cfg),
-		vmSlot:      make(chan struct{}, 1),
-		invocations: map[string]invocationRecord{},
-		inFlight:    map[string]context.CancelCauseFunc{},
+		booter:       newFirecrackerLauncher(cfg),
+		failedLogDir: cfg.FailedLogDir,
+		vmSlot:       make(chan struct{}, 1),
+		invocations:  map[string]invocationRecord{},
+		inFlight:     map[string]context.CancelCauseFunc{},
 	}
 }
 
@@ -164,7 +170,10 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 		cancel(nil) // release killCtx's resources; no-op on the cause if Kill already set one
 	}()
 
-	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds)
+	// Non-secret clone coordinates, so "what is it trying to clone?" is
+	// answerable from the log. FORGEJO_TOKEN is deliberately not included.
+	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds,
+		"target_repo", req.Env["TARGET_REPO"], "branch", req.Env["BRANCH"], "base_branch", req.Env["BASE_BRANCH"], "forgejo_url", req.Env["FORGEJO_URL"])
 	startedAt := time.Now()
 	var outcome bootOutcome
 	var bootErr error
@@ -204,6 +213,11 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
 		if len(outcome.stdout) > 0 {
 			log.WarnContext(ctx, "guest event log tail", logging.Sensitive(), "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
+			if path, err := dumpFailedEventLog(s.failedLogDir, req.InvocationId, outcome.stdout); err != nil {
+				log.WarnContext(ctx, "writing failed event log failed", "error", err)
+			} else if path != "" {
+				log.WarnContext(ctx, "full guest event log written", "path", path)
+			}
 		}
 		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
 	}
@@ -229,6 +243,25 @@ func eventLogTail(stdout []byte, n int) string {
 		clean = clean[len(clean)-n:]
 	}
 	return string(clean)
+}
+
+// dumpFailedEventLog writes the whole (already redacted) event log of a
+// failed invocation to <dir>/<invocationID>.log, ANSI stripped, mode 0600.
+// It returns "" with no error when dir is empty (feature off). The
+// invocation ID is already validated (validInvocationID), so it is safe as
+// a file name.
+func dumpFailedEventLog(dir, invocationID string, stdout []byte) (string, error) {
+	if dir == "" {
+		return "", nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, invocationID+".log")
+	if err := os.WriteFile(path, ansiEscape.ReplaceAll(stdout, nil), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) (*launcherv1.KillResponse, error) {

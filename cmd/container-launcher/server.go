@@ -246,10 +246,13 @@ func eventLogTail(stdout []byte, n int) string {
 }
 
 // dumpFailedEventLog writes the whole (already redacted) event log of a
-// failed invocation to <dir>/<invocationID>.log, ANSI stripped, mode 0600.
-// It returns "" with no error when dir is empty (feature off). The
-// invocation ID is already validated (validInvocationID), so it is safe as
-// a file name.
+// failed invocation to <dir>/<invocationID>-<UTC timestamp>.log, ANSI
+// stripped, mode 0600. The timestamp keeps a resumed step's repeat failure
+// (same invocation ID) from overwriting the first one's log, and the file
+// is always freshly created so its mode is always 0600. Nothing prunes the
+// directory. It returns "" with no error when dir is empty (feature off).
+// The invocation ID is already validated (validInvocationID), so it is
+// safe as a file name.
 func dumpFailedEventLog(dir, invocationID string, stdout []byte) (string, error) {
 	if dir == "" {
 		return "", nil
@@ -257,11 +260,16 @@ func dumpFailedEventLog(dir, invocationID string, stdout []byte) (string, error)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, invocationID+".log")
-	if err := os.WriteFile(path, ansiEscape.ReplaceAll(stdout, nil), 0o600); err != nil {
+	path := filepath.Join(dir, invocationID+"-"+time.Now().UTC().Format("20060102T150405.000000000Z")+".log")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return "", err
 	}
-	return path, nil
+	if _, err := f.Write(ansiEscape.ReplaceAll(stdout, nil)); err != nil {
+		f.Close()
+		return "", err
+	}
+	return path, f.Close()
 }
 
 func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) (*launcherv1.KillResponse, error) {

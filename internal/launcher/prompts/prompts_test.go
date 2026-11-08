@@ -1,6 +1,7 @@
 package prompts
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -81,8 +82,8 @@ func TestRender_Implement_PinsTaskBranch(t *testing.T) {
 // of the implement prompt.
 func TestRender_Implement_WithDescription(t *testing.T) {
 	task, ok, err := Render("implement", map[string]string{
-		"TARGET_REPO":     "org/repo",
-		"BRANCH":          "add-feature",
+		"TARGET_REPO":      "org/repo",
+		"BRANCH":           "add-feature",
 		"TASK_DESCRIPTION": "add a health check endpoint",
 	})
 	if err != nil {
@@ -139,6 +140,7 @@ func TestRender_Implement_NoDescriptionOmitsSection(t *testing.T) {
 func TestRender_ReviewWithCommit(t *testing.T) {
 	task, ok, err := Render("review-with-commit", map[string]string{
 		"TARGET_REPO": "org/repo",
+		"BRANCH":      "add-feature",
 		"PR_NUMBER":   "7",
 	})
 	if err != nil {
@@ -150,6 +152,27 @@ func TestRender_ReviewWithCommit(t *testing.T) {
 	if !strings.Contains(task, "#7") || !strings.Contains(task, "org/repo") {
 		t.Errorf("task missing PR number/repo: %q", task)
 	}
+	// The wrapper's clone only sets up git push; posting review comments
+	// needs the API coordinates spelled out.
+	for _, want := range []string{"FORGEJO_URL", "FORGEJO_TOKEN", "do not print their values"} {
+		if !strings.Contains(task, want) {
+			t.Errorf("task missing %q: %q", want, task)
+		}
+	}
+}
+
+func TestRender_RequiresBranch(t *testing.T) {
+	for _, stepID := range []string{"implement", "review-with-commit"} {
+		t.Run(stepID, func(t *testing.T) {
+			_, ok, err := Render(stepID, map[string]string{"TARGET_REPO": "org/repo", "PR_NUMBER": "7"})
+			if !ok {
+				t.Fatal("ok = false, want true")
+			}
+			if !errors.Is(err, errMissingBranch) {
+				t.Errorf("err = %v, want errMissingBranch", err)
+			}
+		})
+	}
 }
 
 // TestRender_ReviewWithCommit_WithDescription exercises design §3/§7: the
@@ -159,6 +182,7 @@ func TestRender_ReviewWithCommit(t *testing.T) {
 func TestRender_ReviewWithCommit_WithDescription(t *testing.T) {
 	task, ok, err := Render("review-with-commit", map[string]string{
 		"TARGET_REPO":      "org/repo",
+		"BRANCH":           "add-feature",
 		"PR_NUMBER":        "7",
 		"TASK_DESCRIPTION": "add a health check endpoint",
 	})

@@ -117,7 +117,7 @@ func TestValidateLLMBaseURL(t *testing.T) {
 			t.Errorf("validateLLMBaseURL(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{"192.168.1.14:11434/v1", "ftp://host/v1", "http://", "://x"} {
+	for _, bad := range []string{"192.168.1.14:11434/v1", "ftp://host/v1", "http://", "://x", "http://:11434/v1"} {
 		if err := validateLLMBaseURL(bad); err == nil {
 			t.Errorf("validateLLMBaseURL(%q) = nil, want error", bad)
 		}

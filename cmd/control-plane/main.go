@@ -9,9 +9,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -42,6 +44,9 @@ func main() {
 	}
 	forgejoURL := requireEnv("FORGEJO_URL")
 	launchForgejoURL := launchForgejoURLFrom(forgejoURL, os.Getenv("LAUNCH_FORGEJO_URL"))
+	if err := validateLaunchForgejoURL(launchForgejoURL); err != nil {
+		log.Fatalf("control-plane: LAUNCH_FORGEJO_URL: %v", err)
+	}
 	forgejoToken := requireEnv("FORGEJO_TOKEN")
 	pdpURL := requireEnv("PDP_MOCK_URL")
 	secretsURL := requireEnv("SECRETS_MOCK_URL")
@@ -257,6 +262,21 @@ func launchForgejoURLFrom(forgejoURL, override string) string {
 		return override
 	}
 	return forgejoURL
+}
+
+// validateLaunchForgejoURL rejects values the guest wrapper would turn into
+// a garbage clone URL (it splits on "://"), e.g. "172.16.0.1:3000" with no
+// scheme, which would otherwise only surface as "git clone failed" on every
+// step.
+func validateLaunchForgejoURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", raw, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("%q must be an absolute http(s) URL such as http://172.16.0.1:3000", raw)
+	}
+	return nil
 }
 
 func requireEnv(name string) string {

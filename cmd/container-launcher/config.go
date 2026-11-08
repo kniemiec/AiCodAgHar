@@ -93,7 +93,7 @@ func validateLLMBaseURL(raw string) error {
 	if err != nil {
 		return fmt.Errorf("invalid URL %q: %w", raw, err)
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return fmt.Errorf("%q must be an absolute http(s) URL such as http://host:11434/v1", raw)
 	}
 	return nil

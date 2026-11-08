@@ -148,16 +148,21 @@ def vsock_connect(retries=20, delay=0.5):
     return None
 
 
-def clone_repo(env, emit, shallow):
+def clone_repo(env, emit, shallow, require_branch):
     """Clone TARGET_REPO@BRANCH into REPO_DIR using the MMDS-delivered
-    FORGEJO_URL (a base URL, not a repo URL) and FORGEJO_TOKEN. Emits an
-    "error" envelope and returns False on any failure."""
+    FORGEJO_URL (a base URL, not a repo URL) and FORGEJO_TOKEN. With
+    require_branch, an empty BRANCH is an error rather than a clone of the
+    default branch. Emits an "error" envelope and returns False on any
+    failure."""
     target_repo = env.get("TARGET_REPO")
     branch = env.get("BRANCH")
     forgejo_url = env.get("FORGEJO_URL")
     token = env.get("FORGEJO_TOKEN")
     if not (target_repo and forgejo_url and token):
         emit({"type": "error", "message": "clone requires TARGET_REPO, FORGEJO_URL, and FORGEJO_TOKEN in env"})
+        return False
+    if require_branch and not branch:
+        emit({"type": "error", "message": "clone requires BRANCH in env"})
         return False
 
     os.makedirs(WORKDIR, exist_ok=True)
@@ -187,8 +192,9 @@ def run_openhands_mode(env, mmds, emit):
     os.makedirs(os.path.dirname(STRUCTURED_RESULT_PATH), exist_ok=True)
 
     # Full history (not --depth 1): the agent may push commits and a
-    # reviewer may need to diff against the base branch.
-    if not clone_repo(env, emit, shallow=False):
+    # reviewer may need to diff against the base branch. The agent commits,
+    # so it must never land on the default branch.
+    if not clone_repo(env, emit, shallow=False, require_branch=True):
         return
     for key, value in (("user.name", "openhands"), ("user.email", "openhands@all-hands.dev")):
         subprocess.run(["git", "config", key, value], cwd=REPO_DIR, env=env,
@@ -253,7 +259,7 @@ def run_openhands_mode(env, mmds, emit):
 
 def run_command_mode(env, mmds, emit):
     command = mmds["COMMAND"]
-    if not clone_repo(env, emit, shallow=True):
+    if not clone_repo(env, emit, shallow=True, require_branch=False):
         return
 
     try:

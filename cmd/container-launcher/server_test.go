@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -407,8 +408,8 @@ func TestDumpFailedEventLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dumpFailedEventLog: %v", err)
 	}
-	if want := filepath.Join(dir, "inv-1.log"); path != want {
-		t.Errorf("path = %q, want %q", path, want)
+	if filepath.Dir(path) != dir || !strings.HasPrefix(filepath.Base(path), "inv-1-") || filepath.Ext(path) != ".log" {
+		t.Errorf("path = %q, want %s/inv-1-<timestamp>.log", path, dir)
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -419,5 +420,17 @@ func TestDumpFailedEventLog(t *testing.T) {
 	}
 	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
+	}
+	// A resumed step re-runs with the same invocation ID; its failure must
+	// not overwrite the first one's log.
+	second, err := dumpFailedEventLog(dir, "inv-1", []byte("again"))
+	if err != nil {
+		t.Fatalf("second dumpFailedEventLog: %v", err)
+	}
+	if second == path {
+		t.Errorf("second dump reused path %q", path)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "hello world" {
+		t.Errorf("first log overwritten: %q", got)
 	}
 }

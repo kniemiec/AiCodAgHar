@@ -29,14 +29,26 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/policyclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/coreloop"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/instrumented"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
 	"github.com/kniemiec/AiCodAgHar/internal/health"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 func main() {
-	logging.Setup("control-plane")
+	// Telemetry first so the OTLP log bridge is a logging sink from the
+	// first line on; without OTEL_EXPORTER_OTLP_ENDPOINT it is a no-op.
+	tel := telemetry.Setup(context.Background(), "control-plane")
+	logging.Setup("control-plane", tel.LogHandlers()...)
+	metrics := telemetry.NewControlPlane(tel.MeterProvider, telemetry.ControlPlaneOptions{
+		TargetRepos: telemetry.NewBounded(telemetry.ParseList(os.Getenv("TELEMETRY_TARGET_REPOS")), telemetry.DefaultBoundedMax),
+		StepIDs:     telemetry.NewBounded(telemetry.ParseList(os.Getenv("TELEMETRY_STEP_IDS")), telemetry.DefaultBoundedMax),
+	})
+	stuckInterval := envDuration("STUCK_TASK_INTERVAL", 30*time.Minute)
 
 	addr := os.Getenv("ADDR")
 	if addr == "" {
@@ -62,17 +74,22 @@ func main() {
 		"launcher_addr", launcherAddr, "orchestrator_instance_id", orchestratorInstanceID,
 		"webhook_approval_enabled", os.Getenv("WEBHOOK_APPROVAL_ENABLED") == "true",
 		"task_max_retries", envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
-		"heartbeat_interval", envDuration("HEARTBEAT_INTERVAL", 5*time.Minute))
+		"heartbeat_interval", envDuration("HEARTBEAT_INTERVAL", 5*time.Minute),
+		"stuck_task_interval", stuckInterval, "telemetry_endpoint", os.Getenv(telemetry.EndpointEnv),
+		"telemetry_target_repos", os.Getenv("TELEMETRY_TARGET_REPOS"), "telemetry_step_ids", os.Getenv("TELEMETRY_STEP_IDS"))
 
-	git, err := gitclient.NewClient(forgejoURL, forgejoToken)
+	// Every dependency client is wrapped by internal/control-plane/instrumented
+	// for request metrics (MT-13); health checks use the raw clients.
+	rawGit, err := gitclient.NewClient(forgejoURL, forgejoToken)
 	if err != nil {
 		log.Fatalf("control-plane: git client: %v", err)
 	}
+	git := instrumented.Git{Next: rawGit, Metrics: metrics}
 
-	policy := policyclient.NewClient(pdpURL)
-	secrets := secretsclient.NewClient(secretsURL)
+	policy := instrumented.Policy{Next: policyclient.NewClient(pdpURL), Metrics: metrics}
+	secrets := instrumented.Secrets{Next: secretsclient.NewClient(secretsURL), Metrics: metrics}
 
-	launcher, err := launcherclient.NewClient(launcherAddr, launcherclient.TLSConfig{
+	rawLauncher, err := launcherclient.NewClient(launcherAddr, launcherclient.TLSConfig{
 		CACertPath:     requireEnv("TLS_CA_CERT"),
 		ClientCertPath: requireEnv("TLS_CLIENT_CERT"),
 		ClientKeyPath:  requireEnv("TLS_CLIENT_KEY"),
@@ -80,23 +97,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("control-plane: launcher client: %v", err)
 	}
-	defer launcher.Close()
+	defer rawLauncher.Close()
+	launcher := instrumented.Launcher{Next: rawLauncher, Metrics: metrics}
 
 	auditWriter, err := audit.NewPostgresWriter(requireEnv("AUDIT_DB_DSN"))
 	if err != nil {
 		log.Fatalf("control-plane: audit writer: %v", err)
 	}
 	defer auditWriter.Close()
+	audited := instrumented.Audit{Next: auditWriter, Metrics: metrics}
 
-	taskStore, err := taskrunner.NewPostgresTaskStore(requireEnv("ORCHESTRATOR_DB_DSN"))
+	pgStore, err := taskrunner.NewPostgresTaskStore(requireEnv("ORCHESTRATOR_DB_DSN"))
 	if err != nil {
 		log.Fatalf("control-plane: task store: %v", err)
 	}
-	defer taskStore.Close()
+	defer pgStore.Close()
+	// Committed task_events feed the task/phase/step metrics (design §6).
+	pgStore.Observer = metrics
+	taskStore := instrumented.Store{Next: pgStore, Metrics: metrics}
 
 	registry := executor.NewRegistry(
-		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: launchForgejoURL},
-		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: auditWriter, ForgejoURL: launchForgejoURL},
+		&executor.AgentStageExecutor{Launcher: launcher, Secrets: secrets, Audit: audited, ForgejoURL: launchForgejoURL},
+		&executor.DeterministicStepExecutor{Launcher: launcher, Secrets: secrets, Audit: audited, ForgejoURL: launchForgejoURL},
 	)
 
 	// Real ApprovalVerifier (design §4.4): the actual verification work
@@ -113,7 +135,7 @@ func main() {
 		Coreloop: coreloop.Dependencies{
 			Policy:                 policy,
 			Approval:               approvalVerifier,
-			Audit:                  auditWriter,
+			Audit:                  audited,
 			Executors:              registry,
 			OrchestratorInstanceID: orchestratorInstanceID,
 			IssueOpener:            git,
@@ -123,6 +145,10 @@ func main() {
 		Store:      taskStore,
 		Launcher:   launcher,
 		MaxRetries: envInt("TASK_MAX_RETRIES", taskrunner.DefaultMaxRetries),
+		Observer:   metrics,
+	})
+	metrics.RegisterFleetGauges(func(ctx context.Context) (domain.FleetSnapshot, error) {
+		return taskStore.FleetSnapshot(ctx, stuckInterval)
 	})
 
 	// Startup reconciliation (design §4.2): resume any task left
@@ -132,7 +158,7 @@ func main() {
 		log.Fatalf("control-plane: startup reconciliation: %v", err)
 	}
 
-	srv := &server{git: git, secrets: secrets, runner: runner}
+	srv := &server{git: git, secrets: secrets, runner: runner, metrics: metrics}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -143,10 +169,14 @@ func main() {
 	secretsProbe := health.NewProber("secrets_issuer", secretsURL)
 	go pdpProbe.Run(ctx, probeInterval)
 	go secretsProbe.Run(ctx, probeInterval)
+	metrics.RegisterDependencyUp(
+		telemetry.DependencyProbe{Dependency: failure.DepPDP, Up: pdpProbe.Up},
+		telemetry.DependencyProbe{Dependency: failure.DepSecretsIssuer, Up: secretsProbe.Up},
+	)
 
 	mux := newServeMux(srv)
 	health.Register(mux,
-		health.Check{Name: "orchestrator_db", Fn: taskStore.Ping},
+		health.Check{Name: "orchestrator_db", Fn: pgStore.Ping},
 		health.Check{Name: "audit_db", Fn: auditWriter.Ping},
 		pdpProbe.Check(), secretsProbe.Check(),
 	)
@@ -186,6 +216,9 @@ func main() {
 		if err := hs.Shutdown(shutdownCtx); err != nil {
 			slog.Warn("control-plane: shutdown", "addr", hs.Addr, "error", err)
 		}
+	}
+	if err := tel.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("control-plane: telemetry shutdown", "error", err)
 	}
 }
 

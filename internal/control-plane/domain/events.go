@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -107,9 +108,10 @@ func StepLaunchedEvent(taskID string, round int, stepID, invocationID, stepType,
 }
 
 // StepResolvedEvent is written by CompleteStepRun in the same transaction.
-// execErr is the executor's own error (nil on success).
-func StepResolvedEvent(taskID string, round int, stepID, invocationID string, run StepRun, execErr error, duration time.Duration) TaskEvent {
-	payload := map[string]any{"duration_ms": duration.Milliseconds()}
+// execErr is the executor's own error (nil on success). Launcher outcome and
+// timings are included whenever run.Launch carries them, success or not.
+func StepResolvedEvent(taskID string, round int, stepID, stepType, invocationID string, run StepRun, execErr error, duration time.Duration) TaskEvent {
+	payload := map[string]any{"duration_ms": duration.Milliseconds(), "step_type": stepType}
 	if execErr != nil {
 		class, _, dep := failure.Classify(execErr)
 		payload["outcome"] = StepRunStatusFailed
@@ -121,6 +123,13 @@ func StepResolvedEvent(taskID string, round int, stepID, invocationID string, ru
 		payload["outcome"] = StepRunStatusCompleted
 		payload["exit_code"] = run.ExitCode
 		payload["has_finding"] = run.HasFinding
+	}
+	if l := run.Launch; l.Outcome != "" {
+		payload["launcher_outcome"] = l.Outcome
+		payload["queue_wait_ms"] = l.QueueWait.Milliseconds()
+		payload["boot_ms"] = l.Boot.Milliseconds()
+		payload["run_ms"] = l.GuestRun.Milliseconds()
+		payload["effective_timeout_s"] = int64(l.EffectiveTimeout.Seconds())
 	}
 	return TaskEvent{TaskID: taskID, Round: round, StepID: stepID, InvocationID: invocationID, Type: EventStepResolved, Payload: payload}
 }
@@ -160,3 +169,23 @@ const (
 	RoundResumeApproval  = "approval"
 	RoundResumeRetry     = "retry"
 )
+
+// EventObserver is told about events after the transaction that wrote them
+// committed (design §6's metric-from-event path). Implementations must not
+// block and must tolerate events of unknown type.
+type EventObserver interface {
+	Observe(ctx context.Context, events []TaskEvent)
+}
+
+// FleetSnapshot is the aggregate the control-plane's gauges poll (MT-7,
+// MT-9): tasks per status, running tasks with no event for longer than the
+// stuck interval, and the approval queue.
+type FleetSnapshot struct {
+	TasksByStatus      map[string]int64
+	Stuck              int64
+	ApprovalsWaiting   int64
+	OldestApprovalWait time.Duration
+}
+
+// TaskStatuses is every tasks.status value, for zero-filling per-status gauges.
+var TaskStatuses = []string{TaskStatusRunning, TaskStatusWaitingApproval, TaskStatusStopSuccess, TaskStatusStopEscalate, TaskStatusFailed}

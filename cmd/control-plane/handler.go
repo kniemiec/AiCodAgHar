@@ -13,6 +13,7 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/secretsclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 // createTaskRequest's branch is now optional (Task Intent Propagation
@@ -89,6 +90,7 @@ type server struct {
 	git     gitclient.GitHostClient
 	secrets secretsclient.SecretsClient
 	runner  *taskrunner.Runner
+	metrics *telemetry.ControlPlane // nil records nothing
 }
 
 func newServeMux(s *server) *http.ServeMux {

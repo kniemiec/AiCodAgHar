@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strings"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/kniemiec/AiCodAgHar/internal/buildinfo"
 )
 
@@ -69,7 +71,8 @@ func WithStep(ctx context.Context, stepID, invocationID string) context.Context 
 	return context.WithValue(ctx, ctxKey{}, a)
 }
 
-// contextHandler appends the ctx correlation attributes to each record.
+// contextHandler appends the ctx correlation attributes to each record, plus
+// trace_id/span_id when ctx carries a valid span (LG-2).
 type contextHandler struct{ slog.Handler }
 
 func (h contextHandler) Handle(ctx context.Context, r slog.Record) error {
@@ -85,6 +88,9 @@ func (h contextHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 	if a.InvocationID != "" {
 		r.AddAttrs(slog.String("invocation_id", a.InvocationID))
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		r.AddAttrs(slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String()))
 	}
 	return h.Handler.Handle(ctx, r)
 }
@@ -165,8 +171,8 @@ func isSensitive(r slog.Record) bool {
 // Setup installs a slog default logger tagged with component, host and
 // build version, configured from LOG_LEVEL (debug|info|warn|error, default
 // info) and LOG_FORMAT (text|json, default text). stderr is always on;
-// extra sinks (added by later telemetry wiring) receive every
-// non-sensitive record. slog.SetDefault also redirects the stdlib log
+// extra sinks (the OTLP log bridge, internal/telemetry) receive every
+// non-sensitive record at or above LOG_LEVEL. slog.SetDefault also redirects the stdlib log
 // package, so startup log.Fatalf lines go through the same handler.
 func Setup(component string, extra ...slog.Handler) {
 	slog.SetDefault(slog.New(NewHandler(os.Stderr, component, extra...)))
@@ -188,7 +194,30 @@ func NewHandler(w io.Writer, component string, extra ...slog.Handler) slog.Handl
 		slog.String("host", host),
 		slog.String("version", buildinfo.Version),
 	}
-	return contextHandler{fanout{primary: base, sinks: extra}.WithAttrs(attrs)}
+	sinks := make([]slog.Handler, len(extra))
+	for i, h := range extra {
+		sinks[i] = levelFilter{Handler: h, min: opts.Level.Level()}
+	}
+	return contextHandler{fanout{primary: base, sinks: sinks}.WithAttrs(attrs)}
+}
+
+// levelFilter applies LOG_LEVEL to an extra sink, which (like the OTel log
+// bridge) may otherwise accept every level.
+type levelFilter struct {
+	slog.Handler
+	min slog.Level
+}
+
+func (h levelFilter) Enabled(ctx context.Context, l slog.Level) bool {
+	return l >= h.min && h.Handler.Enabled(ctx, l)
+}
+
+func (h levelFilter) WithAttrs(as []slog.Attr) slog.Handler {
+	return levelFilter{Handler: h.Handler.WithAttrs(as), min: h.min}
+}
+
+func (h levelFilter) WithGroup(n string) slog.Handler {
+	return levelFilter{Handler: h.Handler.WithGroup(n), min: h.min}
 }
 
 func parseLevel(s string) slog.Level {

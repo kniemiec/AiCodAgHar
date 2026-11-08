@@ -5,6 +5,7 @@ package launcherclient_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strconv"
 	"testing"
@@ -190,5 +191,36 @@ func TestClient_PostPRCommentUsesInjectedCredential(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected launcher-mock to have posted the comment via the injected credential")
+	}
+}
+
+// TestClient_OutcomeContract checks the mock speaks the launcher outcome
+// contract (LA-4): COMPLETED on success, and on a failing fixture an
+// Internal status carrying the LaunchResponse (GUEST_ERROR) as a detail.
+func TestClient_OutcomeContract(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+
+	result, err := client.Launch(ctx, launcherclient.LaunchRequest{
+		InvocationID: "inv-outcome-ok", TaskID: "task-1", StepType: "agent-stage", StepID: "review", PayloadRef: "noop-success",
+		TimeoutSeconds: 42,
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if result.Outcome != launcherclient.OutcomeCompleted || result.EffectiveTimeout.Seconds() != 42 {
+		t.Fatalf("success result = %+v, want outcome completed and effective timeout 42s", result)
+	}
+
+	// post-pr-comment fails inside the fixture when the git env is missing.
+	_, err = client.Launch(ctx, launcherclient.LaunchRequest{
+		InvocationID: "inv-outcome-fail", TaskID: "task-1", StepType: "agent-stage", StepID: "review", PayloadRef: "post-pr-comment",
+	})
+	var le *launcherclient.LaunchError
+	if !errors.As(err, &le) {
+		t.Fatalf("err = %v, want *launcherclient.LaunchError carrying the mock's LaunchResponse", err)
+	}
+	if le.Outcome != launcherclient.OutcomeGuestError || le.Result.Status != "error" {
+		t.Fatalf("LaunchError = %+v, want guest_error / status error", le)
 	}
 }

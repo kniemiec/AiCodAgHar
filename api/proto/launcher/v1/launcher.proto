@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package launcher.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1;launcherv1";
@@ -30,12 +31,42 @@ message LaunchRequest {
   repeated string granted_scopes = 8;
 }
 
+// LaunchOutcome is the enumerated result of one invocation (LA-1). It is
+// derived from the same bookkeeping as the legacy status string, which stays
+// for existing clients.
+enum LaunchOutcome {
+  LAUNCH_OUTCOME_UNSPECIFIED = 0;
+  LAUNCH_OUTCOME_COMPLETED = 1;
+  // The VM never reached the guest (jail, image, Firecracker API or boot error).
+  LAUNCH_OUTCOME_BOOT_FAILURE = 2;
+  // The guest ran but did not report completion within the effective timeout.
+  LAUNCH_OUTCOME_TIMEOUT = 3;
+  // The guest ran and reported a failure, crashed, or returned no valid result.
+  LAUNCH_OUTCOME_GUEST_ERROR = 4;
+  // Pre-empted by Kill (while queued or running).
+  LAUNCH_OUTCOME_KILLED = 5;
+}
+
+// LaunchResponse is returned on success and, on failure, attached to the
+// non-OK gRPC status as an error detail so callers still get the outcome and
+// timings.
 message LaunchResponse {
   string invocation_id = 1;
   int32 exit_code = 2;
   string status = 3; // completed | timed_out | killed | error
+  // started_at is when the request was accepted, so it includes queue_wait.
   google.protobuf.Timestamp started_at = 4;
   google.protobuf.Timestamp finished_at = 5;
+  LaunchOutcome outcome = 6;
+  // Time spent waiting for the VM slot (the launcher runs one VM at a time).
+  google.protobuf.Duration queue_wait = 7;
+  // Slot acquired -> InstanceStart returned.
+  google.protobuf.Duration boot = 8;
+  // InstanceStart -> guest completion (or timeout/kill/crash).
+  google.protobuf.Duration guest_run = 9;
+  // The timeout actually applied: timeout_seconds if positive, else the
+  // launcher default (LA-3).
+  int32 effective_timeout_seconds = 10;
 }
 
 message KillRequest {

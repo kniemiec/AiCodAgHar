@@ -282,7 +282,10 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 		killAndReap()
 		return bootOutcome{status: "error"}, fmt.Errorf("container-launcher: instance-start: %w", err)
 	}
-	log.InfoContext(ctx, "microVM started", "boot_elapsed", time.Since(bootStart), "jailer_log", jailerLogPath,
+	// boot ends here and the guest run starts (design §7's timing split).
+	boot := time.Since(bootStart)
+	runStart := time.Now()
+	log.InfoContext(ctx, "microVM started", "boot_elapsed", boot, "jailer_log", jailerLogPath,
 		"mode", launchMode(task, command))
 
 	if task == "" && command == "" {
@@ -290,24 +293,28 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 		case err := <-exited:
 			// Crashed (or shut itself down) before the grace period
 			// elapsed — not a clean completion signal for a payload that
-			// should just sit at a boot prompt.
-			return bootOutcome{exitCode: 1, status: "error"}, fmt.Errorf("container-launcher: guest process exited during boot: %v", err)
+			// should just sit at a boot prompt. Still a boot failure.
+			return bootOutcome{exitCode: 1, status: "error", boot: boot}, fmt.Errorf("container-launcher: guest process exited during boot: %v", err)
 		case <-time.After(bootGracePeriod):
 		case <-ctx.Done():
 			killAndReap()
-			return bootOutcome{status: statusForCancellation(ctx)}, context.Cause(ctx)
+			return bootOutcome{status: statusForCancellation(ctx), boot: boot, reachedGuest: true, run: time.Since(runStart)}, context.Cause(ctx)
 		}
 
 		killAndReap()
-		return bootOutcome{exitCode: 0, status: "completed"}, nil
+		return bootOutcome{exitCode: 0, status: "completed", boot: boot, reachedGuest: true, run: time.Since(runStart)}, nil
 	}
 
 	timeout := resolveTimeout(timeoutSeconds, l.cfg.DefaultTimeoutSeconds)
 	log.InfoContext(ctx, "waiting for guest completion", "timeout", timeout)
+	var outcome bootOutcome
 	if task != "" {
-		return l.waitForAgentCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+		outcome, err = l.waitForAgentCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+	} else {
+		outcome, err = l.waitForCommandCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
 	}
-	return l.waitForCommandCompletion(ctx, log, env, vsockListener, exited, killAndReap, timeout)
+	outcome.boot = boot
+	return outcome, err
 }
 
 func launchMode(task, command string) string {
@@ -330,6 +337,7 @@ func launchMode(task, command string) string {
 // this function — nothing captured here reaches ExtractLogsResponse
 // un-redacted.
 func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, log *slog.Logger, env map[string]string, vsockListener *vsock.Listener, exited <-chan error, killAndReap func(), timeout time.Duration) (bootOutcome, error) {
+	runStart := time.Now()
 	waitCtx, waitCancel := context.WithCancel(ctx)
 	defer waitCancel()
 
@@ -391,11 +399,16 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, log *s
 		"FORGEJO_TOKEN": env["FORGEJO_TOKEN"],
 		"LLM_API_KEY":   l.cfg.LLMAPIKey,
 	}
+	redactedResult, n1 := vsock.RedactCounted(structuredResultJSON, secrets)
+	redactedStdout, n2 := vsock.RedactCounted(stdout, secrets)
 	return bootOutcome{
 		exitCode:             exitCode,
 		status:               status,
-		structuredResultJSON: vsock.Redact(structuredResultJSON, secrets),
-		stdout:               vsock.Redact(stdout, secrets),
+		structuredResultJSON: redactedResult,
+		stdout:               redactedStdout,
+		reachedGuest:         true,
+		run:                  time.Since(runStart),
+		redactions:           n1 + n2,
 	}, outErr
 }
 
@@ -407,6 +420,7 @@ func (l *firecrackerLauncher) waitForAgentCompletion(ctx context.Context, log *s
 // There is no structured result in command mode, so
 // bootOutcome.structuredResultJSON is left unset on every path.
 func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, log *slog.Logger, env map[string]string, vsockListener *vsock.Listener, exited <-chan error, killAndReap func(), timeout time.Duration) (bootOutcome, error) {
+	runStart := time.Now()
 	waitCtx, waitCancel := context.WithCancel(ctx)
 	defer waitCancel()
 
@@ -464,10 +478,14 @@ func (l *firecrackerLauncher) waitForCommandCompletion(ctx context.Context, log 
 	}
 
 	secrets := map[string]string{"FORGEJO_TOKEN": env["FORGEJO_TOKEN"]}
+	redactedStdout, n := vsock.RedactCounted(stdout, secrets)
 	return bootOutcome{
-		exitCode: exitCode,
-		status:   status,
-		stdout:   vsock.Redact(stdout, secrets),
+		exitCode:     exitCode,
+		status:       status,
+		stdout:       redactedStdout,
+		reachedGuest: true,
+		run:          time.Since(runStart),
+		redactions:   n,
 	}, outErr
 }
 

@@ -3,6 +3,7 @@ package taskrunner_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/fakes"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry/telemetrytest"
 )
 
 var errBoom = errors.New("boom")
@@ -33,6 +36,14 @@ type failingStore struct {
 	ensureRound    func() error
 	updateState    func(domain.TaskState) error
 	setPRNumber    func() error
+	failTask       func() error
+}
+
+func (s *failingStore) FailTask(ctx context.Context, rec domain.FailureRecord, ev ...domain.TaskEvent) error {
+	if s.failTask != nil {
+		return s.failTask()
+	}
+	return s.FakeTaskStore.FailTask(ctx, rec, ev...)
 }
 
 func (s *failingStore) RecordStepLaunched(ctx context.Context, taskID string, round int, step policyclient.ResolvedStep, inv string) error {
@@ -124,6 +135,7 @@ type env struct {
 	git      *failingGit
 	secrets  *failingSecrets
 	audit    *failingAudit
+	observer taskrunner.Observer
 }
 
 func newEnv(steps ...policyclient.ResolvedStep) *env {
@@ -151,6 +163,7 @@ func (e *env) runner() *taskrunner.Runner {
 		},
 		Store:    e.store,
 		Launcher: e.launcher,
+		Observer: e.observer,
 	})
 }
 
@@ -163,15 +176,26 @@ func (e *env) start(t *testing.T, r *taskrunner.Runner) taskrunner.Result {
 	return <-done
 }
 
+// launchOutcome makes Launch fail the way a current launcher does: Internal
+// with the LaunchResponse delivered, here as *launcherclient.LaunchError.
+func launchOutcome(outcome string) func(e *env) {
+	return func(e *env) {
+		e.launcher.LaunchFunc = func(_ context.Context, req launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+			res := launcherclient.RunResult{InvocationID: req.InvocationID, Status: "error", Outcome: outcome, Boot: time.Second}
+			return res, &launcherclient.LaunchError{Result: res, Outcome: outcome, Err: status.Error(codes.Internal, "launch failed")}
+		}
+	}
+}
+
 func agentStep(id, phase string) policyclient.ResolvedStep {
 	return policyclient.ResolvedStep{StepID: id, Type: executor.StepTypeAgentStage, Phase: phase}
 }
 
 // TestRunner_FailureTable is the ER-1 table test: every failure path in the
 // design's §2 table that this PR can reach ends the task failed with the
-// listed class/retryable, exactly one task.failed event, and a restart never
-// picks it up again. (The launcher-outcome rows arrive with the launcher
-// outcome contract.)
+// listed class/retryable, exactly one task.failed event and one
+// harness_task_failures_total increment, and a restart never picks it up
+// again.
 func TestRunner_FailureTable(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -213,6 +237,21 @@ func TestRunner_FailureTable(t *testing.T) {
 				return launcherclient.RunResult{}, status.Error(codes.Internal, "boot failed")
 			}
 		}, []policyclient.ResolvedStep{agentStep("review", "")}, "infrastructure", true, ""},
+		{"launch boot failure (outcome)", launchOutcome(launcherclient.OutcomeBootFailure),
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "infrastructure", true, ""},
+		{"launch killed (outcome)", launchOutcome(launcherclient.OutcomeKilled),
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "infrastructure", true, ""},
+		{"launch timeout (outcome)", launchOutcome(launcherclient.OutcomeTimeout),
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "agent", false, ""},
+		{"launch guest error (outcome)", launchOutcome(launcherclient.OutcomeGuestError),
+			[]policyclient.ResolvedStep{agentStep("review", "")}, "agent", false, ""},
+		{"deterministic launch guest error (outcome)", launchOutcome(launcherclient.OutcomeGuestError),
+			[]policyclient.ResolvedStep{{StepID: "lint", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhaseReview}}, "agent", false, ""},
+		{"deterministic launch unavailable", func(e *env) {
+			e.launcher.LaunchFunc = func(context.Context, launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
+				return launcherclient.RunResult{}, status.Error(codes.Unavailable, "down")
+			}
+		}, []policyclient.ResolvedStep{{StepID: "lint", Type: executor.StepTypeDeterministicStep, Phase: policyclient.PhaseReview}}, "dependency", true, "launcher"},
 		{"launch invalid argument", func(e *env) {
 			e.launcher.LaunchFunc = func(context.Context, launcherclient.LaunchRequest) (launcherclient.RunResult, error) {
 				return launcherclient.RunResult{}, status.Error(codes.InvalidArgument, "bad payload_ref")
@@ -252,10 +291,21 @@ func TestRunner_FailureTable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(tc.steps...)
 			tc.setup(e)
+			reader := telemetrytest.New()
+			e.store.Observer = telemetry.NewControlPlane(reader.Provider, telemetry.ControlPlaneOptions{})
 			r := e.runner()
 			res := e.start(t, r)
 			if res.Err == nil {
 				t.Fatalf("expected an error result, got %+v", res)
+			}
+			if got := reader.Value(t, "harness_task_failures_total", nil); got != 1 {
+				t.Fatalf("harness_task_failures_total = %v, want 1", got)
+			}
+			if got := reader.Value(t, "harness_task_failures_total", map[string]string{
+				"error_class": tc.class, "retryable": strconv.FormatBool(tc.retryable), "dependency": tc.dep,
+			}); got != 1 {
+				t.Fatalf("harness_task_failures_total{%s,%v,%q} = %v, want 1: %+v", tc.class, tc.retryable, tc.dep, got,
+					reader.Points(t, "harness_task_failures_total"))
 			}
 
 			rec, _, _ := e.store.GetTask(context.Background(), "task-1")

@@ -28,10 +28,14 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/buildinfo"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/egress"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 func main() {
-	logging.Setup("container-launcher")
+	// Telemetry first so the OTLP log bridge is a logging sink from the
+	// first line on; without OTEL_EXPORTER_OTLP_ENDPOINT it is a no-op.
+	tel := telemetry.Setup(context.Background(), "container-launcher")
+	logging.Setup("container-launcher", tel.LogHandlers()...)
 	cfg := loadConfig()
 	slog.Info("container-launcher starting",
 		"version", buildinfo.Version, "commit", buildinfo.Commit, "health_addr", cfg.HealthAddr,
@@ -74,13 +78,22 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer(grpc.Creds(creds), grpc.UnaryInterceptor(logUnaryRPC))
-	launcherv1.RegisterContainerLauncherServiceServer(grpcServer, newLauncherServer(cfg))
+	launcherv1.RegisterContainerLauncherServiceServer(grpcServer, newLauncherServer(cfg, tel.MeterProvider))
 
-	slog.Info("container-launcher listening (mTLS)", "addr", cfg.Addr)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("container-launcher: serve: %v", err)
+	slog.Info("container-launcher listening (mTLS)", "addr", cfg.Addr, "telemetry_endpoint", os.Getenv(telemetry.EndpointEnv))
+	serveErr := grpcServer.Serve(lis)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
+	defer cancel()
+	if err := tel.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("container-launcher: telemetry shutdown", "error", err)
+	}
+	if serveErr != nil {
+		log.Fatalf("container-launcher: serve: %v", serveErr)
 	}
 }
+
+// telemetryFlushTimeout bounds the final metric/log flush on exit.
+const telemetryFlushTimeout = 5 * time.Second
 
 // logUnaryRPC logs every RPC with its outcome code. Requests rejected
 // before the handler logs anything (e.g. InvalidArgument) still show up.

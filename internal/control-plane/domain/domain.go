@@ -65,6 +65,23 @@ type StepRun struct {
 	HasFinding       bool
 	StructuredResult []byte
 	Status           string // launched | completed | failed ("" when not persistence-backed)
+
+	// Launch is what the launcher reported about the invocation (design §7).
+	// Executors set it on success and, when the launcher delivered it, on a
+	// failed launch too; it is not persisted in step_runs, only carried into
+	// the step.resolved event.
+	Launch LaunchInfo
+}
+
+// LaunchInfo is the launcher's outcome and timing for one invocation.
+// Outcome is "" when the launcher reported none (an old server, or an RPC
+// that never reached it).
+type LaunchInfo struct {
+	Outcome          string // completed | boot_failure | timeout | guest_error | killed
+	QueueWait        time.Duration
+	Boot             time.Duration
+	GuestRun         time.Duration
+	EffectiveTimeout time.Duration
 }
 
 // step_runs.status values (design §4.2/§5).

@@ -7,6 +7,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
@@ -42,15 +43,23 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	exitCode, structuredResult, err := fx(ctx, req)
 	finishedAt := time.Now()
 
+	// Same outcome contract as the real launcher (LA-4): there is no VM, so
+	// queue/boot/run are zero and the effective timeout is the request's.
 	resp := &launcherv1.LaunchResponse{
-		InvocationId: req.InvocationId,
-		ExitCode:     exitCode,
-		Status:       "completed",
-		StartedAt:    timestamppb.New(startedAt),
-		FinishedAt:   timestamppb.New(finishedAt),
+		InvocationId:            req.InvocationId,
+		ExitCode:                exitCode,
+		Status:                  "completed",
+		StartedAt:               timestamppb.New(startedAt),
+		FinishedAt:              timestamppb.New(finishedAt),
+		Outcome:                 launcherv1.LaunchOutcome_LAUNCH_OUTCOME_COMPLETED,
+		QueueWait:               durationpb.New(0),
+		Boot:                    durationpb.New(0),
+		GuestRun:                durationpb.New(0),
+		EffectiveTimeoutSeconds: req.TimeoutSeconds,
 	}
 	if err != nil {
 		resp.Status = "error"
+		resp.Outcome = launcherv1.LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR
 	}
 
 	s.mu.Lock()
@@ -63,7 +72,13 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	s.mu.Unlock()
 
 	if err != nil {
-		return resp, status.Errorf(codes.Internal, "launcher-mock: fixture %q failed: %v", req.PayloadRef, err)
+		// Attach resp as an error detail, exactly like the real launcher,
+		// so the control-plane sees the outcome on this path too.
+		st := status.Newf(codes.Internal, "launcher-mock: fixture %q failed: %v", req.PayloadRef, err)
+		if withDetail, derr := st.WithDetails(resp); derr == nil {
+			st = withDetail
+		}
+		return resp, st.Err()
 	}
 	return resp, nil
 }

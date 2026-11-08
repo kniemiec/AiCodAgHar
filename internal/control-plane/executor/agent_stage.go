@@ -65,11 +65,11 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 	if err != nil {
 		slog.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
 		auditLaunchFailure(e.Audit, sc, invocationID)
-		return domain.StepRun{}, classifyLaunchError(fmt.Errorf("launch agent-stage step %s: %w", sc.Step.StepID, err))
+		return domain.StepRun{Launch: launchInfo(result, err)}, classifyLaunchError(fmt.Errorf("launch agent-stage step %s: %w", sc.Step.StepID, err))
 	}
 
-	slog.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
-		"started_at", result.StartedAt, "finished_at", result.FinishedAt, "duration", time.Since(launchStarted))
+	slog.InfoContext(ctx, "launch finished", "status", result.Status, "outcome", result.Outcome, "exit_code", result.ExitCode,
+		"queue_wait", result.QueueWait, "boot", result.Boot, "guest_run", result.GuestRun, "duration", time.Since(launchStarted))
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
@@ -98,5 +98,6 @@ func (e *AgentStageExecutor) Execute(ctx context.Context, sc StepContext) (domai
 		ExitCode:         result.ExitCode,
 		HasFinding:       parsed.HasBlockingFinding,
 		StructuredResult: logs.StructuredResultJSON,
+		Launch:           launchInfo(result, nil),
 	}, nil
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 type captureSink struct {
@@ -80,5 +82,42 @@ func TestSensitiveViaWithAttrsLoggerStillFiltered(t *testing.T) {
 	l.InfoContext(context.Background(), "x", Sensitive())
 	if len(sink.msgs) != 0 {
 		t.Errorf("sink got %v", sink.msgs)
+	}
+}
+
+func TestTraceIDsFromContext(t *testing.T) {
+	var buf bytes.Buffer
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{0x0a, 0x0b, 1},
+		SpanID:     trace.SpanID{0x0c, 2},
+		TraceFlags: trace.FlagsSampled,
+	})
+	jsonLogger(&buf).InfoContext(trace.ContextWithSpanContext(context.Background(), sc), "traced")
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec["trace_id"] != sc.TraceID().String() || rec["span_id"] != sc.SpanID().String() {
+		t.Errorf("trace_id/span_id = %v/%v, want %s/%s", rec["trace_id"], rec["span_id"], sc.TraceID(), sc.SpanID())
+	}
+
+	buf.Reset()
+	jsonLogger(&buf).InfoContext(context.Background(), "untraced")
+	if strings.Contains(buf.String(), "trace_id") {
+		t.Errorf("trace_id on a record without a span: %s", buf.String())
+	}
+}
+
+// TestExtraSinksFollowLogLevel: an extra sink that accepts every level (as
+// the OTLP bridge does) still only receives records at or above LOG_LEVEL.
+func TestExtraSinksFollowLogLevel(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	sink := &captureSink{}
+	l := slog.New(NewHandler(&bytes.Buffer{}, "test", sink))
+	l.DebugContext(context.Background(), "chatter")
+	l.InfoContext(context.Background(), "lifecycle")
+	if len(sink.msgs) != 1 || sink.msgs[0] != "lifecycle" {
+		t.Errorf("extra sink got %v, want only the info record", sink.msgs)
 	}
 }

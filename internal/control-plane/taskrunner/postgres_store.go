@@ -20,6 +20,10 @@ import (
 // a DSN rather than a shared one passed in.
 type PostgresTaskStore struct {
 	db *sql.DB
+
+	// Observer, when set, is told about every event after the transaction
+	// that inserted it committed — the metric-from-event path (design §6).
+	Observer domain.EventObserver
 }
 
 // NewPostgresTaskStore opens a connection pool against dsn (a
@@ -42,27 +46,37 @@ func (s *PostgresTaskStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
-// execer is the part of *sql.DB / *sql.Tx the helpers below need.
-type execer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+// txn is one transaction plus the events inserted in it, handed to the
+// Observer once it commits.
+type txn struct {
+	*sql.Tx
+	events []domain.TaskEvent
 }
 
 // withTx runs fn in one transaction: commit on nil, rollback otherwise. It is
-// what makes "state change and its event" atomic (design §3, TS-3).
-func (s *PostgresTaskStore) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+// what makes "state change and its event" atomic (design §3, TS-3). Only a
+// committed transaction's events reach the Observer.
+func (s *PostgresTaskStore) withTx(ctx context.Context, fn func(tx *txn) error) error {
+	sqlTx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	tx := &txn{Tx: sqlTx}
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.Observer != nil && len(tx.events) > 0 {
+		s.Observer.Observe(ctx, tx.events)
+	}
+	return nil
 }
 
-// insertEvents appends events to orchestrator.task_events via ex.
-func insertEvents(ctx context.Context, ex execer, events []domain.TaskEvent) error {
+// insertEvents appends events to orchestrator.task_events within tx.
+func insertEvents(ctx context.Context, tx *txn, events []domain.TaskEvent) error {
 	for _, e := range events {
 		payload := e.Payload
 		if payload == nil {
@@ -72,20 +86,21 @@ func insertEvents(ctx context.Context, ex execer, events []domain.TaskEvent) err
 		if err != nil {
 			return fmt.Errorf("marshal %s payload: %w", e.Type, err)
 		}
-		if _, err := ex.ExecContext(ctx, `
+		if err := tx.QueryRowContext(ctx, `
 			INSERT INTO orchestrator.task_events (task_id, round, step_id, invocation_id, type, payload, trace_id, span_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, at`,
 			e.TaskID, e.Round, nullableString(e.StepID), nullableString(e.InvocationID), e.Type, b,
 			nullableString(e.TraceID), nullableString(e.SpanID),
-		); err != nil {
+		).Scan(&e.ID, &e.At); err != nil {
 			return fmt.Errorf("insert %s event: %w", e.Type, err)
 		}
+		tx.events = append(tx.events, e)
 	}
 	return nil
 }
 
 func (s *PostgresTaskStore) CreateTask(ctx context.Context, task domain.Task) error {
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO orchestrator.tasks (
 				id, type, target_repo, triggering_principal, bot_account, risk_tier,
@@ -151,7 +166,7 @@ func (s *PostgresTaskStore) UpdateTaskState(ctx context.Context, state domain.Ta
 	if state.ApprovalIssueNumber != nil {
 		approvalIssue = *state.ApprovalIssueNumber
 	}
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE orchestrator.tasks
 			SET status = $2, current_round = $3, approval_issue_number = $4, approved_by = $5,
@@ -176,7 +191,7 @@ func (s *PostgresTaskStore) UpdateTaskState(ctx context.Context, state domain.Ta
 }
 
 func (s *PostgresTaskStore) FailTask(ctx context.Context, rec domain.FailureRecord, events ...domain.TaskEvent) error {
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE orchestrator.tasks
 			SET status = 'failed', error_class = $2, retryable = $3, reason = $4, updated_at = now(),
@@ -199,7 +214,7 @@ func (s *PostgresTaskStore) FailTask(ctx context.Context, rec domain.FailureReco
 }
 
 func (s *PostgresTaskStore) RetryTask(ctx context.Context, taskID string, maxRetries int, ev domain.TaskEvent) (domain.TaskState, error) {
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		var previous sql.NullString
 		err := tx.QueryRowContext(ctx, `
 			WITH prev AS (SELECT error_class FROM orchestrator.tasks WHERE id = $1 FOR UPDATE)
@@ -238,7 +253,7 @@ func (s *PostgresTaskStore) AppendEvents(ctx context.Context, events ...domain.T
 	if len(events) == 0 {
 		return nil
 	}
-	err := s.withTx(ctx, func(tx *sql.Tx) error { return insertEvents(ctx, tx, events) })
+	err := s.withTx(ctx, func(tx *txn) error { return insertEvents(ctx, tx, events) })
 	if err != nil {
 		return fmt.Errorf("taskrunner: append events: %w", err)
 	}
@@ -322,6 +337,50 @@ func (s *PostgresTaskStore) ListTasksByStatus(ctx context.Context, status string
 	return out, rows.Err()
 }
 
+func (s *PostgresTaskStore) FleetSnapshot(ctx context.Context, stuckAfter time.Duration) (domain.FleetSnapshot, error) {
+	snap := domain.FleetSnapshot{TasksByStatus: map[string]int64{}}
+	rows, err := s.db.QueryContext(ctx, `SELECT status, count(*) FROM orchestrator.tasks GROUP BY status`)
+	if err != nil {
+		return snap, fmt.Errorf("taskrunner: fleet snapshot: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int64
+		if err := rows.Scan(&status, &n); err != nil {
+			return snap, fmt.Errorf("taskrunner: fleet snapshot: %w", err)
+		}
+		snap.TasksByStatus[status] = n
+	}
+	if err := rows.Err(); err != nil {
+		return snap, fmt.Errorf("taskrunner: fleet snapshot: %w", err)
+	}
+
+	// Progress is the latest task_events.at (design §4); the database clock
+	// is the single time source for both sides of the comparison.
+	var oldestSeconds float64
+	err = s.db.QueryRowContext(ctx, `
+		WITH last AS (
+			SELECT t.status,
+			       (SELECT max(e.at) FROM orchestrator.task_events e WHERE e.task_id = t.id) AS progress_at,
+			       (SELECT max(e.at) FROM orchestrator.task_events e WHERE e.task_id = t.id AND e.type = $2) AS requested_at,
+			       t.updated_at
+			FROM orchestrator.tasks t WHERE t.status IN ('running', 'waiting_approval')
+		)
+		SELECT
+			count(*) FILTER (WHERE status = 'running' AND COALESCE(progress_at, updated_at) < now() - $1 * interval '1 second'),
+			count(*) FILTER (WHERE status = 'waiting_approval'),
+			COALESCE(extract(epoch FROM max(now() - COALESCE(requested_at, updated_at)) FILTER (WHERE status = 'waiting_approval')), 0)
+		FROM last`,
+		stuckAfter.Seconds(), domain.EventApprovalRequested,
+	).Scan(&snap.Stuck, &snap.ApprovalsWaiting, &oldestSeconds)
+	if err != nil {
+		return snap, fmt.Errorf("taskrunner: fleet snapshot: %w", err)
+	}
+	snap.OldestApprovalWait = time.Duration(oldestSeconds * float64(time.Second))
+	return snap, nil
+}
+
 func (s *PostgresTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE orchestrator.tasks SET pr_number = $2 WHERE id = $1`, taskID, prNumber)
 	if err != nil {
@@ -335,7 +394,7 @@ func (s *PostgresTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, 
 
 func (s *PostgresTaskStore) EnsureRound(ctx context.Context, taskID string, round int) (bool, error) {
 	var created bool
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO orchestrator.rounds (task_id, round_number) VALUES ($1, $2)
 			ON CONFLICT (task_id, round_number) DO NOTHING`, taskID, round)
@@ -356,7 +415,7 @@ func (s *PostgresTaskStore) EnsureRound(ctx context.Context, taskID string, roun
 }
 
 func (s *PostgresTaskStore) RecordStepLaunched(ctx context.Context, taskID string, round int, step policyclient.ResolvedStep, invocationID string) error {
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO orchestrator.step_runs (task_id, round_number, step_id, step_type, invocation_id, blocking, status)
 			VALUES ($1,$2,$3,$4,$5,$6,'launched')
@@ -392,17 +451,17 @@ func (s *PostgresTaskStore) CompleteStepRun(ctx context.Context, taskID string, 
 		structuredResult = nullableJSON(run.StructuredResult)
 	}
 
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.withTx(ctx, func(tx *txn) error {
 		var round int
-		var stepID string
+		var stepID, stepType string
 		var durationMS int64
 		err := tx.QueryRowContext(ctx, `
 			UPDATE orchestrator.step_runs
 			SET status = $2, exit_code = $3, has_finding = $4, structured_result = $5, updated_at = now()
 			WHERE invocation_id = $1
-			RETURNING round_number, step_id, (extract(epoch FROM (now() - created_at)) * 1000)::bigint`,
+			RETURNING round_number, step_id, step_type, (extract(epoch FROM (now() - created_at)) * 1000)::bigint`,
 			invocationID, status, exitCode, hasFinding, structuredResult,
-		).Scan(&round, &stepID, &durationMS)
+		).Scan(&round, &stepID, &stepType, &durationMS)
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("no such row")
 		}
@@ -410,7 +469,7 @@ func (s *PostgresTaskStore) CompleteStepRun(ctx context.Context, taskID string, 
 			return err
 		}
 		return insertEvents(ctx, tx, []domain.TaskEvent{
-			domain.StepResolvedEvent(taskID, round, stepID, invocationID, run, execErr, time.Duration(durationMS)*time.Millisecond),
+			domain.StepResolvedEvent(taskID, round, stepID, stepType, invocationID, run, execErr, time.Duration(durationMS)*time.Millisecond),
 		})
 	})
 	if err != nil {

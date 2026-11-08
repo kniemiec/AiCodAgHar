@@ -10,10 +10,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -22,6 +25,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
+	"github.com/kniemiec/AiCodAgHar/internal/buildinfo"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/egress"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
@@ -30,6 +34,7 @@ func main() {
 	logging.Setup("container-launcher")
 	cfg := loadConfig()
 	slog.Info("container-launcher starting",
+		"version", buildinfo.Version, "commit", buildinfo.Commit, "health_addr", cfg.HealthAddr,
 		"addr", cfg.Addr, "chroot_base_dir", cfg.ChrootBaseDir, "image_root", cfg.ImageRoot,
 		"jailer_binary", cfg.JailerBinary, "firecracker_binary", cfg.FirecrackerBinary,
 		"jailer_uid", cfg.JailerUID, "jailer_gid", cfg.JailerGID,
@@ -40,10 +45,21 @@ func main() {
 	// complete before the first Launch call, so it runs at startup, not
 	// per invocation (egress.Setup's own doc comment explains why this is
 	// safe to treat as a singleton rather than per-invocation state).
+	// The health listener starts first so /readyz can report "egress not
+	// complete" while setup runs, instead of the probe being refused.
+	var egressReady atomic.Bool
+	healthSrv := healthServer(cfg, &egressReady)
+	go func() {
+		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("container-launcher: health listener: %v", err)
+		}
+	}()
+
 	egressCfg := egress.DefaultConfig(cfg.JailerUID)
 	if err := egress.Setup(egressCfg); err != nil {
 		log.Fatalf("container-launcher: egress setup: %v", err)
 	}
+	egressReady.Store(true)
 	slog.Info("egress ready", "tap_device", egressCfg.TapDevice, "tap_cidr", egressCfg.TapCIDR,
 		"guest_subnet", egressCfg.GuestSubnet, "proxy_service", egressCfg.ProxyServiceName, "nft_table", egressCfg.NftTable, "proxy_url", egressCfg.ProxyURL())
 

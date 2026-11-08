@@ -75,10 +75,11 @@ Findings from the code review that this document is written against.
 | TS-1 | M | `GET /tasks/{id}` keeps returning current status, round, PR number, approval issue and step runs. | Existing contract tests still pass; additions are backward-compatible except as stated in TS-4. |
 | TS-2 | M | Every state transition of a task is recorded in an append-only `orchestrator.task_events` table with timestamp, `task_id`, `round`, optional `step_id`/`invocation_id`, event type and a small structured payload. | For any completed task, the sequence of events reconstructs: acceptance, each round start/finish, each phase start/finish, each step launch/resolve, approval requested/granted, resume, reconciliation actions, terminal outcome. |
 | TS-3 | M | Events are written in the same database transaction as the state change they describe. | No test can produce a state change without its event, or an event without its state change, including under injected failure. |
-| TS-4 | M | A task that errored is a distinct, first-class state. It is distinguishable from an active task in the database, in `GET /tasks/{id}`, in metrics, and in `task_events`, and carries a failure class and a retryable/terminal indicator. | A task whose round errors is reported as failed (not `running`); a retryable failure is still picked up by startup reconciliation; a terminal failure is not. |
+| TS-4 | M | A task that errored is a distinct, first-class state. It is distinguishable from an active task in the database, in `GET /tasks/{id}`, in metrics, and in `task_events`, and carries a failure class and a retryable/terminal indicator. | A task whose round errors is reported as `failed` (not `running`). Startup reconciliation does not pick up failed tasks, retryable or not; retry is manual (TS-9). Tasks merely interrupted by a restart (still `running`) are reconciled as today. |
 | TS-5 | M | The status API exposes the task's timeline (or a way to fetch it): at minimum accepted-at, per-round start/finish, and terminal-at. | A caller can compute total duration, per-round duration, and time in `waiting_approval` from the API alone. |
 | TS-6 | S | The timeline is queryable by task, by time range, and by event type through the status API or an equivalent read path. | An operator can list the tasks currently `waiting_approval`, with age. |
 | TS-7 | M | The migration of existing rows is defined: tasks currently persisted as `running` with an `error:` reason are handled explicitly rather than left ambiguous. | Documented migration with a test on a seeded database. |
+| TS-9 | M | A `failed` task flagged retryable can be retried by an operator through an explicit action. There is no automatic retry. A retry is recorded in `task_events` with who/what triggered it. A terminal failure cannot be retried. | Retrying a retryable failed task resumes it and emits a retry event; retrying a terminal one is rejected; a restart never retries a failed task on its own. |
 | TS-8 | C | Task-level summary fields are denormalised for cheap fleet queries (e.g. rounds run, terminal-at). | — |
 
 ### 5.2 Metrics
@@ -261,17 +262,32 @@ It deliberately does not specify what is captured inside the guest.
 
 ## 12. Open questions
 
-1. **Thresholds.** Confirm or change the SLO values in §8 (stuck interval, failure rate, queue wait, approval age, cap-hit rate).
-2. **Retention values** for each store (CC-3).
-3. **Failure-state vocabulary** and the representation of retryable vs terminal in the status model and API (TS-4, TS-7).
-4. **`task_events` event catalogue** — the exact event types and payloads (design).
-5. **Do we back-fill history** for existing tasks from `rounds`/`step_runs`, or start clean?
-6. **`target_repo` as a metric label** — fine at current repository count; revisit if the number of repositories grows beyond a bounded set.
-7. **Whether `GET /tasks/{id}` carries the timeline inline** or via a separate endpoint (TS-5, TS-6).
-8. **Collector topology** — one collector per host, or a shared one — and the transport between hosts.
-9. **Sampling** (TR-7) once real volume is known.
-10. **Authentication for observability UIs** — interim measure until API authn exists.
-11. **Scope of release one** — whether all (M) items land in a single release, or the work splits into foundation (correlation, `task_events`, failure state, metrics) and then tracing and dashboards.
+### 12.1 Decided before design
+
+| # | Decision |
+|---|---|
+| Q3 | **Failure state.** `failed` is a real task status. Each failure carries an `error_class` (ER-1) and a `retryable` flag derived from the class by a fixed mapping (transient causes such as `dependency` and `infrastructure` are retryable; `platform` and deterministic `agent` failures are terminal). **Retry is manual only**, triggered by an operator (TS-9); there is no automatic retry and reconciliation does not touch failed tasks. Exact status and enum names are settled in the design. |
+| Q5 | **No back-fill.** History is not reconstructed from `rounds`/`step_runs`. The migration inserts one synthetic `migrated` event per existing task (timestamp = migration time, payload = status and round at that moment, note that earlier history was not recorded), so every task has a non-empty timeline. Tasks persisted as `running` with an `error:` reason become `failed`; the design defines their class and retryable flag (ER-1 has no "unknown" class). |
+| Q6 | **`target_repo` label** is accepted, restricted to a few task-level metrics (task counters, rounds-per-task), taken from a configured bounded set with `other` as overflow. Not used on histograms, step or dependency metrics. Revisit if the repository count outgrows the set. |
+| Q11 | **Release scope.** Slice 1 (foundation) and slice 2 (pipeline) are designed together and implemented as separate PRs in order. The release boundary is confirmed after the design sizes them; if both do not fit one release, release one is slice 1 plus 2 anyway as the starting target and tracing/dashboards follow. |
+
+### 12.2 To be decided in the design
+
+- **Q4. `task_events` catalogue** — exact event types and payloads.
+- **Q7. Timeline delivery** — inline in `GET /tasks/{id}` or a separate endpoint (TS-5, TS-6).
+- **Q8. Collector topology** — one collector per host or a shared one, and the transport between hosts (check against ADR-12 first; drop if already decided).
+- **Definition of "progress"** for SLO-1 (proposal: latest `task_events`/`step_runs` timestamp), which obliges long-running activity to emit events more often than the stuck interval.
+- **Configurable in-process thresholds** — the stuck interval (MT-9) and approval age (SLO-5) are computed by the platform, so the design makes them configuration.
+- **Failure-rate rule at low volume** (SLO-2) needs a minimum-volume guard.
+- **Retry mechanism** (TS-9) — operator-facing surface (API endpoint or CLI), retry-count bound, and interaction with the missing API authn (N4).
+- **`task_events` volume** — whether it needs partitioning.
+
+### 12.3 Deferred to implementation or deployment
+
+- **Q1. Threshold values** in §8 (alert-only thresholds are tuned in alert rules).
+- **Q2. Retention values** for each store (CC-3 requires that each has one).
+- **Q9. Sampling** (TR-7 defaults to 100%); revisit with real volume.
+- **Q10. Authentication for observability UIs** — interim measure; must be closed before production exposure (SEC-6). Local compose is unaffected.
 
 ## 13. Suggested delivery slicing (for the design to confirm)
 

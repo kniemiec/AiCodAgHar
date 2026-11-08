@@ -43,7 +43,7 @@ services:
       FORGEJO__database__USER: forgejo
       FORGEJO__database__PASSWD: ${FORGEJO_DB_PASSWORD:?set in deploy/.env}
       FORGEJO__server__DOMAIN: localhost
-      FORGEJO__server__ROOT_URL: http://localhost:3001/
+      FORGEJO__server__ROOT_URL: http://localhost:3000/
       FORGEJO__server__SSH_DOMAIN: localhost
       FORGEJO__service__DISABLE_REGISTRATION: "true"
       FORGEJO__security__INSTALL_LOCK: "true"
@@ -56,7 +56,7 @@ services:
     volumes:
       - forgejo-data:/data
     ports:
-      - "3001:3000"
+      - "3000:3000"
       - "2223:22"
     networks: [orchestrator-net]
 
@@ -85,6 +85,9 @@ services:
         condition: service_started
     environment:
       ADDR: ":8080"
+      # Admin routes (retry, waiting/failed listing) have no authn yet; bind
+      # inside the container, publish on host loopback only (see ports below).
+      ADMIN_ADDR: "0.0.0.0:8090"
       FORGEJO_URL: "http://forgejo:3000"
       # Empty until `make bootstrap-admin` has run and deploy/.env carries a
       # real token — this container crash-loops with a clear log message
@@ -132,7 +135,14 @@ services:
         condition: service_started
     environment:
       ADDR: ":8080"
+      # Admin routes (retry, waiting/failed listing) have no authn yet; bind
+      # inside the container, publish on host loopback only (see ports below).
+      ADMIN_ADDR: "0.0.0.0:8090"
       FORGEJO_URL: "http://forgejo:3000"
+      # URL launched steps clone from. Empty = same as FORGEJO_URL (fine for
+      # launcher-mock); a real Firecracker launcher needs the guest-reachable
+      # address, e.g. http://172.16.0.1:3000.
+      LAUNCH_FORGEJO_URL: ${LAUNCH_FORGEJO_URL:-}
       # Same first-boot caveat as pdp-mock: empty until `make bootstrap-admin`
       # has run; crash-loops with a clear log message until then.
       FORGEJO_TOKEN: ${FORGEJO_ADMIN_TOKEN}
@@ -157,4 +167,5 @@ services:
       - ./certs:/certs:ro
     ports:
       - "8080:8080"
+      - "127.0.0.1:8090:8090"
     networks: [orchestrator-net]

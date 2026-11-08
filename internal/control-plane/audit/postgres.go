@@ -31,6 +31,11 @@ func (w *PostgresWriter) Close() error {
 	return w.db.Close()
 }
 
+// Ping checks the pool can reach Postgres (readiness, HL-1).
+func (w *PostgresWriter) Ping(ctx context.Context) error {
+	return w.db.PingContext(ctx)
+}
+
 // WriteInvocationRecord extends task_id's hash chain by one row, inside a
 // transaction serialized per task_id via a Postgres advisory lock — fan-out
 // can write multiple invocations for the same task concurrently, and the

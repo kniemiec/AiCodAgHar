@@ -247,7 +247,7 @@ func TestRunner_ReconcileTask_SkipsCompletedResolvesLaunchedDispatchesMissing(t 
 	if err := store.CreateTask(ctx, task); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
+	if _, err := store.EnsureRound(ctx, task.ID, 1); err != nil {
 		t.Fatalf("EnsureRound: %v", err)
 	}
 	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-completed", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-completed"); err != nil {
@@ -328,7 +328,7 @@ func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
 	if err := store.CreateTask(ctx, task); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
+	if _, err := store.EnsureRound(ctx, task.ID, 1); err != nil {
 		t.Fatalf("EnsureRound(1): %v", err)
 	}
 	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-1"); err != nil {
@@ -342,7 +342,7 @@ func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
 	}
 
 	// Round 2 started (its step launched) but never resolved before the crash.
-	if err := store.EnsureRound(ctx, task.ID, 2); err != nil {
+	if _, err := store.EnsureRound(ctx, task.ID, 2); err != nil {
 		t.Fatalf("EnsureRound(2): %v", err)
 	}
 	if err := store.RecordStepLaunched(ctx, task.ID, 2, policyclient.ResolvedStep{StepID: "step-1", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r2-step-1"); err != nil {
@@ -367,11 +367,13 @@ func TestRunner_ReconcileTask_ResumesRoundAfterLastCompleted(t *testing.T) {
 	}
 }
 
-// TestRunner_ReconcileTask_UnresolvableLaunchedStepEscalates exercises the
+// TestRunner_ReconcileTask_UnresolvableLaunchedStepFails exercises the
 // fail-closed path: a still-"launched" step the launcher no longer knows
 // about (e.g. launcher-mock itself also restarted) must not be silently
-// relaunched or silently ignored — the task escalates instead.
-func TestRunner_ReconcileTask_UnresolvableLaunchedStepEscalates(t *testing.T) {
+// relaunched or silently ignored — the task becomes a retryable failed
+// task (platform-observability design §2; it used to escalate with an
+// audited outcome, but an unreachable launcher is a fault, not a decision).
+func TestRunner_ReconcileTask_UnresolvableLaunchedStepFails(t *testing.T) {
 	launcher := &fakes.FakeContainerLauncher{
 		ExtractLogsFunc: func(ctx context.Context, invocationID string) (launcherclient.LogBundle, error) {
 			return launcherclient.LogBundle{}, context.DeadlineExceeded // any error simulates "unresolvable"
@@ -394,7 +396,7 @@ func TestRunner_ReconcileTask_UnresolvableLaunchedStepEscalates(t *testing.T) {
 	if err := store.CreateTask(ctx, task); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if err := store.EnsureRound(ctx, task.ID, 1); err != nil {
+	if _, err := store.EnsureRound(ctx, task.ID, 1); err != nil {
 		t.Fatalf("EnsureRound: %v", err)
 	}
 	if err := store.RecordStepLaunched(ctx, task.ID, 1, policyclient.ResolvedStep{StepID: "step-launched", Type: executor.StepTypeAgentStage, Blocking: true}, "task-1-r1-step-launched"); err != nil {
@@ -402,19 +404,19 @@ func TestRunner_ReconcileTask_UnresolvableLaunchedStepEscalates(t *testing.T) {
 	}
 
 	result, err := runner.ReconcileTask(ctx, task.ID)
-	if err != nil {
-		t.Fatalf("ReconcileTask: %v", err)
-	}
-	if result.Outcome != coreloop.OutcomeStopEscalate {
-		t.Fatalf("expected stop-escalate on an unresolvable launched step, got %v", result.Outcome)
+	if err == nil || result.Err == nil {
+		t.Fatalf("expected ReconcileTask to report the failure, got result=%+v err=%v", result, err)
 	}
 	if len(launcher.Launches()) != 0 {
 		t.Fatalf("expected zero (re)launches — must not blindly relaunch an unresolvable step, got %d", len(launcher.Launches()))
 	}
 
 	rec, _, _ := store.GetTask(ctx, task.ID)
-	if rec.State.Status != domain.TaskStatusStopEscalate {
-		t.Fatalf("expected persisted status stop_escalate, got %q", rec.State.Status)
+	if rec.State.Status != domain.TaskStatusFailed || rec.State.ErrorClass != "dependency" || !rec.State.Retryable {
+		t.Fatalf("expected failed/dependency/retryable, got %+v", rec.State)
+	}
+	if chain, _ := auditWriter.GetTaskChain(ctx, task.ID); len(chain) != 0 {
+		t.Fatalf("expected no task-outcome audit row for an infrastructure fault, got %d records", len(chain))
 	}
 }
 

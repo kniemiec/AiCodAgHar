@@ -17,6 +17,7 @@ This is a testing/dev-environment concern, not part of the orchestrator's own ar
 | `launcher-mock` | Step launcher | `mocks/launcher-mock` | `9443` (mTLS only) |
 | `forgejo` | Git host (real) | `codeberg.org/forgejo/forgejo:16` | `3000` (UI/API), `2222` (SSH) |
 | `postgres` | `orchestrator` + `audit` schemas (real) | `postgres:16-alpine` | `5432` |
+| `otel-collector`, `prometheus`, `loki`, `tempo`, `grafana`, `alertmanager` | — (the real observability pipeline) | `deploy/docker-compose.observability.yml` | host loopback only — see [§7](#7-observability-stack) |
 
 `pdp-mock` computes real decisions by reading `.harness/*.yaml` live from Forgejo. `launcher-mock` is fixture-driven but performs real Forgejo side effects (commits, comments) using the credential injected for each step. `secrets-mock` hands out a static, pre-provisioned bot-token pool. None of the three persist meaningfully beyond process lifetime.
 
@@ -30,7 +31,7 @@ Go toolchain, Docker + Docker Compose, `openssl` (cert generation).
 cp deploy/.env.example deploy/.env
 #    (edit passwords if you want; the defaults are fine for local dev)
 
-make compose-up          # Forgejo + Postgres + the 3 mocks + control-plane; generates dev mTLS certs
+make compose-up          # Forgejo + Postgres + the 3 mocks + control-plane + observability pipeline; generates dev mTLS certs
 make bootstrap-admin      # mints a Forgejo admin token, recreates pdp-mock/control-plane to pick it up
 make migrate               # applies deploy/migrations/*.sql
 make seed                  # provisions bot accounts + the global-baseline and sample-repo config repos
@@ -38,7 +39,7 @@ make seed                  # provisions bot accounts + the global-baseline and s
 
 **Upgrading an existing stack across migration `006`** (failed status, `task_events`): stop the control-plane first — `docker compose -f deploy/docker-compose.yml stop control-plane` — then `make migrate`, rebuild (`docker compose -f deploy/docker-compose.yml build control-plane`) and `up -d`. `006` converts tasks the old code left `running` with an `error:` reason into retryable `failed` tasks, and a live `runLoop` could otherwise be flipped mid-flight. Afterwards, `GET /tasks/{id}/events` shows a task's timeline and, for a retryable failure, `curl -X POST localhost:8090/admin/tasks/<id>/retry -d '{"operator":"you"}'` resumes it.
 
-**Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). Set `LOG_FORMAT=json` to get `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` as fields. The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
+**Health and logs.** `curl localhost:8080/healthz` and `/readyz` (readiness needs both Postgres pools and the PDP/secrets mocks reachable; a `503` body names the failing checks, the control-plane log says why). The compose control-plane logs JSON (`LOG_FORMAT=json`), so `task_id`/`round`/`step_id`/`invocation_id`/`host`/`version` are fields, and it ships metrics and non-sensitive logs to the Collector ([§7](#7-observability-stack)); `make task-logs TASK=<task_id>` prints one task's lines. The control-plane stops cleanly on `docker compose stop` (SIGTERM, 5 s drain).
 
 After that: Forgejo at `http://localhost:3000` (admin login `forgejo-admin` / `changeme-local-only` — **not** the reserved `admin` username), `control-plane` at `http://localhost:8080`.
 
@@ -111,7 +112,7 @@ docker compose -f deploy/docker-compose.yml exec -T postgres \
 |---|---|---|---|
 | Integration | `compose-up` + `bootstrap-admin` + `migrate` | `make test-integration` | Each production client against its real/stand-in counterpart — incl. mTLS enforcement, the Postgres-role privilege test, and the tamper-detection test |
 | Spike | `compose-up` + `bootstrap-admin` | `make test-spike` | `code.gitea.io/sdk/gitea` actually covers `GitHostClient`'s surface |
-| E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/control-plane/e2e/smoke_test.go` |
+| E2E smoke | Full stack + `make seed` | `make test-e2e` | The real system, driven through its real HTTP API — see `internal/control-plane/e2e/smoke_test.go`. `TestSmoke_MainFlow` also checks that the task's control-plane lines come back from Loki via `task-logs.sh`, in time order, and that `task_id` is not a stream label (needs `curl` + `jq`; `LOKI_URL` overrides `http://localhost:3100`) |
 
 ### Using a local LLM (Ollama on Windows) for agent steps
 
@@ -160,3 +161,30 @@ Notes: the guest reaches Ollama through the launcher's forward proxy (tinyproxy)
 - **A migration you just applied doesn't seem to take effect.** Postgres client connections (including `control-plane`'s pool) can cache prepared-statement type metadata from before a schema change. Restart the affected container after altering a column type.
 - **`make seed` fails with a password/auth error for a bot account.** If a bot account already exists with a different password than `cmd/seed` expects, it deletes and recreates it — expected and safe for these throwaway local accounts.
 - **A webhook to `control-plane` never arrives; Forgejo logs `webhook can only call allowed HTTP servers (check your webhook.ALLOWED_HOST_LIST setting)`.** Forgejo's own SSRF guard blocks webhook delivery to private/loopback addresses by default — but `control-plane` is only ever reachable at a private compose-network address from Forgejo's side, so the default silently breaks every approval webhook in this exact topology. `deploy/docker-compose.yml` sets `FORGEJO__webhook__ALLOWED_HOST_LIST: "private,loopback"` on the `forgejo` service for this reason; if you're seeing this, that service definition changed or the container hasn't picked it up (`docker compose up -d forgejo` to recreate it).
+- **`make compose-up` fails with `include` unknown / not allowed.** The stack pulls `deploy/docker-compose.observability.yml` in with a top-level `include:`, which needs Docker Compose ≥ 2.20 (`docker compose version`).
+- **`make task-logs` prints nothing for a task that ran.** Logs reach Loki asynchronously (a second or two after the line); records older than 14 days are past retention; and `launcher-mock` exports nothing, so only control-plane lines appear. More in [`runbooks/observability.md` §3](runbooks/observability.md#3-when-the-pipeline-itself-is-down).
+
+## 7. Observability stack
+
+`deploy/docker-compose.observability.yml` (platform-observability design §11), included by `deploy/docker-compose.yml`, so `make compose-up`/`compose-down` and every `docker compose -f deploy/docker-compose.yml …` command cover it. Config is under `deploy/observability/<service>/`. Ports are published on **host loopback only**, since none of these has authentication yet. No pipeline container gets a database DSN.
+
+| Service | Image (pinned) | Host port | Role | Retention (provisional) |
+|---|---|---|---|---|
+| `otel-collector` | `otel/opentelemetry-collector-contrib:0.162.0` | `127.0.0.1:4317` (OTLP/gRPC), `:4318` (OTLP/HTTP) | Receives OTLP from the binaries; logs → Loki (`/otlp`), metrics → Prometheus (remote write, `service_name`/`host_name`/`deployment_environment` labels on every series), traces → Tempo | — |
+| `prometheus` | `prom/prometheus:v3.15.1` | `127.0.0.1:9090` | Metrics; also scrapes the pipeline's own components (`up{job=…}`) | 30 d (`--storage.tsdb.retention.time`) |
+| `loki` | `grafana/loki:3.7.9` | `127.0.0.1:3100` | Logs. Stream labels: `service_name`, `host_name`, `deployment_environment` only; `task_id`, `round`, `step_id`, `invocation_id`, `trace_id` are structured metadata | 14 d (`limits_config.retention_period`, compactor) |
+| `tempo` | `grafana/tempo:2.10.10` | `127.0.0.1:3200` | Traces (nothing emits spans until tracing lands, PR E) | 7 d (`compactor.compaction.block_retention`) |
+| `grafana` | `grafana/grafana:13.2.4` | `127.0.0.1:3030` | Prometheus, Loki and Tempo datasources provisioned; dashboards arrive in PR F. Anonymous viewer access; admin `admin` / `GRAFANA_ADMIN_PASSWORD` (default `changeme-local-only`) | — |
+| `alertmanager` | `prom/alertmanager:v0.34.1` | `127.0.0.1:9093` | Null receiver; alert rules arrive in PR F | — |
+
+The audit trail's and `task_events`' retention are unchanged (ADR-5; the `task_events` retention job is PR G).
+
+The compose `control-plane` sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317`, `OTEL_RESOURCE_ATTRIBUTES=deployment.environment=local`, `OTEL_METRIC_EXPORT_INTERVAL=15000` (15 s, quicker than the SDK's 60 s) and `hostname: control-plane-host` (the `host_name` label). It has no `depends_on` on the Collector: telemetry is lossy, a missing Collector never blocks a task. A process on the host (e.g. the real launcher) exports to `http://127.0.0.1:4317`.
+
+```sh
+make task-logs TASK=<task_id>      # every Loki line for one task, time order (deploy/observability/task-logs.sh)
+curl -sG localhost:9090/api/v1/query --data-urlencode 'query=harness_tasks' | jq .   # a metric
+# Grafana: http://localhost:3030 → Explore
+```
+
+Finding a task's logs, timeline and (later) trace, and what to do when the pipeline is down: [`docs/runbooks/observability.md`](runbooks/observability.md).

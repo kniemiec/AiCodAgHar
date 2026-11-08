@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -196,28 +197,82 @@ func NewHandler(w io.Writer, component string, extra ...slog.Handler) slog.Handl
 	}
 	sinks := make([]slog.Handler, len(extra))
 	for i, h := range extra {
-		sinks[i] = levelFilter{Handler: h, min: opts.Level.Level()}
+		sinks[i] = extraSink{Handler: h, min: opts.Level.Level()}
 	}
 	return contextHandler{fanout{primary: base, sinks: sinks}.WithAttrs(attrs)}
 }
 
-// levelFilter applies LOG_LEVEL to an extra sink, which (like the OTel log
-// bridge) may otherwise accept every level.
-type levelFilter struct {
+// extraSink adapts an extra sink (the OTLP log bridge): it applies
+// LOG_LEVEL, which the bridge would otherwise ignore, and rewrites attribute
+// values into kinds every sink can represent. The OTel bridge renders a
+// named string type such as failure.Class as "unhandled: (failure.Class) …"
+// and a time.Duration as bare nanoseconds; extraSink turns named basic types
+// into their underlying kind and durations into their String form. The stderr
+// handler is not affected.
+type extraSink struct {
 	slog.Handler
 	min slog.Level
 }
 
-func (h levelFilter) Enabled(ctx context.Context, l slog.Level) bool {
+func (h extraSink) Enabled(ctx context.Context, l slog.Level) bool {
 	return l >= h.min && h.Handler.Enabled(ctx, l)
 }
 
-func (h levelFilter) WithAttrs(as []slog.Attr) slog.Handler {
-	return levelFilter{Handler: h.Handler.WithAttrs(as), min: h.min}
+func (h extraSink) Handle(ctx context.Context, r slog.Record) error {
+	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	r.Attrs(func(a slog.Attr) bool {
+		out.AddAttrs(portableAttr(a))
+		return true
+	})
+	return h.Handler.Handle(ctx, out)
 }
 
-func (h levelFilter) WithGroup(n string) slog.Handler {
-	return levelFilter{Handler: h.Handler.WithGroup(n), min: h.min}
+func (h extraSink) WithAttrs(as []slog.Attr) slog.Handler {
+	conv := make([]slog.Attr, len(as))
+	for i, a := range as {
+		conv[i] = portableAttr(a)
+	}
+	return extraSink{Handler: h.Handler.WithAttrs(conv), min: h.min}
+}
+
+func (h extraSink) WithGroup(n string) slog.Handler {
+	return extraSink{Handler: h.Handler.WithGroup(n), min: h.min}
+}
+
+func portableAttr(a slog.Attr) slog.Attr {
+	return slog.Attr{Key: a.Key, Value: portableValue(a.Value.Resolve())}
+}
+
+func portableValue(v slog.Value) slog.Value {
+	switch v.Kind() {
+	case slog.KindDuration:
+		return slog.StringValue(v.Duration().String())
+	case slog.KindGroup:
+		g := v.Group()
+		conv := make([]slog.Attr, len(g))
+		for i, a := range g {
+			conv[i] = portableAttr(a)
+		}
+		return slog.GroupValue(conv...)
+	case slog.KindAny:
+		if _, isErr := v.Any().(error); isErr {
+			return v // the bridge maps errors itself
+		}
+		rv := reflect.ValueOf(v.Any())
+		switch rv.Kind() {
+		case reflect.String:
+			return slog.StringValue(rv.String())
+		case reflect.Bool:
+			return slog.BoolValue(rv.Bool())
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return slog.Int64Value(rv.Int())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			return slog.Uint64Value(rv.Uint())
+		case reflect.Float32, reflect.Float64:
+			return slog.Float64Value(rv.Float())
+		}
+	}
+	return v
 }
 
 func parseLevel(s string) slog.Level {

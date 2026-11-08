@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -295,6 +296,74 @@ func TestSmoke_MainFlow(t *testing.T) {
 	}
 	if err := audit.VerifyChain(chain); err != nil {
 		t.Fatalf("expected a valid hash chain, got: %v", err)
+	}
+
+	// (6) the task's control-plane lines reached Loki through the Collector
+	// and come back, in time order, from the single-step runbook action
+	// (platform-observability design §11, LG-3/LG-5).
+	assertTaskLogsInLoki(t, resp.TaskID)
+}
+
+// assertTaskLogsInLoki runs deploy/observability/task-logs.sh (what `make
+// task-logs` runs) for taskID until the task's round lines show up — the log
+// batch processor and the Collector each buffer for a moment — and checks
+// they are in time order. It also checks LG-4: task_id must be structured
+// metadata, never a Loki stream label.
+func assertTaskLogsInLoki(t *testing.T, taskID string) {
+	t.Helper()
+	lokiURL := os.Getenv("LOKI_URL")
+	if lokiURL == "" {
+		lokiURL = "http://localhost:3100"
+	}
+
+	resp, err := http.Get(lokiURL + "/loki/api/v1/labels")
+	if err != nil {
+		t.Fatalf("Loki at %s unreachable (the observability services are part of `make compose-up`): %v", lokiURL, err)
+	}
+	var labels struct {
+		Data []string `json:"data"`
+	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&labels)
+	resp.Body.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode Loki labels: %v", decodeErr)
+	}
+	if !slices.Contains(labels.Data, "service_name") {
+		t.Fatalf("Loki has no service_name label (labels %v): nothing has been ingested over OTLP, so the task_id check below would prove nothing", labels.Data)
+	}
+	for _, forbidden := range []string{"task_id", "invocation_id", "step_id", "trace_id"} {
+		if slices.Contains(labels.Data, forbidden) {
+			t.Fatalf("%s is a Loki stream label (labels %v); it must stay structured metadata (LG-4)", forbidden, labels.Data)
+		}
+	}
+
+	var out string
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		cmd := exec.Command("../../../deploy/observability/task-logs.sh", taskID)
+		cmd.Env = append(os.Environ(), "LOKI_URL="+lokiURL)
+		b, err := cmd.Output()
+		out = string(b)
+		if err == nil && strings.Contains(out, " control-plane INFO round started") && strings.Contains(out, " control-plane INFO round finished") {
+			break
+		}
+		if time.Now().After(deadline) {
+			var stderr string
+			if ee, ok := err.(*exec.ExitError); ok {
+				stderr = string(ee.Stderr)
+			}
+			t.Fatalf("task-logs.sh %s did not return the task's round lines within 45s (err %v, stderr %q); output:\n%s", taskID, err, stderr, out)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	stamps := make([]string, len(lines))
+	for i, l := range lines {
+		stamps[i], _, _ = strings.Cut(l, " ")
+	}
+	if !slices.IsSorted(stamps) {
+		t.Fatalf("task-logs.sh output is not in time order:\n%s", out)
 	}
 }
 

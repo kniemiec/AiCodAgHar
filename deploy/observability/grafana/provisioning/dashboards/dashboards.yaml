@@ -1,0 +1,12 @@
+# Loads dashboard JSON from deploy/observability/grafana/dashboards/
+# (mounted at /etc/grafana/dashboards). Dashboards D1–D6 arrive in PR F.
+apiVersion: 1
+
+providers:
+  - name: harness
+    folder: Harness
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

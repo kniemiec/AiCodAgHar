@@ -21,7 +21,7 @@ import (
 // internal/control-plane/fakes.FakeTaskStore.
 type TaskStore interface {
 	// CreateTask inserts a new task row with status=running,
-	// current_round=0.
+	// current_round=0, and its task.accepted event in the same transaction.
 	CreateTask(ctx context.Context, task domain.Task) error
 
 	// GetTask loads a task's immutable config joined with its live state.
@@ -30,7 +30,9 @@ type TaskStore interface {
 
 	// UpdateTaskState persists a task's live state in place. state.TaskID
 	// selects the row; every other TaskState field is written as given.
-	UpdateTaskState(ctx context.Context, state domain.TaskState) error
+	// events are inserted in the same transaction (design §3, TS-3);
+	// finished_at is stamped when state is stop_success/stop_escalate.
+	UpdateTaskState(ctx context.Context, state domain.TaskState, events ...domain.TaskEvent) error
 
 	// SetTaskPRNumber persists the review PR's number once coreloop opens
 	// it, after the generate phase's step completes with no blocking
@@ -38,16 +40,38 @@ type TaskStore interface {
 	// arrives with pr_number already set.
 	SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error
 
-	// SetTaskReason overwrites only the task's reason column — used to
-	// surface a runLoop error through GET /tasks/{id} without touching
-	// status (left running, so startup reconciliation still retries it) or
-	// any approval/prior-findings state UpdateTaskState would overwrite.
-	SetTaskReason(ctx context.Context, taskID, reason string) error
+	// FailTask moves a task to status=failed in one transaction with events:
+	// it sets error_class/retryable/reason (finished_at only when terminal)
+	// and deliberately leaves approval_issue_number, approved_by,
+	// prior_findings and current_round alone, so a retry re-enters the same
+	// round with approval still verifiable.
+	FailTask(ctx context.Context, rec domain.FailureRecord, events ...domain.TaskEvent) error
+
+	// RetryTask is the operator-retry compare-and-set: iff the task is
+	// status=failed AND retryable AND retry_count < maxRetries it becomes
+	// running (error fields cleared, retry_count+1) and ev is appended, in
+	// one transaction. Otherwise it returns domain.ErrNotRetryable, so two
+	// concurrent retries cannot both win. Returns the post-retry state.
+	RetryTask(ctx context.Context, taskID string, maxRetries int, ev domain.TaskEvent) (domain.TaskState, error)
 
 	// EnsureRound inserts orchestrator.rounds' (task_id, round_number) row
 	// if it doesn't already exist — step_runs' foreign key requires it to
-	// exist before any step_runs row for that round can be inserted.
-	EnsureRound(ctx context.Context, taskID string, round int) error
+	// exist before any step_runs row for that round can be inserted. created
+	// reports whether this call inserted it; only then is round.started
+	// written (same transaction).
+	EnsureRound(ctx context.Context, taskID string, round int) (created bool, err error)
+
+	// AppendEvents inserts events that accompany no row change (phase.*,
+	// policy.decided, step.heartbeat, step.reconciled, round.resumed).
+	AppendEvents(ctx context.Context, events ...domain.TaskEvent) error
+
+	// ListEvents returns a task's events in id order, narrowed by f.
+	ListEvents(ctx context.Context, taskID string, f domain.EventFilter) ([]domain.TaskEvent, error)
+
+	// ListTasksByStatus backs the admin listing: each task of that status
+	// with the time it entered it (latest approval.requested for
+	// waiting_approval, latest task.failed for failed, else updated_at).
+	ListTasksByStatus(ctx context.Context, status string) ([]domain.TaskAge, error)
 
 	// RecordStepLaunched inserts a step_runs row the instant a step is
 	// dispatched (status=launched), before its outcome is known.

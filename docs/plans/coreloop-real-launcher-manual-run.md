@@ -107,7 +107,7 @@ curl -s http://localhost:8080/tasks/<task_id>
 
 Watch the `pr_number` field — set by `coreloop.go`'s `CreateOrUpdatePR` call once the generate-phase step completes.
 
-**7. Confirm the real PR** at `http://localhost:3001/forgejo-admin/sample-repo/pulls/<pr_number>` — commits pushed by the real agent, then reviewed by `review-with-commit` + `unit-tests`.
+**7. Confirm the real PR** at `http://localhost:3000/forgejo-admin/sample-repo/pulls/<pr_number>` — commits pushed by the real agent, then reviewed by `review-with-commit` + `unit-tests`.
 
 **8. Cleanup**: Ctrl+C both host processes, then
 

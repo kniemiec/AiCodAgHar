@@ -72,7 +72,7 @@ func TestTeardown_RemovesJailDirectoryTree(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 
-	teardown(jailDir)
+	teardown(context.Background(), jailDir)
 
 	if _, err := os.Stat(jailDir); !os.IsNotExist(err) {
 		t.Errorf("jailDir still exists after teardown (err=%v), want removed", err)
@@ -83,13 +83,43 @@ func TestTeardown_NonexistentDirIsNotAnError(t *testing.T) {
 	// teardown is unconditionally deferred, including on paths where the
 	// jail directory was never created (e.g. jailer.Config.Validate failed
 	// before anything was staged) — must not panic or block.
-	teardown(filepath.Join(t.TempDir(), "never-created"))
+	teardown(context.Background(), filepath.Join(t.TempDir(), "never-created"))
 }
 
 func TestAddProxyEnv_OverridesCallerValues(t *testing.T) {
-	env := mergeAgentEnv(map[string]string{"HTTP_PROXY": "http://caller:1"}, "task", "", "")
+	env := mergeAgentEnv(map[string]string{"HTTP_PROXY": "http://caller:1"}, "task", "", "", "")
 	addProxyEnv(env, "http://172.16.0.1:8888")
 	if env["HTTP_PROXY"] != "http://172.16.0.1:8888" || env["HTTPS_PROXY"] != "http://172.16.0.1:8888" {
 		t.Errorf("proxy env = %q / %q, want both set to the launcher's proxy", env["HTTP_PROXY"], env["HTTPS_PROXY"])
+	}
+}
+
+func TestMergeAgentEnv_LLMSettings(t *testing.T) {
+	env := mergeAgentEnv(map[string]string{"A": "b"}, "task", "key", "openai/m", "http://10.0.0.5:11434/v1")
+	want := map[string]string{"A": "b", "TASK": "task", "LLM_API_KEY": "key", "LLM_MODEL": "openai/m", "LLM_BASE_URL": "http://10.0.0.5:11434/v1"}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("env[%s] = %q, want %q", k, env[k], v)
+		}
+	}
+
+	env = mergeAgentEnv(nil, "task", "", "", "")
+	for _, k := range []string{"LLM_API_KEY", "LLM_MODEL", "LLM_BASE_URL"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s set although empty; want it omitted", k)
+		}
+	}
+}
+
+func TestValidateLLMBaseURL(t *testing.T) {
+	for _, ok := range []string{"", "http://192.168.1.14:11434/v1", "https://llm.example.com"} {
+		if err := validateLLMBaseURL(ok); err != nil {
+			t.Errorf("validateLLMBaseURL(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"192.168.1.14:11434/v1", "ftp://host/v1", "http://", "://x", "http://:11434/v1"} {
+		if err := validateLLMBaseURL(bad); err == nil {
+			t.Errorf("validateLLMBaseURL(%q) = nil, want error", bad)
+		}
 	}
 }

@@ -26,6 +26,8 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/clients/policyclient"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/domain"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
+	"github.com/kniemiec/AiCodAgHar/internal/control-plane/failure"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 )
 
 // MaxRounds is ADR-7's hardcoded round cap. internal/control-plane/taskrunner is
@@ -102,6 +104,21 @@ type Dependencies struct {
 	// on its own in-memory copy either way, which is what the rest of this
 	// round's dispatch actually needs.
 	PRRecorder PRRecorder
+
+	// Events appends task events that accompany no row change (policy.decided,
+	// phase.*, step.heartbeat — design §3). Nil is a valid no-op, mirroring
+	// Recorder. A failed non-heartbeat append fails the round like any other
+	// persistence error.
+	Events EventAppender
+
+	// HeartbeatInterval is how often fanOut appends step.heartbeat while a
+	// step is in flight (design §4). Zero disables heartbeats.
+	HeartbeatInterval time.Duration
+}
+
+// EventAppender is Dependencies.Events' interface; any TaskStore satisfies it.
+type EventAppender interface {
+	AppendEvents(ctx context.Context, events ...domain.TaskEvent) error
 }
 
 // IssueOpener is Dependencies.IssueOpener's interface.
@@ -138,6 +155,9 @@ type StepRunRecorder interface {
 type RoundResult struct {
 	Outcome Outcome
 	Reason  string
+	// ReasonKind classifies a stop-escalate Reason (domain.Reason*): a
+	// governance outcome, never a failure (ER-3). Empty otherwise.
+	ReasonKind string
 	// StepRuns holds only this round's step runs (steps skipped via
 	// alreadyCompleted are included too, so callers see a complete picture
 	// of the round regardless of what was actually (re)dispatched).
@@ -177,35 +197,45 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 	// constraint on the second evaluation. Two real "pdp-decision" rows for
 	// the same round is correct, not noise: PDP really was asked twice.
 	pdpInvocationID := fmt.Sprintf("%s:round-%d:pdp-eval:%d", task.ID, round, time.Now().UnixNano())
-	log := slog.With("task_id", task.ID, "round", round)
-	log.DebugContext(ctx, "policy evaluate", "invocation_id", pdpInvocationID, "task_type", task.Type, "risk_tier", task.RiskTier, "target_repo", task.TargetRepo)
+	ctx = logging.WithRound(logging.WithTask(ctx, task.ID), round)
+	slog.DebugContext(ctx, "policy evaluate", "invocation_id", pdpInvocationID, "task_type", task.Type, "risk_tier", task.RiskTier, "target_repo", task.TargetRepo)
 	decision, err := deps.Policy.Evaluate(ctx, policyRequest(deps, task, round, pdpInvocationID))
 	if err != nil {
-		return RoundResult{}, fmt.Errorf("round %d: policy evaluate: %w", round, err)
+		return RoundResult{}, fmt.Errorf("round %d: policy evaluate: %w", round, failure.Dependency(failure.DepPDP, err))
 	}
 
 	if err := auditPDPDecision(ctx, deps.Audit, task, round, pdpInvocationID, decision); err != nil {
-		return RoundResult{}, fmt.Errorf("round %d: audit PDP decision: %w", round, err)
+		return RoundResult{}, fmt.Errorf("round %d: audit PDP decision: %w", round, failure.Platform(err))
 	}
 
-	log.InfoContext(ctx, "policy decision", "decision", decision.Decision, "reason", decision.Reason,
+	decided := map[string]any{
+		"decision": decision.Decision, "bundle_version": decision.PolicyBundleVersion, "resolved_steps": len(decision.ResolvedSteps),
+	}
+	if decision.Decision == "deny" {
+		decided["reason_kind"] = domain.ReasonPolicyDenied
+	}
+	if err := emit(ctx, deps, domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventPolicyDecided, Payload: decided}); err != nil {
+		return RoundResult{}, fmt.Errorf("round %d: %w", round, err)
+	}
+
+	slog.InfoContext(ctx, "policy decision", "decision", decision.Decision, "reason", decision.Reason,
 		"policy_bundle_version", decision.PolicyBundleVersion, "granted_scopes", decision.GrantedScopes,
 		"resolved_steps", describeSteps(decision.ResolvedSteps))
 
 	switch decision.Decision {
 	case "deny":
-		log.WarnContext(ctx, "policy denied task", "reason", decision.Reason)
-		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "policy denied: " + decision.Reason}, nil
+		slog.WarnContext(ctx, "policy denied task", "reason", decision.Reason)
+		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "policy denied: " + decision.Reason, ReasonKind: domain.ReasonPolicyDenied}, nil
 	case "allow":
 		// proceed to fan-out below
 	default:
-		return RoundResult{}, fmt.Errorf("round %d: unknown policy decision %q", round, decision.Decision)
+		return RoundResult{}, fmt.Errorf("round %d: unknown policy decision %q", round, decision.Decision) // unclassified: platform
 	}
 
 	groups, err := groupStepsByPhase(decision.ResolvedSteps)
 	if err != nil {
-		log.WarnContext(ctx, "invalid phase configuration", "error", err)
-		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "invalid phase configuration: " + err.Error()}, nil
+		slog.WarnContext(ctx, "invalid phase configuration", "error", err)
+		return RoundResult{Outcome: OutcomeStopEscalate, Reason: "invalid phase configuration: " + err.Error(), ReasonKind: domain.ReasonInvalidPhaseConfig}, nil
 	}
 
 	// Pre-generate branch creation design: the generate step's agent (or
@@ -216,9 +246,9 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 	// idempotent, so a retried round or an approve-phase resume just reuses it.
 	if len(groups[policyclient.PhaseGenerate]) > 0 && task.PRNumber == 0 {
 		if _, err := deps.PRCreator.CreateOrReuseBranch(ctx, approvalRepoRef(task), task.Branch, task.BaseBranch); err != nil {
-			return RoundResult{}, fmt.Errorf("round %d: create task branch: %w", round, err)
+			return RoundResult{}, fmt.Errorf("round %d: create task branch: %w", round, failure.Dependency(failure.DepGitHost, err))
 		}
-		log.InfoContext(ctx, "task branch ready", "branch", task.Branch, "base_branch", task.BaseBranch)
+		slog.InfoContext(ctx, "task branch ready", "branch", task.Branch, "base_branch", task.BaseBranch)
 	}
 
 	var runs []domain.StepRun
@@ -231,13 +261,13 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if phase == policyclient.PhaseGenerate {
 			pf = priorFindings
 		}
-		log.InfoContext(ctx, "phase started", "phase", phase, "steps", len(steps), "has_prior_findings", len(pf) > 0)
-		phaseRuns, err := fanOut(ctx, deps, task, round, steps, decision.GrantedScopes, pf, alreadyCompleted)
+		slog.InfoContext(ctx, "phase started", "phase", phase, "steps", len(steps), "has_prior_findings", len(pf) > 0)
+		phaseRuns, err := runPhase(ctx, deps, task, round, phase, steps, decision.GrantedScopes, pf, alreadyCompleted)
 		if err != nil {
-			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, phase, err)
+			return RoundResult{}, err
 		}
 		runs = append(runs, phaseRuns...)
-		log.InfoContext(ctx, "phase finished", "phase", phase, "blocking_findings", aggregate(phaseRuns))
+		slog.InfoContext(ctx, "phase finished", "phase", phase, "blocking_findings", aggregate(phaseRuns))
 
 		// Task Intent Propagation design §5: a task no longer arrives with
 		// a PR already open, so once the generate phase's own step
@@ -248,10 +278,10 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if phase == policyclient.PhaseGenerate && task.PRNumber == 0 && !aggregate(phaseRuns) {
 			pr, err := deps.PRCreator.CreateOrUpdatePR(ctx, approvalRepoRef(task), task.Branch, task.BaseBranch, prTitle(task), task.Description)
 			if err != nil {
-				return RoundResult{}, fmt.Errorf("round %d: open review PR: %w", round, err)
+				return RoundResult{}, fmt.Errorf("round %d: open review PR: %w", round, failure.Dependency(failure.DepGitHost, err))
 			}
 			task.PRNumber = pr.Number
-			log.InfoContext(ctx, "review PR ready", "pr_number", pr.Number, "branch", task.Branch)
+			slog.InfoContext(ctx, "review PR ready", "pr_number", pr.Number, "branch", task.Branch)
 			if deps.PRRecorder != nil {
 				if err := deps.PRRecorder.SetTaskPRNumber(ctx, task.ID, pr.Number); err != nil {
 					return RoundResult{}, fmt.Errorf("round %d: persist PR number: %w", round, err)
@@ -265,7 +295,7 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if err != nil {
 			return RoundResult{}, fmt.Errorf("round %d: marshal prior findings: %w", round, err)
 		}
-		log.InfoContext(ctx, "blocking findings outstanding; another round needed")
+		slog.InfoContext(ctx, "blocking findings outstanding; another round needed")
 		return RoundResult{Outcome: OutcomeContinue, StepRuns: runs, PriorFindings: findings, PRNumber: task.PRNumber}, nil
 	}
 
@@ -282,23 +312,80 @@ func RunRound(ctx context.Context, deps Dependencies, task domain.Task, round in
 		if !res.Approved {
 			issue, err := deps.IssueOpener.CreateOrReuseIssue(ctx, approvalRepoRef(task), approvalIssueTitle(task, round), approvalIssueBody(task, round))
 			if err != nil {
-				return RoundResult{}, fmt.Errorf("round %d: open approval issue: %w", round, err)
+				return RoundResult{}, fmt.Errorf("round %d: open approval issue: %w", round, failure.Dependency(failure.DepGitHost, err))
 			}
-			log.InfoContext(ctx, "waiting for approval", "approval_issue", issue.Number)
+			slog.InfoContext(ctx, "waiting for approval", "approval_issue", issue.Number)
 			return RoundResult{Outcome: OutcomeWaitingApproval, StepRuns: runs, ApprovalIssueNumber: issue.Number, PRNumber: task.PRNumber}, nil
 		}
 	}
 
 	if publishSteps := groups[policyclient.PhasePublish]; len(publishSteps) > 0 {
-		log.InfoContext(ctx, "phase started", "phase", policyclient.PhasePublish, "steps", len(publishSteps))
-		phaseRuns, err := fanOut(ctx, deps, task, round, publishSteps, decision.GrantedScopes, nil, alreadyCompleted)
+		slog.InfoContext(ctx, "phase started", "phase", policyclient.PhasePublish, "steps", len(publishSteps))
+		phaseRuns, err := runPhase(ctx, deps, task, round, policyclient.PhasePublish, publishSteps, decision.GrantedScopes, nil, alreadyCompleted)
 		if err != nil {
-			return RoundResult{}, fmt.Errorf("round %d: fan out (%s phase): %w", round, policyclient.PhasePublish, err)
+			return RoundResult{}, err
 		}
 		runs = append(runs, phaseRuns...)
 	}
 
 	return RoundResult{Outcome: OutcomeStopSuccess, StepRuns: runs, PRNumber: task.PRNumber}, nil
+}
+
+// emit appends events through deps.Events; a nil Events is a no-op. Events
+// that describe no state change (heartbeats) must not use it — their failure
+// is not fatal.
+func emit(ctx context.Context, deps Dependencies, events ...domain.TaskEvent) error {
+	if deps.Events == nil {
+		return nil
+	}
+	if err := deps.Events.AppendEvents(ctx, events...); err != nil {
+		return fmt.Errorf("append %s event: %w", events[0].Type, err) // unclassified: platform
+	}
+	return nil
+}
+
+// runPhase wraps fanOut with phase.started / phase.finished events.
+func runPhase(ctx context.Context, deps Dependencies, task domain.Task, round int, phase string, steps []policyclient.ResolvedStep, grantedScopes []string, priorFindings []byte, alreadyCompleted map[string]domain.StepRun) ([]domain.StepRun, error) {
+	if err := emit(ctx, deps, domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventPhaseStarted,
+		Payload: map[string]any{"phase": phase, "steps": len(steps)}}); err != nil {
+		return nil, fmt.Errorf("round %d: %w", round, err)
+	}
+	started := time.Now()
+	runs, err := fanOut(ctx, deps, task, round, steps, grantedScopes, priorFindings, alreadyCompleted)
+	if err != nil {
+		return nil, fmt.Errorf("round %d: fan out (%s phase): %w", round, phase, err)
+	}
+	if err := emit(ctx, deps, domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventPhaseFinished,
+		Payload: map[string]any{"phase": phase, "blocking_findings": aggregate(runs), "duration_ms": time.Since(started).Milliseconds()}}); err != nil {
+		return nil, fmt.Errorf("round %d: %w", round, err)
+	}
+	return runs, nil
+}
+
+// heartbeat appends step.heartbeat every deps.HeartbeatInterval until stop is
+// closed. A failed append is logged and otherwise ignored: it describes no
+// state change (design §4).
+func heartbeat(ctx context.Context, deps Dependencies, task domain.Task, round int, stepID, invocationID string, stop <-chan struct{}) {
+	if deps.Events == nil || deps.HeartbeatInterval <= 0 {
+		return
+	}
+	started := time.Now()
+	ticker := time.NewTicker(deps.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ev := domain.TaskEvent{TaskID: task.ID, Round: round, StepID: stepID, InvocationID: invocationID, Type: domain.EventStepHeartbeat,
+				Payload: map[string]any{"elapsed_s": int64(time.Since(started).Seconds())}}
+			if err := deps.Events.AppendEvents(ctx, ev); err != nil {
+				slog.WarnContext(ctx, "step heartbeat append failed", "error", err)
+			}
+		}
+	}
 }
 
 // approvalRepoRef splits task.TargetRepo ("owner/name") into a
@@ -423,7 +510,7 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 	var wg sync.WaitGroup
 	for i, step := range steps {
 		if cached, ok := alreadyCompleted[step.StepID]; ok {
-			slog.InfoContext(ctx, "step already completed; not redispatching", "task_id", task.ID, "round", round, "step_id", step.StepID)
+			slog.InfoContext(ctx, "step already completed; not redispatching", "step_id", step.StepID)
 			runs[i] = cached
 			continue
 		}
@@ -433,13 +520,13 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 			defer wg.Done()
 			exec, ok := deps.Executors.Lookup(step.Type)
 			if !ok {
-				slog.ErrorContext(ctx, "no executor registered for step type", "task_id", task.ID, "step_id", step.StepID, "step_type", step.Type)
+				slog.ErrorContext(ctx, "no executor registered for step type", "step_id", step.StepID, "step_type", step.Type)
 				errs[i] = fmt.Errorf("no executor registered for step type %q", step.Type)
 				return
 			}
 
 			invocationID := executor.InvocationID(executor.StepContext{Task: task, Round: round, Step: step})
-			log := slog.With("task_id", task.ID, "round", round, "step_id", step.StepID, "invocation_id", invocationID)
+			ctx := logging.WithStep(ctx, step.StepID, invocationID)
 			if deps.Recorder != nil {
 				if err := deps.Recorder.RecordLaunched(ctx, task.ID, round, step, invocationID); err != nil {
 					errs[i] = fmt.Errorf("record launched step_run for %s: %w", step.StepID, err)
@@ -447,20 +534,23 @@ func fanOut(ctx context.Context, deps Dependencies, task domain.Task, round int,
 				}
 			}
 
-			log.InfoContext(ctx, "step dispatched", "step_type", step.Type, "phase", step.Phase, "blocking", step.Blocking)
+			slog.InfoContext(ctx, "step dispatched", "step_type", step.Type, "phase", step.Phase, "blocking", step.Blocking)
 			started := time.Now()
+			stopHeartbeat := make(chan struct{})
+			go heartbeat(ctx, deps, task, round, step.StepID, invocationID, stopHeartbeat)
 			run, err := exec.Execute(ctx, executor.StepContext{
 				Task: task, Round: round, Step: step, GrantedScopes: grantedScopes, PriorFindings: priorFindings,
 			})
+			close(stopHeartbeat)
 			if err != nil {
-				log.ErrorContext(ctx, "step failed", "duration", time.Since(started), "error", err)
+				slog.ErrorContext(ctx, "step failed", "duration", time.Since(started), "error", err)
 			} else {
-				log.InfoContext(ctx, "step finished", "duration", time.Since(started), "exit_code", run.ExitCode, "has_finding", run.HasFinding)
+				slog.InfoContext(ctx, "step finished", "duration", time.Since(started), "exit_code", run.ExitCode, "has_finding", run.HasFinding)
 			}
 
 			if deps.Recorder != nil {
 				if rerr := deps.Recorder.RecordCompleted(ctx, task.ID, invocationID, run, err); rerr != nil && err == nil {
-					log.WarnContext(ctx, "record completed step_run failed", "error", rerr)
+					slog.WarnContext(ctx, "record completed step_run failed", "error", rerr)
 					err = fmt.Errorf("record completed step_run for %s: %w", step.StepID, rerr)
 				}
 			}

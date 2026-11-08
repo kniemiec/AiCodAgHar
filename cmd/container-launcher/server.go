@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
@@ -93,6 +95,9 @@ type launcherServer struct {
 
 	booter vmLauncher
 
+	// failedLogDir is config.FailedLogDir; empty disables the dump.
+	failedLogDir string
+
 	// vmSlot serializes VM boots: every microVM shares the one tap device,
 	// guest CID and MAC (egress.DefaultConfig, launch.go), so a second
 	// concurrent boot fails with EBUSY on tap0. Launch holds the slot for
@@ -107,10 +112,11 @@ type launcherServer struct {
 
 func newLauncherServer(cfg config) *launcherServer {
 	return &launcherServer{
-		booter:      newFirecrackerLauncher(cfg),
-		vmSlot:      make(chan struct{}, 1),
-		invocations: map[string]invocationRecord{},
-		inFlight:    map[string]context.CancelCauseFunc{},
+		booter:       newFirecrackerLauncher(cfg),
+		failedLogDir: cfg.FailedLogDir,
+		vmSlot:       make(chan struct{}, 1),
+		invocations:  map[string]invocationRecord{},
+		inFlight:     map[string]context.CancelCauseFunc{},
 	}
 }
 
@@ -120,8 +126,8 @@ func newLauncherServer(cfg config) *launcherServer {
 var validInvocationID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchRequest) (*launcherv1.LaunchResponse, error) {
-	log := slog.With("invocation_id", req.InvocationId, "task_id", req.TaskId, "step_id", req.StepId,
-		"step_type", req.StepType, "payload_ref", req.PayloadRef)
+	ctx = logging.WithStep(logging.WithTask(ctx, req.TaskId), req.StepId, req.InvocationId)
+	log := slog.With("step_type", req.StepType, "payload_ref", req.PayloadRef)
 	if !validInvocationID.MatchString(req.InvocationId) {
 		log.WarnContext(ctx, "launch rejected: invalid invocation_id", "allowed_pattern", validInvocationID.String())
 		return nil, status.Errorf(codes.InvalidArgument, "container-launcher: invalid invocation_id %q", req.InvocationId)
@@ -140,7 +146,7 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 			return nil, status.Errorf(codes.InvalidArgument, "container-launcher: unknown payload_ref %q", req.PayloadRef)
 		}
 		task = rendered
-		log.DebugContext(ctx, "prompt rendered", "prompt_bytes", len(task), "prompt_prefix", logging.Truncate(task, 500))
+		log.DebugContext(ctx, "prompt rendered", "prompt_bytes", len(task), logging.Sensitive(), "prompt_prefix", logging.Truncate(task, 500))
 	case stepTypeDeterministicStep:
 		rendered, ok := prompts.RenderCommand(req.PayloadRef)
 		if !ok {
@@ -164,7 +170,10 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 		cancel(nil) // release killCtx's resources; no-op on the cause if Kill already set one
 	}()
 
-	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds)
+	// Non-secret clone coordinates, so "what is it trying to clone?" is
+	// answerable from the log. FORGEJO_TOKEN is deliberately not included.
+	log.InfoContext(ctx, "launch accepted", "env_keys", logging.Keys(req.Env), "timeout_seconds", req.TimeoutSeconds,
+		"target_repo", req.Env["TARGET_REPO"], "branch", req.Env["BRANCH"], "base_branch", req.Env["BASE_BRANCH"], "forgejo_url", req.Env["FORGEJO_URL"])
 	startedAt := time.Now()
 	var outcome bootOutcome
 	var bootErr error
@@ -203,12 +212,17 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	if bootErr != nil {
 		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
 		if len(outcome.stdout) > 0 {
-			log.WarnContext(ctx, "guest event log tail", "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
+			log.WarnContext(ctx, "guest event log tail", logging.Sensitive(), "tail", eventLogTail(outcome.stdout, eventLogTailBytes))
+			if path, err := dumpFailedEventLog(s.failedLogDir, req.InvocationId, outcome.stdout); err != nil {
+				log.WarnContext(ctx, "writing failed event log failed", "error", err)
+			} else if path != "" {
+				log.WarnContext(ctx, "full guest event log written", "path", path)
+			}
 		}
 		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
 	}
 	log.InfoContext(ctx, "launch finished", attrs...)
-	log.DebugContext(ctx, "structured result", "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
+	log.DebugContext(ctx, "structured result", logging.Sensitive(), "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
 }
 
@@ -231,7 +245,35 @@ func eventLogTail(stdout []byte, n int) string {
 	return string(clean)
 }
 
+// dumpFailedEventLog writes the whole (already redacted) event log of a
+// failed invocation to <dir>/<invocationID>-<UTC timestamp>.log, ANSI
+// stripped, mode 0600. The timestamp keeps a resumed step's repeat failure
+// (same invocation ID) from overwriting the first one's log, and the file
+// is always freshly created so its mode is always 0600. Nothing prunes the
+// directory. It returns "" with no error when dir is empty (feature off).
+// The invocation ID is already validated (validInvocationID), so it is
+// safe as a file name.
+func dumpFailedEventLog(dir, invocationID string, stdout []byte) (string, error) {
+	if dir == "" {
+		return "", nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, invocationID+"-"+time.Now().UTC().Format("20060102T150405.000000000Z")+".log")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(ansiEscape.ReplaceAll(stdout, nil)); err != nil {
+		f.Close()
+		return "", err
+	}
+	return path, f.Close()
+}
+
 func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) (*launcherv1.KillResponse, error) {
+	ctx = logging.WithStep(ctx, "", req.InvocationId)
 	s.mu.Lock()
 	cancel, inFlight := s.inFlight[req.InvocationId]
 	_, completed := s.invocations[req.InvocationId]
@@ -244,11 +286,11 @@ func (s *launcherServer) Kill(ctx context.Context, req *launcherv1.KillRequest) 
 		// Known, but already finished by the time Kill arrived — nothing
 		// left to pre-empt. Not an error: this is a legitimate race, not a
 		// caller mistake.
-		slog.InfoContext(ctx, "kill requested for already-finished invocation", "invocation_id", req.InvocationId)
+		slog.InfoContext(ctx, "kill requested for already-finished invocation")
 		return &launcherv1.KillResponse{Killed: false}, nil
 	}
 
-	slog.InfoContext(ctx, "killing in-flight invocation", "invocation_id", req.InvocationId)
+	slog.InfoContext(ctx, "killing in-flight invocation")
 	cancel(errInvocationKilled)
 	return &launcherv1.KillResponse{Killed: true}, nil
 }

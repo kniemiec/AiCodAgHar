@@ -8,8 +8,10 @@ kernel arg — design §7), then dispatches to one of two modes based on which
 key MMDS carries (design §5's mode table — v1 uses a single golden image
 for every StepID, so this one script must tell the two apart at runtime):
 
-  - MMDS "TASK" set   -> agent-stage mode: runs OpenHands headless against
-    that task (run_openhands_mode).
+  - MMDS "TASK" set   -> agent-stage mode: clones TARGET_REPO@BRANCH (so the
+    agent starts in a ready checkout instead of assembling a clone URL and
+    token itself), then runs OpenHands headless against that task from the
+    checkout (run_openhands_mode).
   - MMDS "COMMAND" set -> deterministic-step mode: clones TARGET_REPO@BRANCH
     with the MMDS-delivered credential and runs the fixed command
     (run_command_mode).
@@ -54,6 +56,7 @@ fragile. Idempotent and best-effort, same posture as ensure_mmds_route.
 import http.client
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -145,16 +148,62 @@ def vsock_connect(retries=20, delay=0.5):
     return None
 
 
+def clone_repo(env, emit, shallow, require_branch):
+    """Clone TARGET_REPO@BRANCH into REPO_DIR using the MMDS-delivered
+    FORGEJO_URL (a base URL, not a repo URL) and FORGEJO_TOKEN. With
+    require_branch, an empty BRANCH is an error rather than a clone of the
+    default branch. Emits an "error" envelope and returns False on any
+    failure."""
+    target_repo = env.get("TARGET_REPO")
+    branch = env.get("BRANCH")
+    forgejo_url = env.get("FORGEJO_URL")
+    token = env.get("FORGEJO_TOKEN")
+    if not (target_repo and forgejo_url and token):
+        emit({"type": "error", "message": "clone requires TARGET_REPO, FORGEJO_URL, and FORGEJO_TOKEN in env"})
+        return False
+    if require_branch and not branch:
+        emit({"type": "error", "message": "clone requires BRANCH in env"})
+        return False
+
+    os.makedirs(WORKDIR, exist_ok=True)
+    shutil.rmtree(REPO_DIR, ignore_errors=True)
+    scheme, _, rest = forgejo_url.partition("://")
+    clone_url = f"{scheme}://x-access-token:{token}@{rest.rstrip('/')}/{target_repo}.git"
+    clone_cmd = ["git", "clone"]
+    if shallow:
+        clone_cmd += ["--depth", "1"]
+    if branch:
+        clone_cmd += ["--branch", branch]
+    clone_cmd += [clone_url, REPO_DIR]
+
+    emit({"type": "event", "line": f"cloning {target_repo}@{branch or '(default branch)'}"})
+    clone = subprocess.run(clone_cmd, cwd=WORKDIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in clone.stdout.splitlines():
+        emit({"type": "event", "line": line})
+    if clone.returncode != 0:
+        emit({"type": "error", "message": f"git clone failed with exit code {clone.returncode}"})
+        return False
+    return True
+
+
 def run_openhands_mode(env, mmds, emit):
     task = mmds["TASK"]
 
-    os.makedirs(WORKDIR, exist_ok=True)
     os.makedirs(os.path.dirname(STRUCTURED_RESULT_PATH), exist_ok=True)
+
+    # Full history (not --depth 1): the agent may push commits and a
+    # reviewer may need to diff against the base branch. The agent commits,
+    # so it must never land on the default branch.
+    if not clone_repo(env, emit, shallow=False, require_branch=True):
+        return
+    for key, value in (("user.name", "openhands"), ("user.email", "openhands@all-hands.dev")):
+        subprocess.run(["git", "config", key, value], cwd=REPO_DIR, env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     try:
         proc = subprocess.Popen(
             [OPENHANDS_BIN, "--headless", "--json", "--override-with-envs", "-t", task],
-            cwd=WORKDIR,
+            cwd=REPO_DIR,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -210,28 +259,7 @@ def run_openhands_mode(env, mmds, emit):
 
 def run_command_mode(env, mmds, emit):
     command = mmds["COMMAND"]
-    target_repo = env.get("TARGET_REPO")
-    branch = env.get("BRANCH")
-    forgejo_url = env.get("FORGEJO_URL")
-    token = env.get("FORGEJO_TOKEN")
-    if not (target_repo and forgejo_url and token):
-        emit({"type": "error", "message": "command mode requires TARGET_REPO, FORGEJO_URL, and FORGEJO_TOKEN in env"})
-        return
-
-    os.makedirs(WORKDIR, exist_ok=True)
-    scheme, _, rest = forgejo_url.partition("://")
-    clone_url = f"{scheme}://x-access-token:{token}@{rest}/{target_repo}.git"
-    clone_cmd = ["git", "clone", "--depth", "1"]
-    if branch:
-        clone_cmd += ["--branch", branch]
-    clone_cmd += [clone_url, REPO_DIR]
-
-    emit({"type": "event", "line": f"cloning {target_repo}@{branch or '(default branch)'}"})
-    clone = subprocess.run(clone_cmd, cwd=WORKDIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in clone.stdout.splitlines():
-        emit({"type": "event", "line": line})
-    if clone.returncode != 0:
-        emit({"type": "error", "message": f"git clone failed with exit code {clone.returncode}"})
+    if not clone_repo(env, emit, shallow=True, require_branch=False):
         return
 
     try:

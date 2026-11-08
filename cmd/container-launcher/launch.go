@@ -102,7 +102,7 @@ func newFirecrackerLauncher(cfg config) *firecrackerLauncher {
 }
 
 func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, env map[string]string, task, command string, timeoutSeconds int32) (bootOutcome, error) {
-	log := slog.With("invocation_id", invocationID)
+	log := slog.Default()
 	bootStart := time.Now()
 	// stage logs one completed boot step at debug. Failures aren't logged
 	// here: they're returned and logged once by server.go's Launch.
@@ -145,7 +145,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	}
 
 	jailDir := filepath.Join(l.cfg.ChrootBaseDir, jailCfg.ExecBasename(), invocationID)
-	defer teardown(jailDir)
+	defer teardown(ctx, jailDir)
 	stage("jail-config", "jail_dir", jailDir, "api_socket", socketPath)
 
 	cmd := jailCfg.Command(ctx)
@@ -263,7 +263,7 @@ func (l *firecrackerLauncher) Launch(ctx context.Context, invocationID string, e
 	mmdsData := env
 	switch {
 	case task != "":
-		mmdsData = mergeAgentEnv(env, task, l.cfg.LLMAPIKey, l.cfg.LLMModel)
+		mmdsData = mergeAgentEnv(env, task, l.cfg.LLMAPIKey, l.cfg.LLMModel, l.cfg.LLMBaseURL)
 	case command != "":
 		mmdsData = mergeCommandEnv(env, command)
 	}
@@ -499,8 +499,8 @@ func mergeCommandEnv(env map[string]string, command string) map[string]string {
 // credentials on top of the caller's Env, all in the same UPPER_SNAKE_CASE
 // key style — the guest wrapper exports every key but TASK straight into
 // OpenHands' environment (design §7).
-func mergeAgentEnv(env map[string]string, task, llmAPIKey, llmModel string) map[string]string {
-	merged := make(map[string]string, len(env)+3)
+func mergeAgentEnv(env map[string]string, task, llmAPIKey, llmModel, llmBaseURL string) map[string]string {
+	merged := make(map[string]string, len(env)+4)
 	for k, v := range env {
 		merged[k] = v
 	}
@@ -510,6 +510,9 @@ func mergeAgentEnv(env map[string]string, task, llmAPIKey, llmModel string) map[
 	}
 	if llmModel != "" {
 		merged["LLM_MODEL"] = llmModel
+	}
+	if llmBaseURL != "" {
+		merged["LLM_BASE_URL"] = llmBaseURL
 	}
 	return merged
 }
@@ -572,10 +575,10 @@ func copyAndChown(src, dst string, uid, gid int) error {
 // switch itself. jailDir is
 // <chroot-base-dir>/<exec-basename>/<invocation-id>, one level above the
 // "root" subdirectory jailer itself creates.
-func teardown(jailDir string) {
+func teardown(ctx context.Context, jailDir string) {
 	if err := os.RemoveAll(jailDir); err != nil {
-		slog.Warn("teardown: remove jail dir failed", "jail_dir", jailDir, "error", err)
+		slog.WarnContext(ctx, "teardown: remove jail dir failed", "jail_dir", jailDir, "error", err)
 		return
 	}
-	slog.Debug("teardown: jail dir removed", "jail_dir", jailDir)
+	slog.DebugContext(ctx, "teardown: jail dir removed", "jail_dir", jailDir)
 }

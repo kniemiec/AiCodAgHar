@@ -100,6 +100,11 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 	cfg := kvmTestConfig(t)
 	cfg.LLMAPIKey = requireTestEnv(t, "LAUNCHER_LLM_API_KEY")
 	cfg.LLMModel = requireTestEnv(t, "LAUNCHER_LLM_MODEL")
+	// Optional (local Ollama etc.); same env var and validation as loadConfig.
+	cfg.LLMBaseURL = os.Getenv("LAUNCHER_LLM_BASE_URL")
+	if err := validateLLMBaseURL(cfg.LLMBaseURL); err != nil {
+		t.Fatalf("LAUNCHER_LLM_BASE_URL: %v", err)
+	}
 	srv := newLauncherServer(cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)

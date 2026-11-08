@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -393,5 +396,41 @@ func TestEventLogTail_StripsANSIAndKeepsEnd(t *testing.T) {
 	got := eventLogTail([]byte("\x1b[92mstart\x1b[0m middle \x1b[1;3mend\x1b[0m"), 9)
 	if got != "iddle end" {
 		t.Errorf("eventLogTail = %q, want %q", got, "iddle end")
+	}
+}
+
+func TestDumpFailedEventLog(t *testing.T) {
+	if path, err := dumpFailedEventLog("", "inv-1", []byte("x")); path != "" || err != nil {
+		t.Fatalf("disabled: got (%q, %v), want (\"\", nil)", path, err)
+	}
+	dir := filepath.Join(t.TempDir(), "nested")
+	path, err := dumpFailedEventLog(dir, "inv-1", []byte("\x1b[92mhello\x1b[0m world"))
+	if err != nil {
+		t.Fatalf("dumpFailedEventLog: %v", err)
+	}
+	if filepath.Dir(path) != dir || !strings.HasPrefix(filepath.Base(path), "inv-1-") || filepath.Ext(path) != ".log" {
+		t.Errorf("path = %q, want %s/inv-1-<timestamp>.log", path, dir)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello world" {
+		t.Errorf("contents = %q, want ANSI-stripped %q", got, "hello world")
+	}
+	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
+	}
+	// A resumed step re-runs with the same invocation ID; its failure must
+	// not overwrite the first one's log.
+	second, err := dumpFailedEventLog(dir, "inv-1", []byte("again"))
+	if err != nil {
+		t.Fatalf("second dumpFailedEventLog: %v", err)
+	}
+	if second == path {
+		t.Errorf("second dump reused path %q", path)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "hello world" {
+		t.Errorf("first log overwritten: %q", got)
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/kniemiec/AiCodAgHar/internal/logging"
 	"log/slog"
 	"net"
 	"os"
@@ -134,7 +135,7 @@ func (l *Listener) WaitForResult(ctx context.Context) (Result, error) {
 	}
 	readCh := make(chan readOutcome, 1)
 	go func() {
-		result, err := readEnvelopes(conn)
+		result, err := readEnvelopes(ctx, conn)
 		readCh <- readOutcome{result, err}
 	}()
 
@@ -164,7 +165,7 @@ func Redact(data []byte, secrets map[string]string) []byte {
 	return data
 }
 
-func readEnvelopes(conn net.Conn) (Result, error) {
+func readEnvelopes(ctx context.Context, conn net.Conn) (Result, error) {
 	var events [][]byte
 	var structuredResult []byte
 	var exitCode *int32
@@ -186,7 +187,7 @@ func readEnvelopes(conn net.Conn) (Result, error) {
 			events = append(events, append([]byte(nil), line...))
 			continue
 		}
-		slog.Debug("vsock: envelope received", "type", env.Type, "bytes", len(line))
+		slog.DebugContext(ctx, "vsock: envelope received", "type", env.Type, "bytes", len(line))
 		switch env.Type {
 		case "event":
 			events = append(events, []byte(env.Line))
@@ -199,7 +200,7 @@ func readEnvelopes(conn net.Conn) (Result, error) {
 			}
 		case "error":
 			guestErrMsg = env.Message
-			slog.Warn("vsock: guest wrapper reported an error", "message", env.Message)
+			slog.WarnContext(ctx, "vsock: guest wrapper reported an error", logging.Sensitive(), "message", env.Message)
 		}
 	}
 

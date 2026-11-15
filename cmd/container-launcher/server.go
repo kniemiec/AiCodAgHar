@@ -3,20 +3,25 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/prompts"
 	"github.com/kniemiec/AiCodAgHar/internal/logging"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 // errInvocationKilled is the context.Cause set on an in-flight invocation's
@@ -60,12 +65,53 @@ type vmLauncher interface {
 
 // bootOutcome is a launch attempt's result, in RunResult.Status terms
 // (including "killed", design §6), plus whatever ExtractLogs should return
-// for this invocation.
+// for this invocation. reachedGuest, boot and run feed the enumerated
+// LaunchOutcome and its timings (observability design §7): reachedGuest is
+// set once InstanceStart succeeded and the launcher started waiting on the
+// guest, so an "error" before that is a boot failure and one after it a
+// guest error.
 type bootOutcome struct {
 	exitCode             int32
 	status               string
 	structuredResultJSON []byte
 	stdout               []byte
+
+	reachedGuest bool
+	boot, run    time.Duration
+	redactions   int // secret replacements in stdout/structured result
+}
+
+// classify maps a bootOutcome onto the wire LaunchOutcome (LA-1).
+func classify(o bootOutcome) launcherv1.LaunchOutcome {
+	switch o.status {
+	case "completed":
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_COMPLETED
+	case "timed_out":
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_TIMEOUT
+	case "killed":
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_KILLED
+	}
+	if o.reachedGuest {
+		return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR
+	}
+	return launcherv1.LaunchOutcome_LAUNCH_OUTCOME_BOOT_FAILURE
+}
+
+// outcomeLabel is the metric/log form of a LaunchOutcome ("boot_failure").
+func outcomeLabel(o launcherv1.LaunchOutcome) string {
+	switch o {
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_COMPLETED:
+		return "completed"
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_BOOT_FAILURE:
+		return "boot_failure"
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_TIMEOUT:
+		return "timeout"
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR:
+		return "guest_error"
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_KILLED:
+		return "killed"
+	}
+	return "unspecified"
 }
 
 type invocationRecord struct {
@@ -98,6 +144,15 @@ type launcherServer struct {
 	// failedLogDir is config.FailedLogDir; empty disables the dump.
 	failedLogDir string
 
+	// defaultTimeoutSeconds is config.DefaultTimeoutSeconds, reported back
+	// as the effective timeout when a request sets none (LA-3).
+	defaultTimeoutSeconds int
+
+	// metrics is nil in tests that don't look at it (records nothing).
+	metrics *telemetry.Launcher
+	// waiting counts Launch calls queued for vmSlot (launcher_queue_depth).
+	waiting atomic.Int64
+
 	// vmSlot serializes VM boots: every microVM shares the one tap device,
 	// guest CID and MAC (egress.DefaultConfig, launch.go), so a second
 	// concurrent boot fails with EBUSY on tap0. Launch holds the slot for
@@ -110,14 +165,17 @@ type launcherServer struct {
 	inFlight    map[string]context.CancelCauseFunc
 }
 
-func newLauncherServer(cfg config) *launcherServer {
-	return &launcherServer{
-		booter:       newFirecrackerLauncher(cfg),
-		failedLogDir: cfg.FailedLogDir,
-		vmSlot:       make(chan struct{}, 1),
-		invocations:  map[string]invocationRecord{},
-		inFlight:     map[string]context.CancelCauseFunc{},
+func newLauncherServer(cfg config, mp metric.MeterProvider) *launcherServer {
+	s := &launcherServer{
+		booter:                newFirecrackerLauncher(cfg),
+		failedLogDir:          cfg.FailedLogDir,
+		defaultTimeoutSeconds: cfg.DefaultTimeoutSeconds,
+		vmSlot:                make(chan struct{}, 1),
+		invocations:           map[string]invocationRecord{},
+		inFlight:              map[string]context.CancelCauseFunc{},
 	}
+	s.metrics = telemetry.NewLauncher(mp, s.waiting.Load)
+	return s
 }
 
 // validInvocationID keeps InvocationId safe to embed directly into
@@ -177,25 +235,39 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	startedAt := time.Now()
 	var outcome bootOutcome
 	var bootErr error
+	var queueWait time.Duration
+	s.waiting.Add(1)
 	select {
 	case s.vmSlot <- struct{}{}:
-		if waited := time.Since(startedAt); waited > time.Second {
-			log.InfoContext(ctx, "vm slot acquired", "waited", waited)
+		s.waiting.Add(-1)
+		queueWait = time.Since(startedAt)
+		if queueWait > time.Second {
+			log.InfoContext(ctx, "vm slot acquired", "waited", queueWait)
 		}
 		outcome, bootErr = s.booter.Launch(killCtx, req.InvocationId, req.Env, task, command, req.TimeoutSeconds)
 		<-s.vmSlot
 	case <-killCtx.Done():
+		// Killed (or cancelled) while queued: no boot, no run.
+		s.waiting.Add(-1)
+		queueWait = time.Since(startedAt)
 		outcome, bootErr = bootOutcome{status: statusForCancellation(killCtx)}, context.Cause(killCtx)
 	}
 	finishedAt := time.Now()
 
+	launchOutcome := classify(outcome)
 	resp := &launcherv1.LaunchResponse{
-		InvocationId: req.InvocationId,
-		ExitCode:     outcome.exitCode,
-		Status:       outcome.status,
-		StartedAt:    timestamppb.New(startedAt),
-		FinishedAt:   timestamppb.New(finishedAt),
+		InvocationId:            req.InvocationId,
+		ExitCode:                outcome.exitCode,
+		Status:                  outcome.status,
+		StartedAt:               timestamppb.New(startedAt),
+		FinishedAt:              timestamppb.New(finishedAt),
+		Outcome:                 launchOutcome,
+		QueueWait:               durationpb.New(queueWait),
+		Boot:                    durationpb.New(outcome.boot),
+		GuestRun:                durationpb.New(outcome.run),
+		EffectiveTimeoutSeconds: int32(resolveTimeout(req.TimeoutSeconds, s.defaultTimeoutSeconds) / time.Second),
 	}
+	s.metrics.Invocation(ctx, req.StepType, outcomeLabel(launchOutcome), queueWait, outcome.boot, outcome.run, outcome.redactions)
 
 	s.mu.Lock()
 	s.invocations[req.InvocationId] = invocationRecord{
@@ -207,7 +279,8 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 	}
 	s.mu.Unlock()
 
-	attrs := []any{"status", outcome.status, "exit_code", outcome.exitCode, "duration", finishedAt.Sub(startedAt),
+	attrs := []any{"status", outcome.status, "outcome", outcomeLabel(launchOutcome), "exit_code", outcome.exitCode,
+		"duration", finishedAt.Sub(startedAt), "queue_wait", queueWait, "boot", outcome.boot, "guest_run", outcome.run,
 		"stdout_bytes", len(outcome.stdout), "structured_result_bytes", len(outcome.structuredResultJSON)}
 	if bootErr != nil {
 		log.ErrorContext(ctx, "launch failed", append(attrs, "error", bootErr)...)
@@ -219,11 +292,23 @@ func (s *launcherServer) Launch(ctx context.Context, req *launcherv1.LaunchReque
 				log.WarnContext(ctx, "full guest event log written", "path", path)
 			}
 		}
-		return resp, status.Errorf(codes.Internal, "container-launcher: launch %s: %v", req.InvocationId, bootErr)
+		return resp, failedLaunch(resp, fmt.Sprintf("container-launcher: launch %s: %v", req.InvocationId, bootErr))
 	}
 	log.InfoContext(ctx, "launch finished", attrs...)
 	log.DebugContext(ctx, "structured result", logging.Sensitive(), "structured_result", logging.Truncate(string(outcome.structuredResultJSON), 2048))
 	return resp, nil
+}
+
+// failedLaunch is the Internal status a failed Launch returns, carrying resp
+// as an error detail: gRPC sends no response body with a non-OK status, so
+// this is the only way the caller learns the outcome and timings (design §7).
+// Older clients ignore the detail.
+func failedLaunch(resp *launcherv1.LaunchResponse, msg string) error {
+	st := status.New(codes.Internal, msg)
+	if withDetail, err := st.WithDetails(resp); err == nil {
+		st = withDetail
+	}
+	return st.Err()
 }
 
 // eventLogTailBytes is how much of a failed invocation's event log

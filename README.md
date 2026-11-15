@@ -55,7 +55,7 @@ Full reference in [`docs/components/orchestrator.md` §4](docs/components/orches
 | `mocks/` | Local stand-in services |
 | `api/` | Launcher protobuf (`api/proto`), generated Go (`api/gen/go`), OpenAPI contracts (`api/openapi`) |
 | `schemas/` | JSON Schemas for target-repo `.harness/stages.yaml` and `.harness/policy.yaml` |
-| `deploy/` | Docker Compose stack, `.env.example`, SQL migrations |
+| `deploy/` | Docker Compose stack (incl. the observability pipeline under `deploy/observability/`), `.env.example`, SQL migrations |
 | `docs/` | Documentation (see below) |
 
 ### Documentation map
@@ -64,6 +64,7 @@ Full reference in [`docs/components/orchestrator.md` §4](docs/components/orches
 |---|---|---|
 | [`docs/components/`](docs/components/README.md) | How each component works **today** | Living — trust these when they disagree with older docs |
 | [`docs/local-development.md`](docs/local-development.md) | Bringing up and using the local stack | Living |
+| [`docs/runbooks/`](docs/runbooks/) | Operator procedures (observability: one task's logs/timeline, pipeline down) | Living |
 | [`docs/architecture/`](docs/architecture/) | ADRs — *why* things are the way they are (ADR-0 … ADR-12) | Frozen |
 | [`docs/intents/`](docs/intents/) | Requirements behind a body of work | Frozen |
 | [`docs/designs/`](docs/designs/) | Design docs per change (`completed/` = landed) | Frozen once landed |
@@ -77,7 +78,8 @@ Key ADRs: [execution model (ADR-1)](docs/architecture/week1-adr-1-agent-executio
 ### Prerequisites
 
 - Go and `buf` — versions are pinned in `.mise.toml`; `mise install` installs both
-- Docker + Docker Compose
+- Docker + Docker Compose ≥ 2.20 (the compose file uses `include:`)
+- `jq` (for `make task-logs`)
 - `openssl` (generates the dev mTLS certs)
 
 ### Build and unit-test
@@ -93,7 +95,7 @@ The local stack runs the real orchestrator against Forgejo and Postgres, with th
 
 ```sh
 cp deploy/.env.example deploy/.env   # defaults are fine for local dev
-make compose-up                      # Forgejo + Postgres + mocks + control-plane
+make compose-up                      # Forgejo + Postgres + mocks + control-plane + observability
 make bootstrap-admin                 # mint a Forgejo admin token
 make migrate                         # apply deploy/migrations/*.sql
 make seed                            # bot accounts + sample config repos
@@ -102,7 +104,8 @@ make seed                            # bot accounts + sample config repos
 Then:
 
 - Orchestrator API: `http://localhost:8080`
-- Forgejo: `http://localhost:3001` (note: **3001**, not 3000) — login `forgejo-admin` / `changeme-local-only`
+- Forgejo: `http://localhost:3000` — login `forgejo-admin` / `changeme-local-only`
+- Grafana: `http://localhost:3030`, Prometheus `:9090`, Loki `:3100` (host loopback only). `make task-logs TASK=<task_id>` prints one task's log lines from Loki; see the [observability runbook](docs/runbooks/observability.md)
 
 Submit a task and poll it:
 

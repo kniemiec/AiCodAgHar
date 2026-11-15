@@ -30,7 +30,27 @@ type Dependencies struct {
 	// MaxRetries bounds operator retries per task (TASK_MAX_RETRIES). Zero
 	// means DefaultMaxRetries.
 	MaxRetries int
+
+	// Observer receives the runner facts that have no task event behind
+	// them (design §6). Nil is a no-op.
+	Observer Observer
 }
+
+// Observer is told about reconciliation results and persistence failures;
+// *telemetry.ControlPlane implements it.
+type Observer interface {
+	// Reconciled reports one task's startup reconciliation: resumed,
+	// failed (unreconcilable launched step), noop, or error.
+	Reconciled(ctx context.Context, outcome string)
+	// PersistenceFailure reports a Postgres write that failed outside a
+	// task's own error path (ER-5).
+	PersistenceFailure(ctx context.Context, component string)
+}
+
+type noopObserver struct{}
+
+func (noopObserver) Reconciled(context.Context, string)         {}
+func (noopObserver) PersistenceFailure(context.Context, string) {}
 
 // DefaultMaxRetries is the operator-retry bound when Dependencies.MaxRetries
 // is unset.
@@ -78,6 +98,9 @@ func NewRunner(deps Dependencies) *Runner {
 	deps.Coreloop.Events = deps.Store
 	if deps.MaxRetries <= 0 {
 		deps.MaxRetries = DefaultMaxRetries
+	}
+	if deps.Observer == nil {
+		deps.Observer = noopObserver{}
 	}
 	return &Runner{deps: deps}
 }
@@ -257,7 +280,7 @@ func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err erro
 		"error_class", class, "retryable", retryable, "dependency", dep, "error", err)
 
 	reason := failure.Bound(err.Error())
-	payload := map[string]any{"error_class": string(class), "retryable": retryable, "error": reason}
+	payload := map[string]any{"error_class": string(class), "retryable": retryable, "error": reason, "target_repo": task.TargetRepo}
 	if dep != "" {
 		payload["dependency"] = dep
 	}
@@ -270,6 +293,7 @@ func (r *Runner) fail(ctx context.Context, task domain.Task, round int, err erro
 	rec := domain.FailureRecord{TaskID: task.ID, Round: round, Class: string(class), Retryable: retryable, Reason: reason}
 	if serr := r.deps.Store.FailTask(ctx, rec, ev); serr != nil {
 		slog.ErrorContext(ctx, "could not persist task failure; task left running for reconciliation", "error", serr)
+		r.deps.Observer.PersistenceFailure(ctx, "taskrunner")
 	}
 	if done != nil {
 		done <- Result{TaskID: task.ID, Err: err}
@@ -342,7 +366,7 @@ func (r *Runner) finish(ctx context.Context, task domain.Task, round int, result
 	}
 	wall, wait, _ := domain.WaitActive(history, now)
 	finished := domain.TaskEvent{TaskID: task.ID, Round: round, Type: domain.EventTaskFinished, Payload: map[string]any{
-		"outcome": outcome, "reason_kind": result.ReasonKind, "rounds": round,
+		"outcome": outcome, "reason_kind": result.ReasonKind, "rounds": round, "target_repo": task.TargetRepo,
 		"wall_ms": wall.Milliseconds(), "wait_ms": wait.Milliseconds(),
 	}}
 
@@ -424,11 +448,29 @@ func (r *Runner) RecordApproval(ctx context.Context, taskID, approvedBy, evidenc
 		ApprovalIssueNumber: rec.State.ApprovalIssueNumber, ApprovedBy: approvedBy,
 		PriorFindings: rec.State.PriorFindings, UpdatedAt: time.Now(),
 	}
-	granted := domain.TaskEvent{TaskID: taskID, Round: rec.State.CurrentRound + 1, Type: domain.EventApprovalGranted, Payload: map[string]any{"by": approvedBy}}
+	granted := domain.TaskEvent{TaskID: taskID, Round: rec.State.CurrentRound + 1, Type: domain.EventApprovalGranted,
+		Payload: r.approvalPayload(ctx, taskID, approvedBy)}
 	if err := r.deps.Store.UpdateTaskState(ctx, state, granted); err != nil {
 		return fmt.Errorf("taskrunner: record approval for %s: %w", taskID, err)
 	}
 	return r.auditApprovalGranted(ctx, rec.Task, rec.State.CurrentRound+1, approvedBy, evidence)
+}
+
+// approvalPayload is approval.granted/rejected's payload: who decided and,
+// when the matching approval.requested is found, how long the task waited
+// (wait_ms, for harness_approval_wait_seconds, MT-7). A failed lookup only
+// drops wait_ms; the decision itself must still be recorded.
+func (r *Runner) approvalPayload(ctx context.Context, taskID, by string) map[string]any {
+	payload := map[string]any{"by": by}
+	requested, err := r.deps.Store.ListEvents(ctx, taskID, domain.EventFilter{Type: domain.EventApprovalRequested})
+	if err != nil {
+		slog.WarnContext(ctx, "approval wait not recorded: load approval.requested failed", "error", err)
+		return payload
+	}
+	if n := len(requested); n > 0 {
+		payload["wait_ms"] = time.Since(requested[n-1].At).Milliseconds()
+	}
+	return payload
 }
 
 // RecordRejection persists a verified rejection (design §4.4 step 5) as the
@@ -448,7 +490,7 @@ func (r *Runner) RecordRejection(ctx context.Context, taskID, rejectedBy, eviden
 		TaskID: taskID, Outcome: coreloop.OutcomeStopEscalate, RoundsRun: round,
 		Reason: fmt.Sprintf("approval rejected by %s", rejectedBy), ReasonKind: domain.ReasonApprovalRejected,
 	}
-	rejected := domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventApprovalRejected, Payload: map[string]any{"by": rejectedBy}}
+	rejected := domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventApprovalRejected, Payload: r.approvalPayload(ctx, taskID, rejectedBy)}
 	return r.finish(ctx, rec.Task, round, result, &approvalEvidence{Approved: false, ApprovedBy: rejectedBy, Evidence: evidence}, rejected)
 }
 
@@ -546,9 +588,11 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 	ctx = logging.WithTask(ctx, taskID)
 	rec, ok, err := r.deps.Store.GetTask(ctx, taskID)
 	if err != nil {
+		r.deps.Observer.Reconciled(ctx, "error")
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: load task: %w", taskID, err)
 	}
 	if !ok || rec.State.Status != domain.TaskStatusRunning {
+		r.deps.Observer.Reconciled(ctx, "noop")
 		return Result{TaskID: taskID}, nil
 	}
 
@@ -564,15 +608,19 @@ func (r *Runner) ReconcileTask(ctx context.Context, taskID string) (Result, erro
 	alreadyCompleted, err := r.loadAlreadyCompleted(ctx, rec.Task, round)
 	if err != nil {
 		if r.failUnreconcilable(ctx, rec.Task, round, err, done) {
+			r.deps.Observer.Reconciled(ctx, "failed")
 			result := <-done
 			return result, result.Err
 		}
+		r.deps.Observer.Reconciled(ctx, "error")
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: %w", taskID, err)
 	}
 	if err := r.deps.Store.AppendEvents(ctx, domain.TaskEvent{TaskID: taskID, Round: round, Type: domain.EventTaskReconciled,
 		Payload: map[string]any{"from_status": rec.State.Status, "resume_round": round, "completed_steps": len(alreadyCompleted)}}); err != nil {
+		r.deps.Observer.Reconciled(ctx, "error")
 		return Result{}, fmt.Errorf("taskrunner: reconcile %s: %w", taskID, err)
 	}
+	r.deps.Observer.Reconciled(ctx, "resumed")
 	r.runLoop(ctx, rec.Task, round, rec.State.PriorFindings, alreadyCompleted, domain.RoundResumeReconcile, done)
 	result := <-done
 	return result, result.Err

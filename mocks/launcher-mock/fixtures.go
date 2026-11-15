@@ -38,11 +38,10 @@ func fixtureDeterministicFail(ctx context.Context, req *launcherv1.LaunchRequest
 // gitEnv is the credential + repo/PR/branch context every real-side-effect
 // fixture needs from LaunchRequest.env.
 type gitEnv struct {
-	client     *gitclient.Client
-	repo       gitclient.RepoRef
-	prNumber   int
-	branch     string
-	baseBranch string
+	client   *gitclient.Client
+	repo     gitclient.RepoRef
+	prNumber int
+	branch   string
 }
 
 func parseGitEnv(req *launcherv1.LaunchRequest) (gitEnv, error) {
@@ -70,11 +69,10 @@ func parseGitEnv(req *launcherv1.LaunchRequest) (gitEnv, error) {
 	}
 
 	return gitEnv{
-		client:     client,
-		repo:       gitclient.RepoRef{Owner: owner, Name: name},
-		prNumber:   prNumber,
-		branch:     req.Env["BRANCH"],
-		baseBranch: req.Env["BASE_BRANCH"],
+		client:   client,
+		repo:     gitclient.RepoRef{Owner: owner, Name: name},
+		prNumber: prNumber,
+		branch:   req.Env["BRANCH"],
 	}, nil
 }
 
@@ -85,12 +83,10 @@ func parseGitEnv(req *launcherv1.LaunchRequest) (gitEnv, error) {
 // findings, which it treats as untrusted review output, not instructions
 // (§7), only ever quoting it verbatim into its own commit's body.
 //
-// Task Intent Propagation design §5: a task no longer arrives with its
-// branch already pushed — the control-plane only opens the review PR
-// *after* this step completes — so round 1 (no PRIOR_FINDINGS_JSON yet,
-// meaning the branch can't exist yet either) must cut env.branch fresh off
-// env.baseBranch itself, the same way a real coding agent would `git
-// checkout -b`. Later rounds commit to the now-already-existing branch.
+// Pre-generate branch creation design: coreloop creates (or reuses)
+// env.branch off the base branch before this step dispatches, so every
+// round — round 1 included — just commits to the existing branch, the same
+// way a real coding agent clones it and pushes.
 func fixtureImplement(ctx context.Context, req *launcherv1.LaunchRequest) (int32, []byte, error) {
 	env, err := parseGitEnv(req)
 	if err != nil {
@@ -112,14 +108,7 @@ func fixtureImplement(ctx context.Context, req *launcherv1.LaunchRequest) (int32
 	}
 
 	notesPath := fmt.Sprintf(".implement-notes/%s.md", strings.NewReplacer(":", "-", "/", "-").Replace(req.InvocationId))
-	if priorFindings == "" {
-		if env.baseBranch == "" {
-			return 0, nil, fmt.Errorf("fixture %s: env must set BASE_BRANCH to cut a fresh branch on round 1", req.PayloadRef)
-		}
-		if err := env.client.CreateFileOnNewBranch(ctx, env.repo, notesPath, env.baseBranch, env.branch, commitMsg, content); err != nil {
-			return 0, nil, fmt.Errorf("fixture %s: commit implementation on new branch: %w", req.PayloadRef, err)
-		}
-	} else if err := env.client.CreateFile(ctx, env.repo, notesPath, env.branch, commitMsg, content); err != nil {
+	if err := env.client.CreateFile(ctx, env.repo, notesPath, env.branch, commitMsg, content); err != nil {
 		return 0, nil, fmt.Errorf("fixture %s: commit implementation: %w", req.PayloadRef, err)
 	}
 

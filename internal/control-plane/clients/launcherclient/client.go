@@ -103,13 +103,32 @@ func (c *Client) Launch(ctx context.Context, req LaunchRequest) (RunResult, erro
 		GrantedScopes:  req.GrantedScopes,
 	})
 	if err != nil {
-		return RunResult{}, fmt.Errorf("launcherclient: launch %s: %w", req.InvocationID, err)
+		wrapped := fmt.Errorf("launcherclient: launch %s: %w", req.InvocationID, err)
+		// A current launcher attaches its LaunchResponse to a failed Launch
+		// (design §7); an older one doesn't, and callers fall back to the
+		// gRPC code alone.
+		for _, d := range status.Convert(err).Details() {
+			if detail, ok := d.(*launcherv1.LaunchResponse); ok {
+				result := runResultFrom(detail)
+				return result, &LaunchError{Result: result, Outcome: result.Outcome, Err: wrapped}
+			}
+		}
+		return RunResult{}, wrapped
 	}
+	return runResultFrom(resp), nil
+}
 
+// runResultFrom converts the wire response.
+func runResultFrom(resp *launcherv1.LaunchResponse) RunResult {
 	result := RunResult{
-		InvocationID: resp.InvocationId,
-		ExitCode:     resp.ExitCode,
-		Status:       resp.Status,
+		InvocationID:     resp.InvocationId,
+		ExitCode:         resp.ExitCode,
+		Status:           resp.Status,
+		Outcome:          outcomeName(resp.Outcome),
+		QueueWait:        resp.QueueWait.AsDuration(),
+		Boot:             resp.Boot.AsDuration(),
+		GuestRun:         resp.GuestRun.AsDuration(),
+		EffectiveTimeout: time.Duration(resp.EffectiveTimeoutSeconds) * time.Second,
 	}
 	if resp.StartedAt != nil {
 		result.StartedAt = resp.StartedAt.AsTime()
@@ -117,7 +136,25 @@ func (c *Client) Launch(ctx context.Context, req LaunchRequest) (RunResult, erro
 	if resp.FinishedAt != nil {
 		result.FinishedAt = resp.FinishedAt.AsTime()
 	}
-	return result, nil
+	return result
+}
+
+// outcomeName maps the wire enum to RunResult.Outcome; UNSPECIFIED (an older
+// server) is "".
+func outcomeName(o launcherv1.LaunchOutcome) string {
+	switch o {
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_COMPLETED:
+		return OutcomeCompleted
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_BOOT_FAILURE:
+		return OutcomeBootFailure
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_TIMEOUT:
+		return OutcomeTimeout
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_GUEST_ERROR:
+		return OutcomeGuestError
+	case launcherv1.LaunchOutcome_LAUNCH_OUTCOME_KILLED:
+		return OutcomeKilled
+	}
+	return ""
 }
 
 func (c *Client) Kill(ctx context.Context, invocationID string) error {

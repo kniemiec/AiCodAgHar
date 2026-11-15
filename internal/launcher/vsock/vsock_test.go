@@ -249,3 +249,20 @@ func TestRedact_SymbolicReferenceLeftAlone(t *testing.T) {
 		t.Errorf("symbolic reference should pass through untouched, got %s", got)
 	}
 }
+
+func TestRedactCounted(t *testing.T) {
+	secrets := map[string]string{"FORGEJO_TOKEN": "tok-1", "LLM_API_KEY": "sk-2", "EMPTY_SECRET": ""}
+	data := []byte("tok-1 and tok-1 and sk-2, nothing else")
+
+	got, n := RedactCounted(data, secrets)
+
+	if n != 3 {
+		t.Errorf("replacements = %d, want 3", n)
+	}
+	if want := Redact(data, secrets); !bytes.Equal(got, want) {
+		t.Errorf("RedactCounted output %q differs from Redact's %q", got, want)
+	}
+	if _, n := RedactCounted([]byte("clean"), secrets); n != 0 {
+		t.Errorf("clean input: replacements = %d, want 0", n)
+	}
+}

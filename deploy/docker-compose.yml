@@ -1,5 +1,10 @@
 name: orchestrator-mvp
 
+# Observability pipeline (Collector, Prometheus, Loki, Tempo, Grafana,
+# Alertmanager) — platform-observability design §11. Needs Compose ≥ 2.20.
+include:
+  - docker-compose.observability.yml
+
 networks:
   orchestrator-net: {}
 
@@ -163,6 +168,17 @@ services:
       # reachable from Forgejo, so there's no reason to run this stack with
       # NoopApprovalVerifier's permanently-unsatisfiable fail-closed default.
       WEBHOOK_APPROVAL_ENABLED: "true"
+      # Platform-observability design §11: JSON logs on stderr (LG-1), and
+      # metrics + non-sensitive logs over OTLP to the Collector
+      # (docker-compose.observability.yml). No depends_on: telemetry is lossy
+      # by design, a missing Collector never blocks a task (CC-4).
+      LOG_FORMAT: json
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=local"
+      # 15 s instead of the SDK's 60 s, for quicker local feedback.
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+    # Becomes the host.name resource attribute / host_name label.
+    hostname: control-plane-host
     volumes:
       - ./certs:/certs:ro
     ports:

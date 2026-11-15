@@ -21,6 +21,8 @@ import (
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/executor"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/fakes"
 	"github.com/kniemiec/AiCodAgHar/internal/control-plane/taskrunner"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry/telemetrytest"
 )
 
 const webhookTestSecret = "test-webhook-secret"
@@ -362,4 +364,71 @@ func waitForStatus(t *testing.T, store *fakes.FakeTaskStore, taskID, want string
 	}
 	rec, _, _ := store.GetTask(context.Background(), taskID)
 	t.Fatalf("expected task %s to reach status %q, got %q", taskID, want, rec.State.Status)
+}
+
+// labelsFailGit makes ListIssueLabels fail — our own processing failure.
+type labelsFailGit struct{ *fakes.FakeGitHostClient }
+
+func (labelsFailGit) ListIssueLabels(context.Context, gitclient.RepoRef, int) ([]string, error) {
+	return nil, fmt.Errorf("forgejo down")
+}
+
+// TestHandleForgejoWebhook_CountsOutcomes is MT-14: every delivery lands in
+// exactly one harness_webhook_events_total outcome.
+func TestHandleForgejoWebhook_CountsOutcomes(t *testing.T) {
+	repo := gitclient.RepoRef{Owner: "acme", Name: "widgets"}
+	cases := []struct {
+		name    string
+		deliver func(t *testing.T, s *server, git *fakes.FakeGitHostClient, issue int) *httptest.ResponseRecorder
+		outcome string
+	}{
+		{"bad signature", func(t *testing.T, s *server, _ *fakes.FakeGitHostClient, issue int) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(http.MethodPost, "/webhooks/forgejo", bytes.NewReader(labelWebhookBody(t, issue, "alice")))
+			req.Header.Set("X-Forgejo-Signature", "deadbeef")
+			rec := httptest.NewRecorder()
+			newServeMux(s).ServeHTTP(rec, req)
+			return rec
+		}, telemetry.WebhookRejected},
+		{"incomplete payload", func(t *testing.T, s *server, _ *fakes.FakeGitHostClient, _ int) *httptest.ResponseRecorder {
+			return postSignedWebhook(t, newServeMux(s), []byte(`{}`))
+		}, telemetry.WebhookRejected},
+		{"labeler not an approver", func(t *testing.T, s *server, git *fakes.FakeGitHostClient, issue int) *httptest.ResponseRecorder {
+			git.SetIssueLabels(repo, issue, []string{"approved"})
+			return postSignedWebhook(t, newServeMux(s), labelWebhookBody(t, issue, "mallory"))
+		}, telemetry.WebhookRejected},
+		{"unknown issue", func(t *testing.T, s *server, _ *fakes.FakeGitHostClient, _ int) *httptest.ResponseRecorder {
+			return postSignedWebhook(t, newServeMux(s), labelWebhookBody(t, 9999, "alice"))
+		}, telemetry.WebhookIgnored},
+		{"no decision label", func(t *testing.T, s *server, _ *fakes.FakeGitHostClient, issue int) *httptest.ResponseRecorder {
+			return postSignedWebhook(t, newServeMux(s), labelWebhookBody(t, issue, "alice"))
+		}, telemetry.WebhookIgnored},
+		{"label lookup fails", func(t *testing.T, s *server, git *fakes.FakeGitHostClient, issue int) *httptest.ResponseRecorder {
+			s.git = labelsFailGit{git}
+			return postSignedWebhook(t, newServeMux(s), labelWebhookBody(t, issue, "alice"))
+		}, telemetry.WebhookFailed},
+		{"rejection recorded", func(t *testing.T, s *server, git *fakes.FakeGitHostClient, issue int) *httptest.ResponseRecorder {
+			git.SetIssueLabels(repo, issue, []string{"rejected"})
+			return postSignedWebhook(t, newServeMux(s), labelWebhookBody(t, issue, "alice"))
+		}, telemetry.WebhookProcessed},
+		{"issue opened starts a task", func(t *testing.T, s *server, _ *fakes.FakeGitHostClient, _ int) *httptest.ResponseRecorder {
+			return postSignedWebhook(t, newServeMux(s), issueOpenedWebhookBody(t, 77, "alice", "do the thing"))
+		}, telemetry.WebhookProcessed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, git, store := newWebhookTestServer(t)
+			reader := telemetrytest.New()
+			s.metrics = telemetry.NewControlPlane(reader.Provider, telemetry.ControlPlaneOptions{})
+			rec, _, _ := store.GetTask(context.Background(), "task-1")
+
+			tc.deliver(t, s, git, *rec.State.ApprovalIssueNumber)
+
+			if got := reader.Value(t, "harness_webhook_events_total", nil); got != 1 {
+				t.Fatalf("deliveries counted = %v, want 1: %+v", got, reader.Points(t, "harness_webhook_events_total"))
+			}
+			if got := reader.Value(t, "harness_webhook_events_total", map[string]string{"outcome": tc.outcome}); got != 1 {
+				t.Fatalf("outcome %s not counted: %+v", tc.outcome, reader.Points(t, "harness_webhook_events_total"))
+			}
+		})
+	}
 }

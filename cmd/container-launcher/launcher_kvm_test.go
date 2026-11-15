@@ -12,6 +12,7 @@ import (
 	launcherv1 "github.com/kniemiec/AiCodAgHar/api/gen/go/launcher/v1"
 	"github.com/kniemiec/AiCodAgHar/internal/clients/gitclient"
 	"github.com/kniemiec/AiCodAgHar/internal/launcher/egress"
+	"github.com/kniemiec/AiCodAgHar/internal/telemetry"
 )
 
 // TestLaunchKVM_BareBootTrivialPayload is design §14's KVM-gated
@@ -39,7 +40,7 @@ import (
 func TestLaunchKVM_BareBootTrivialPayload(t *testing.T) {
 	requireKVMDevice(t)
 	cfg := kvmTestConfig(t)
-	srv := newLauncherServer(cfg)
+	srv := newLauncherServer(cfg, telemetry.Noop().MeterProvider)
 
 	resp, err := srv.Launch(context.Background(), &launcherv1.LaunchRequest{
 		InvocationId: "kvm-smoke-bare-boot",
@@ -105,7 +106,7 @@ func TestLaunchKVM_AgentStageRealForgejo(t *testing.T) {
 	if err := validateLLMBaseURL(cfg.LLMBaseURL); err != nil {
 		t.Fatalf("LAUNCHER_LLM_BASE_URL: %v", err)
 	}
-	srv := newLauncherServer(cfg)
+	srv := newLauncherServer(cfg, telemetry.Noop().MeterProvider)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()

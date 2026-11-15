@@ -102,6 +102,14 @@ func (p *Prober) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// Up reports whether the latest probe reached the dependency (backs
+// harness_dependency_up).
+func (p *Prober) Up() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.err == nil
+}
+
 // Check adapts the latest probe result into a readiness Check. Before the
 // first probe completes it reports not ready.
 func (p *Prober) Check() Check {

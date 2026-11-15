@@ -51,16 +51,16 @@ func TestReadyzOKWhenAllPass(t *testing.T) {
 func TestProberAnyHTTPResponseIsReachable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(404) }))
 	p := NewProber("pdp", srv.URL)
-	if p.Check().Fn(context.Background()) == nil {
-		t.Fatal("must not be ready before first probe")
+	if p.Check().Fn(context.Background()) == nil || p.Up() {
+		t.Fatal("must not be ready (or up) before first probe")
 	}
 	p.Probe(context.Background())
-	if err := p.Check().Fn(context.Background()); err != nil {
+	if err := p.Check().Fn(context.Background()); err != nil || !p.Up() {
 		t.Fatalf("404 should count as reachable: %v", err)
 	}
 	srv.Close()
 	p.Probe(context.Background())
-	if p.Check().Fn(context.Background()) == nil {
+	if p.Check().Fn(context.Background()) == nil || p.Up() {
 		t.Fatal("closed server should be unreachable")
 	}
 }

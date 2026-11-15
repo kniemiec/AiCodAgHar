@@ -1,0 +1,61 @@
+# Loki, single binary on the local filesystem (platform-observability design
+# §11; LG-3/LG-4, CC-3).
+#
+# Index labels (LG-4) stay low-cardinality: service_name, host_name,
+# deployment_environment from the OTLP resource, plus Loki's derived
+# detected_level. Log attributes — task_id, round, step_id, invocation_id,
+# trace_id — are structured metadata, filtered at query time:
+#   {service_name="control-plane"} | task_id="task-…"
+# deploy/observability/task-logs.sh wraps that query.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: "2026-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  # Retention (CC-3, provisional value — design §11): 14 days, applied by the
+  # compactor below.
+  retention_period: 336h
+  otlp_config:
+    resource_attributes:
+      # Loki's defaults already index service.name and
+      # deployment.environment; host.name is added so a stream identifies
+      # its host (CC-8). Nothing per-task is ever indexed.
+      attributes_config:
+        - action: index_label
+          attributes:
+            - host.name
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+analytics:
+  reporting_enabled: false

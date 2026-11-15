@@ -346,3 +346,87 @@ func mustGet(t *testing.T, s *taskrunner.PostgresTaskStore, id string) domain.Ta
 	}
 	return rec
 }
+
+// collectingObserver records what PostgresTaskStore.Observer is handed.
+type collectingObserver struct {
+	mu     sync.Mutex
+	events []domain.TaskEvent
+}
+
+func (o *collectingObserver) Observe(_ context.Context, events []domain.TaskEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, events...)
+}
+
+// The Observer sees committed events only — with their store-assigned ID and
+// timestamp, including the ones the store derives itself — and nothing from
+// a rolled-back transaction (design §6's metric-from-event path).
+func TestPG_ObserverSeesCommittedEventsOnly(t *testing.T) {
+	s := newPGStore(t)
+	obs := &collectingObserver{}
+	s.Observer = obs
+	ctx := context.Background()
+	id := uniqueID(t, "observer")
+
+	if err := s.CreateTask(ctx, domain.Task{ID: id, Type: "new-task"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTaskState(ctx, domain.TaskState{TaskID: id, Status: domain.TaskStatusStopSuccess, CurrentRound: 1},
+		domain.TaskEvent{TaskID: "no-such-task", Type: "x"}); err == nil {
+		t.Fatal("expected the foreign-key violation to fail the write")
+	}
+
+	if got := eventTypes(obs.events); len(got) != 1 || got[0] != domain.EventTaskAccepted {
+		t.Fatalf("observed %v, want only the committed task.accepted", got)
+	}
+	if obs.events[0].ID == 0 || obs.events[0].At.IsZero() {
+		t.Fatalf("observed event lacks store-assigned id/at: %+v", obs.events[0])
+	}
+}
+
+// FleetSnapshot counts per status, stuck running tasks (relative to
+// stuckAfter, on the database clock) and the approval queue. The database is
+// shared with other tests, so it compares before/after deltas.
+func TestPG_FleetSnapshot(t *testing.T) {
+	s := newPGStore(t)
+	ctx := context.Background()
+	snap := func(stuckAfter time.Duration) domain.FleetSnapshot {
+		t.Helper()
+		v, err := s.FleetSnapshot(ctx, stuckAfter)
+		if err != nil {
+			t.Fatalf("FleetSnapshot: %v", err)
+		}
+		return v
+	}
+	before, beforeLong := snap(0), snap(time.Hour)
+
+	running, waiting := uniqueID(t, "fleet-run"), uniqueID(t, "fleet-wait")
+	for _, id := range []string{running, waiting} {
+		if err := s.CreateTask(ctx, domain.Task{ID: id, Type: "new-task"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issue := 5
+	if err := s.UpdateTaskState(ctx, domain.TaskState{TaskID: waiting, Status: domain.TaskStatusWaitingApproval, ApprovalIssueNumber: &issue},
+		domain.TaskEvent{TaskID: waiting, Round: 1, Type: domain.EventApprovalRequested}); err != nil {
+		t.Fatal(err)
+	}
+
+	after, afterLong := snap(0), snap(time.Hour)
+	if d := after.TasksByStatus[domain.TaskStatusRunning] - before.TasksByStatus[domain.TaskStatusRunning]; d != 1 {
+		t.Errorf("running delta = %d, want 1", d)
+	}
+	if d := after.ApprovalsWaiting - before.ApprovalsWaiting; d != 1 {
+		t.Errorf("waiting delta = %d, want 1", d)
+	}
+	if d := after.Stuck - before.Stuck; d != 1 {
+		t.Errorf("stuck(0) delta = %d, want 1: any running task is stuck with a zero interval", d)
+	}
+	if d := afterLong.Stuck - beforeLong.Stuck; d != 0 {
+		t.Errorf("stuck(1h) delta = %d, want 0: the new task just made progress", d)
+	}
+	if after.OldestApprovalWait < 0 {
+		t.Errorf("oldest approval wait = %v", after.OldestApprovalWait)
+	}
+}

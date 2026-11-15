@@ -1,4 +1,4 @@
-.PHONY: build test test-spike test-integration test-e2e test-launcher-kvm compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy
+.PHONY: build test test-spike test-integration test-e2e test-launcher-kvm compose-up compose-down compose-logs bootstrap-admin migrate seed gen-certs install-buf proto-lint proto-gen tidy task-logs
 
 BUF := buf
 
@@ -30,6 +30,13 @@ compose-down:
 
 compose-logs:
 	docker compose -f deploy/docker-compose.yml logs -f
+
+# Every central (Loki) log line for one task, in time order:
+#   make task-logs TASK=<task_id>
+# See deploy/observability/task-logs.sh and docs/runbooks/observability.md.
+task-logs:
+	@test -n "$(TASK)" || { echo "usage: make task-logs TASK=<task_id>"; exit 2; }
+	@./deploy/observability/task-logs.sh "$(TASK)"
 
 bootstrap-admin:
 	./deploy/bootstrap-admin.sh

@@ -5,6 +5,8 @@ package launcherclient
 import (
 	"context"
 	"time"
+
+	"google.golang.org/grpc/status"
 )
 
 // LaunchRequest mirrors api/proto/launcher/v1/launcher.proto's LaunchRequest.
@@ -26,7 +28,40 @@ type RunResult struct {
 	Status       string // completed | timed_out | killed | error
 	StartedAt    time.Time
 	FinishedAt   time.Time
+
+	// Outcome is the enumerated LaunchOutcome (Outcome* below); "" when the
+	// server sent none (an older launcher). The durations are zero then too.
+	Outcome          string
+	QueueWait        time.Duration
+	Boot             time.Duration
+	GuestRun         time.Duration
+	EffectiveTimeout time.Duration
 }
+
+// Launch outcomes, the lower-cased LaunchOutcome enum names (LA-1).
+const (
+	OutcomeCompleted   = "completed"
+	OutcomeBootFailure = "boot_failure"
+	OutcomeTimeout     = "timeout"
+	OutcomeGuestError  = "guest_error"
+	OutcomeKilled      = "killed"
+)
+
+// LaunchError is a failed Launch for which the server still delivered its
+// LaunchResponse (as a gRPC error detail): Result and Outcome say how the
+// invocation ended. Err is the underlying gRPC error, so status.Code(err)
+// and status.FromError keep working (GRPCStatus).
+type LaunchError struct {
+	Result  RunResult
+	Outcome string
+	Err     error
+}
+
+func (e *LaunchError) Error() string { return e.Err.Error() }
+func (e *LaunchError) Unwrap() error { return e.Err }
+
+// GRPCStatus lets status.Code/status.FromError see through the wrapper.
+func (e *LaunchError) GRPCStatus() *status.Status { return status.Convert(e.Err) }
 
 // LogBundle mirrors api/proto/launcher/v1/launcher.proto's ExtractLogsResponse.
 type LogBundle struct {

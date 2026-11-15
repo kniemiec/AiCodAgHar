@@ -1,0 +1,10 @@
+# Alertmanager with a null receiver (platform-observability design §11):
+# alerts are visible in the Alertmanager UI, but routing them to people is a
+# process decision per ADR-5 and is not configured here.
+
+route:
+  receiver: "null"
+  group_by: [alertname]
+
+receivers:
+  - name: "null"

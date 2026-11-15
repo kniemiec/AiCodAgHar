@@ -36,6 +36,15 @@ type FakeTaskStore struct {
 	// *before* touching state — the in-memory equivalent of an event INSERT
 	// violating a row inside the Postgres transaction (TS-3).
 	FailEventAppend func(domain.TaskEvent) error
+
+	// Observer, when set, is told about events after the write that carried
+	// them succeeded and f.mu is released — PostgresTaskStore's after-commit
+	// hook.
+	Observer domain.EventObserver
+	pending  []domain.TaskEvent
+
+	// FleetSnapshotFunc, when set, replaces FleetSnapshot's computed answer.
+	FleetSnapshotFunc func(ctx context.Context, stuckAfter time.Duration) (domain.FleetSnapshot, error)
 }
 
 // appendEvents stamps and stores events; callers hold f.mu. It validates
@@ -52,8 +61,21 @@ func (f *FakeTaskStore) appendEvents(events []domain.TaskEvent) error {
 		e.ID = int64(len(f.events) + 1)
 		e.At = time.Now()
 		f.events = append(f.events, e)
+		f.pending = append(f.pending, e)
 	}
 	return nil
+}
+
+// notify hands pending events to the Observer. Write methods defer it before
+// taking f.mu, so it runs after the write finished and the lock is released.
+func (f *FakeTaskStore) notify(ctx context.Context) {
+	f.mu.Lock()
+	pending, obs := f.pending, f.Observer
+	f.pending = nil
+	f.mu.Unlock()
+	if obs != nil && len(pending) > 0 {
+		obs.Observe(ctx, pending)
+	}
 }
 
 // Events returns every recorded event for taskID in order (test helper).
@@ -89,6 +111,7 @@ func (f *FakeTaskStore) init() {
 }
 
 func (f *FakeTaskStore) CreateTask(ctx context.Context, task domain.Task) error {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -114,6 +137,7 @@ func (f *FakeTaskStore) GetTask(ctx context.Context, taskID string) (domain.Task
 }
 
 func (f *FakeTaskStore) UpdateTaskState(ctx context.Context, state domain.TaskState, events ...domain.TaskEvent) error {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -138,6 +162,7 @@ func (f *FakeTaskStore) UpdateTaskState(ctx context.Context, state domain.TaskSt
 }
 
 func (f *FakeTaskStore) FailTask(ctx context.Context, fr domain.FailureRecord, events ...domain.TaskEvent) error {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -161,6 +186,7 @@ func (f *FakeTaskStore) FailTask(ctx context.Context, fr domain.FailureRecord, e
 }
 
 func (f *FakeTaskStore) RetryTask(ctx context.Context, taskID string, maxRetries int, ev domain.TaskEvent) (domain.TaskState, error) {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -185,6 +211,7 @@ func (f *FakeTaskStore) RetryTask(ctx context.Context, taskID string, maxRetries
 }
 
 func (f *FakeTaskStore) AppendEvents(ctx context.Context, events ...domain.TaskEvent) error {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -244,6 +271,46 @@ func (f *FakeTaskStore) ListTasksByStatus(ctx context.Context, status string) ([
 	return out, nil
 }
 
+// FleetSnapshot computes the gauge aggregate from the in-memory rows, or
+// returns FleetSnapshotFunc's answer when that is set.
+func (f *FakeTaskStore) FleetSnapshot(ctx context.Context, stuckAfter time.Duration) (domain.FleetSnapshot, error) {
+	if f.FleetSnapshotFunc != nil {
+		return f.FleetSnapshotFunc(ctx, stuckAfter)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	now := time.Now()
+	snap := domain.FleetSnapshot{TasksByStatus: map[string]int64{}}
+	for id, rec := range f.tasks {
+		snap.TasksByStatus[rec.State.Status]++
+		progress, requested := rec.State.UpdatedAt, rec.State.UpdatedAt
+		for _, e := range f.events {
+			if e.TaskID != id {
+				continue
+			}
+			if e.At.After(progress) {
+				progress = e.At
+			}
+			if e.Type == domain.EventApprovalRequested && e.At.After(requested) {
+				requested = e.At
+			}
+		}
+		switch rec.State.Status {
+		case domain.TaskStatusRunning:
+			if now.Sub(progress) > stuckAfter {
+				snap.Stuck++
+			}
+		case domain.TaskStatusWaitingApproval:
+			snap.ApprovalsWaiting++
+			if age := now.Sub(requested); age > snap.OldestApprovalWait {
+				snap.OldestApprovalWait = age
+			}
+		}
+	}
+	return snap, nil
+}
+
 func (f *FakeTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNumber int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -258,6 +325,7 @@ func (f *FakeTaskStore) SetTaskPRNumber(ctx context.Context, taskID string, prNu
 }
 
 func (f *FakeTaskStore) EnsureRound(ctx context.Context, taskID string, round int) (bool, error) {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -275,6 +343,7 @@ func (f *FakeTaskStore) EnsureRound(ctx context.Context, taskID string, round in
 }
 
 func (f *FakeTaskStore) RecordStepLaunched(ctx context.Context, taskID string, round int, step policyclient.ResolvedStep, invocationID string) error {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -303,6 +372,7 @@ func (f *FakeTaskStore) RecordStepLaunched(ctx context.Context, taskID string, r
 }
 
 func (f *FakeTaskStore) CompleteStepRun(ctx context.Context, taskID string, invocationID string, run domain.StepRun, execErr error) error {
+	defer f.notify(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.init()
@@ -313,7 +383,7 @@ func (f *FakeTaskStore) CompleteStepRun(ctx context.Context, taskID string, invo
 	rows := f.stepRuns[loc.taskID][loc.round]
 	existing := rows[loc.idx]
 	if err := f.appendEvents([]domain.TaskEvent{
-		domain.StepResolvedEvent(taskID, loc.round, existing.StepID, invocationID, run, execErr, time.Since(f.launched[invocationID])),
+		domain.StepResolvedEvent(taskID, loc.round, existing.StepID, existing.StepType, invocationID, run, execErr, time.Since(f.launched[invocationID])),
 	}); err != nil {
 		return err
 	}

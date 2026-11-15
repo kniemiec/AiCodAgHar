@@ -56,18 +56,18 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 	if err != nil {
 		slog.ErrorContext(ctx, "launch failed", "duration", time.Since(launchStarted), "error", err)
 		auditLaunchFailure(e.Audit, sc, invocationID)
-		return domain.StepRun{}, fmt.Errorf("launch deterministic-step %s: %w", sc.Step.StepID, err)
+		return domain.StepRun{Launch: launchInfo(result, err)}, classifyLaunchError(fmt.Errorf("launch deterministic-step %s: %w", sc.Step.StepID, err))
 	}
 
-	slog.InfoContext(ctx, "launch finished", "status", result.Status, "exit_code", result.ExitCode,
-		"started_at", result.StartedAt, "finished_at", result.FinishedAt, "duration", time.Since(launchStarted))
+	slog.InfoContext(ctx, "launch finished", "status", result.Status, "outcome", result.Outcome, "exit_code", result.ExitCode,
+		"queue_wait", result.QueueWait, "boot", result.Boot, "guest_run", result.GuestRun, "duration", time.Since(launchStarted))
 
 	logs, err := e.Launcher.ExtractLogs(ctx, result.InvocationID)
 	if err != nil {
 		return domain.StepRun{}, failure.Dependency(failure.DepLauncher, fmt.Errorf("extract logs for %s: %w", result.InvocationID, err))
 	}
 	slog.DebugContext(ctx, "logs extracted", "stdout_bytes", len(logs.Stdout), "stderr_bytes", len(logs.Stderr),
-		"structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))
+		logging.Sensitive(), "structured_result", logging.Truncate(string(logs.StructuredResultJSON), 2048))
 
 	if err := auditStepRun(ctx, e.Audit, sc, invocationID, result); err != nil {
 		return domain.StepRun{}, fmt.Errorf("audit deterministic-step %s: %w", sc.Step.StepID, err)
@@ -82,5 +82,6 @@ func (e *DeterministicStepExecutor) Execute(ctx context.Context, sc StepContext)
 		ExitCode:         result.ExitCode,
 		HasFinding:       result.ExitCode != 0,
 		StructuredResult: logs.StructuredResultJSON,
+		Launch:           launchInfo(result, nil),
 	}, nil
 }
